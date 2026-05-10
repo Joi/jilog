@@ -8,7 +8,7 @@ use serde::Deserialize;
 use jilog_review::{
     Reader, Tracker,
     readers::{AmplifierReader, ClaudeCodeReader, GenericReader, SessionIdSource},
-    trackers::{BeadsTracker, GithubTracker, NoneTracker},
+    trackers::{BeadsTracker, GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
 
@@ -62,6 +62,9 @@ pub enum GenericSessionIdSource {
 pub enum TrackerConfig {
     Beads { repo: String },
     Github { repo: String },
+    /// kata local-first tracker. `project` is the kata project name
+    /// (created via `kata init --project <name>` in a workspace dir).
+    Kata { project: String },
     #[default]
     None,
 }
@@ -147,6 +150,9 @@ impl JilogConfig {
             }
             TrackerConfig::Github { repo } => {
                 Box::new(GithubTracker::new(repo))
+            }
+            TrackerConfig::Kata { project } => {
+                Box::new(KataTracker::new(project))
             }
             TrackerConfig::None => Box::new(NoneTracker),
         }

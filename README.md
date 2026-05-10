@@ -108,7 +108,7 @@ Learnings from the nightly loop can be filed as issues in any supported tracker:
 | `beads` | JSONL in `.beads/`, git-managed | ✅ built-in |
 | `github` | `gh issue` CLI wrapper | ✅ built-in |
 | `none` | Markdown digest only, no issue creation | ✅ built-in |
-| `kata` | Local SQLite daemon ([wesm/kata](https://github.com/wesm/kata)) | 🔜 planned |
+| `kata` | Local SQLite daemon ([wesm/kata](https://github.com/wesm/kata)) | ✅ built-in |
 
 ```toml
 [tracker]
@@ -116,6 +116,18 @@ type = "github"
 repo = "Joi/jilog"
 labels = ["jilog-learning"]
 ```
+
+Or against a kata local daemon ([wesm/kata](https://github.com/wesm/kata)):
+
+```toml
+[tracker]
+type = "kata"
+project = "jilog"
+```
+
+`project` is the kata project name, created via `kata init --project jilog` in any workspace directory. Set `KATA_AUTHOR=jilog-extractor` so unattended runs are filterable in the events stream.
+
+kata's `--idempotency-key` is wired up natively: a re-run of the extractor against the same digest is a no-op even if `list_open()` misses, because kata returns `duplicate_candidates` on a repeat key. Labels emitted are `jilog` and `jilog:<kind>` (kata enforces `[a-z0-9._:-]` on label charset, so `:` replaces the slash separator used by the github backend).
 
 On subsequent nightly runs, jilog checks which `jilog-learning` issues are still open. If a pattern re-appears for an already-open issue, it's a bump — not a new filing. If the issue is closed and the pattern hasn't recurred, it counts as resolved.
 
