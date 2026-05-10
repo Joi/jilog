@@ -3,7 +3,7 @@
 use anyhow::Context;
 use chrono::{Duration, NaiveDate, Utc};
 
-use jilog_review::digest::ReviewArgs as LibReviewArgs;
+use jilog_review::digest::{DigestReport, ReviewArgs as LibReviewArgs};
 use jilog_review::util::expand_tilde;
 
 use crate::config::JilogConfig;
@@ -29,6 +29,14 @@ pub struct NightlyArgs {
     /// Look-back window in days (default: 1).
     #[arg(long, default_value_t = 1)]
     pub days: u32,
+
+    /// Time window (e.g. "7d", "24h", "2026-05-10"). Conflicts with --days when both are user-supplied.
+    #[arg(long, conflicts_with = "days")]
+    pub since: Option<String>,
+
+    /// Emit a single JSON object to stdout instead of the human summary.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 
     /// Output digest directory (default: from config zone or ~/.jilog/digests).
     #[arg(long)]
@@ -62,7 +70,7 @@ pub fn run(cfg: &JilogConfig, args: ReviewArgs) -> anyhow::Result<()> {
 }
 
 fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
-    let since = Utc::now() - Duration::days(args.days as i64);
+    let since = nightly_since(args)?;
 
     let digest_dir = args
         .digest_dir
@@ -95,22 +103,236 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
     let report = jilog_review::run_review(readers.as_slice(), tracker.as_ref(), &review_args)
         .with_context(|| "review pipeline failed")?;
 
-    println!(
-        "{} corrections, {} errors, {} workarounds, {} P0 alert(s), {} session(s) scanned",
-        report.corrections.len(),
-        report.errors.len(),
-        report.workarounds.len(),
-        report.p0_alerts.len(),
-        report.sessions_scanned,
-    );
+    if args.json {
+        let value = digest_report_json(&report, args.dry_run);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .with_context(|| "failed to serialize review JSON")?
+        );
+    } else {
+        println!(
+            "{} corrections, {} errors, {} workarounds, {} P0 alert(s), {} session(s) scanned",
+            report.corrections.len(),
+            report.errors.len(),
+            report.workarounds.len(),
+            report.p0_alerts.len(),
+            report.sessions_scanned,
+        );
 
-    if !args.dry_run {
-        println!("Digest: {}", report.digest_path.display());
-    }
+        if !args.dry_run {
+            println!("Digest: {}", report.digest_path.display());
+        }
 
-    if !report.created_issues.is_empty() {
-        println!("Created {} issue(s)", report.created_issues.len());
+        if !report.created_issues.is_empty() {
+            println!("Created {} issue(s)", report.created_issues.len());
+        }
     }
 
     Ok(())
+}
+
+fn nightly_since(args: &NightlyArgs) -> anyhow::Result<chrono::DateTime<Utc>> {
+    if let Some(since) = &args.since {
+        crate::commands::query::parse_since(since)
+            .with_context(|| format!("invalid --since value: {}", since))
+    } else {
+        Ok(Utc::now() - Duration::days(args.days as i64))
+    }
+}
+
+fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value {
+    let mut p0_alerts = serde_json::Map::new();
+    for (tool, sessions) in &report.p0_alerts {
+        p0_alerts.insert(
+            tool.clone(),
+            serde_json::Value::Array(
+                sessions
+                    .iter()
+                    .map(|session| serde_json::Value::String(session.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    let created_issues = report
+        .created_issues
+        .iter()
+        .map(|issue| {
+            serde_json::json!({
+                "id": &issue.id,
+                "backend": &issue.backend,
+                "title": &issue.title,
+                "url": &issue.url,
+            })
+        })
+        .collect();
+
+    let digest_path = if dry_run {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(report.digest_path.display().to_string())
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "sessions_scanned": report.sessions_scanned,
+        "corrections": report.corrections.len(),
+        "errors": report.errors.len(),
+        "workarounds": report.workarounds.len(),
+        "p0_alerts": serde_json::Value::Object(p0_alerts),
+        "digest_path": digest_path,
+        "created_issues": serde_json::Value::Array(created_issues),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use clap::Parser;
+    use jilog_review::tracker::IssueRef;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::PathBuf;
+
+    #[derive(Parser, Debug)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: TestCmd,
+    }
+
+    #[derive(clap::Subcommand, Debug)]
+    enum TestCmd {
+        Nightly(NightlyArgs),
+    }
+
+    fn nightly_args() -> NightlyArgs {
+        NightlyArgs {
+            days: 1,
+            since: None,
+            json: false,
+            digest_dir: None,
+            dry_run: false,
+            create_issues: false,
+            date: None,
+            processed_file: None,
+        }
+    }
+
+    fn digest_report() -> DigestReport {
+        let mut p0_alerts = HashMap::new();
+        let mut sessions = BTreeSet::new();
+        sessions.insert("session-a".to_string());
+        sessions.insert("session-b".to_string());
+        p0_alerts.insert("bash".to_string(), sessions);
+
+        DigestReport {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap(),
+            corrections: Vec::new(),
+            errors: Vec::new(),
+            workarounds: Vec::new(),
+            p0_alerts,
+            digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
+            created_issues: vec![IssueRef {
+                id: "#42".to_string(),
+                backend: "github".to_string(),
+                title: "tracked issue".to_string(),
+                url: Some("https://example.com/issues/42".to_string()),
+            }],
+            sessions_scanned: 3,
+        }
+    }
+
+    #[test]
+    fn since_alone_does_not_conflict_with_default_days() {
+        let parsed = TestCli::try_parse_from(["test", "nightly", "--since", "24h"]).unwrap();
+        let TestCmd::Nightly(args) = parsed.cmd;
+
+        assert_eq!(args.since.as_deref(), Some("24h"));
+        assert_eq!(args.days, 1);
+    }
+
+    #[test]
+    fn since_conflicts_with_user_supplied_days() {
+        let err = TestCli::try_parse_from(["test", "nightly", "--since", "24h", "--days", "1"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--since"));
+        assert!(err.contains("--days"));
+    }
+
+    #[test]
+    fn nightly_since_24h_matches_days_one() {
+        let mut args = nightly_args();
+        args.since = Some("24h".to_string());
+
+        let cutoff = nightly_since(&args).unwrap();
+        let days_cutoff = nightly_since(&nightly_args()).unwrap();
+        let delta = cutoff.signed_duration_since(days_cutoff).num_seconds().abs();
+        assert!(delta <= 2, "cutoff differed by {delta} seconds");
+    }
+
+    #[test]
+    fn nightly_since_reports_parse_errors() {
+        let mut args = nightly_args();
+        args.since = Some("notaduration".to_string());
+
+        let err = nightly_since(&args).unwrap_err().to_string();
+        assert!(err.contains("invalid --since value: notaduration"));
+    }
+
+    #[test]
+    fn json_output_has_documented_keys() {
+        let value = digest_report_json(&digest_report(), false);
+        let encoded = serde_json::to_string(&value).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let object = parsed.as_object().unwrap();
+
+        let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "schema_version",
+                "sessions_scanned",
+                "corrections",
+                "errors",
+                "workarounds",
+                "p0_alerts",
+                "digest_path",
+                "created_issues",
+            ])
+        );
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["sessions_scanned"], 3);
+        assert_eq!(
+            parsed["p0_alerts"]["bash"],
+            serde_json::json!(["session-a", "session-b"])
+        );
+        assert_eq!(parsed["created_issues"][0]["id"], "#42");
+        assert_eq!(parsed["created_issues"][0]["backend"], "github");
+        assert_eq!(parsed["created_issues"][0]["title"], "tracked issue");
+        assert_eq!(
+            parsed["created_issues"][0]["url"],
+            "https://example.com/issues/42"
+        );
+    }
+
+    #[test]
+    fn json_dry_run_uses_null_digest_path() {
+        let mut report = digest_report();
+        report.created_issues.clear();
+
+        let value = digest_report_json(&report, true);
+
+        assert!(value["digest_path"].is_null());
+        assert_eq!(value["created_issues"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_since_accepts_iso_dates() {
+        let cutoff = crate::commands::query::parse_since("2026-05-10").unwrap();
+
+        assert_eq!(cutoff, Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap());
+    }
 }
