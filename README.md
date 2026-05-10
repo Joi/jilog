@@ -2,7 +2,7 @@
 
 > An append-only event ledger and nightly learning loop for personal AI infrastructure.
 
-**Status: early design / pre-release**
+**Status: alpha — running in production on the author's systems; API may shift until 1.0.**
 
 ---
 
@@ -18,12 +18,15 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
+### Why not LangSmith / Langfuse?
+
+Those tools do call-level tracing: spans, token counts, latency, cost per request. jilog does something different: it aggregates *patterns across sessions over time* and asks whether the system is actually getting better. The two are complementary — trace your LLM calls with OTEL/Langfuse; use jilog to close the loop on whether yesterday's corrections and workarounds are still happening next week.
+
 ---
 
 ## Architecture
 
 ```
-Intent           ── What your agents are supposed to do (config)
 Event Plane      ── Append-only segment files (source of truth)
 Projection       ── SQLite index (rebuildable at any time)
 Action           ── jilog CLI
@@ -36,11 +39,33 @@ Segment files are the authority. SQLite is a rebuildable index. Nothing generate
 ## Quick Start
 
 ```bash
-cargo install jilog
+cargo install --git https://github.com/Joi/jilog jilog
+```
 
-# Configure
-cp jilog.example.toml jilog.toml
+Create `~/.jilog.toml`:
 
+```toml
+[[reader]]
+type = "claude-code"
+path = "~/.claude/projects"
+
+[[reader]]
+type = "amplifier"
+path = "~/.amplifier/projects"
+
+[tracker]
+type = "github"
+repo = "your-org/your-repo"
+labels = ["jilog-learning"]
+
+[[zones]]
+id = "ops"
+ledger_path = "~/.jilog/ledgers/ops"
+```
+
+Then:
+
+```bash
 # Wrap any recurring task with ledger events
 jilog supervise --task "jibrain-heartbeat" -- ./jibrain-heartbeat.sh
 
@@ -59,25 +84,14 @@ jilog review nightly --json | your-agent synthesize-suggestions
 
 jilog can scan transcripts from different agent systems. Configure one or more readers:
 
-| Reader | Scans | Notes |
+| Reader | Scans | Status |
 |---|---|---|
-| `claude-code` | `~/.claude/projects/*/` JSONL | Default for Claude Code users |
-| `amplifier` | `~/.amplifier/projects/*/transcript.jsonl` | Amplifier sessions |
-| `nanoclaw` | SSH into NanoClaw host, scan session logs | Multi-channel setups |
-| `generic` | Any JSONL matching the jilog signal schema | BYO agent system |
+| `claude-code` | `~/.claude/projects/*/` JSONL | ✅ built-in |
+| `amplifier` | `~/.amplifier/projects/*/transcript.jsonl` | ✅ built-in |
+| `generic` | Any JSONL matching the jilog signal schema | ✅ built-in |
+| `nanoclaw` | SSH into NanoClaw host, scan session logs | 🔜 planned |
 
-```toml
-# jilog.toml
-[[reader]]
-type = "claude-code"
-path = "~/.claude/projects"
-
-[[reader]]
-type = "amplifier"
-path = "~/.amplifier/projects"
-```
-
-Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them.
+Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
 
 ---
 
@@ -85,12 +99,12 @@ Each reader emits normalized `Signal` types: corrections, errors, workarounds, d
 
 Learnings from the nightly loop can be filed as issues in any supported tracker:
 
-| Tracker | Notes |
-|---|---|
-| `beads` | JSONL in `.beads/`, git-managed |
-| `kata` | Local SQLite daemon (wesm/kata) |
-| `github` | `gh issue` CLI wrapper |
-| `none` | Markdown digest only, no issue creation |
+| Tracker | Notes | Status |
+|---|---|---|
+| `beads` | JSONL in `.beads/`, git-managed | ✅ built-in |
+| `github` | `gh issue` CLI wrapper | ✅ built-in |
+| `none` | Markdown digest only, no issue creation | ✅ built-in |
+| `kata` | Local SQLite daemon ([wesm/kata](https://github.com/wesm/kata)) | 🔜 planned |
 
 ```toml
 [tracker]
@@ -100,6 +114,8 @@ labels = ["jilog-learning"]
 ```
 
 On subsequent nightly runs, jilog checks which `jilog-learning` issues are still open. If a pattern re-appears for an already-open issue, it's a bump — not a new filing. If the issue is closed and the pattern hasn't recurred, it counts as resolved.
+
+See the `Tracker` trait in `crates/jilog-review/src/tracker.rs` to implement your own.
 
 ---
 
@@ -291,17 +307,17 @@ Ten core event classes. All stored as append-only segment files; nothing is dele
 | `ledger-core` | Event types, segment format, CRC32 integrity, zone store |
 | `ledger-sqlite` | Rebuildable SQLite projection, event queries |
 | `ledger-spool` | Cross-machine transport with dedup and integrity checks |
-| `jilog-review` | Nightly review engine: signal extraction, dedup, digest generation |
+| `jilog-review` | Nightly review engine: `Reader` + `Tracker` traits, signal detectors, digest renderer |
 | `jilog` | CLI binary: supervise, query, review, issues, status |
 
-Readers and trackers are compiled in via feature flags or separate crates in `readers/` and `trackers/`.
+Built-in readers and trackers live as modules within `jilog-review`. Implement the `Reader` or `Tracker` trait to add your own without forking.
 
 ---
 
 ## Used by
 
-- **opsctl** — Joi Ito's private personal AI infrastructure control plane, uses jilog as its ledger substrate and extends it with manifest validation, claims, and Joi-specific readers.
-- **deshi** — *(planned)* Executive assistant by Tatsuya Ishibe / isbtty.
+- **opsctl** — Joi Ito's private personal AI infrastructure control plane, uses jilog as its ledger substrate and extends it with manifest validation, claims, and Joi-specific readers. Migration to jilog as an external dependency in progress.
+- **deshi** — *(planned)* Executive assistant by Tatsuya Ishibe / [isbtty/deshi](https://github.com/isbtty/deshi).
 
 ---
 
