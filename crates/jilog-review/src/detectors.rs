@@ -1,6 +1,6 @@
 //! Signal detectors — heuristic analysis of transcript messages.
 //!
-//! All four detectors are pure functions over `&[Message]`.
+//! All five detectors are pure functions over `&[Message]`.
 //! Ported verbatim from opsctl/crates/opsctl/src/review_nightly.rs.
 
 use std::collections::{BTreeSet, HashMap};
@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use regex::RegexSet;
 
 use crate::reader::Message;
-use crate::signal::{Correction, ErrorSignal, Workaround};
+use crate::signal::{Correction, DeferralSignal, ErrorSignal, Workaround};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,6 +49,32 @@ const WORKAROUND_LABELS: &[&str] = &[
     "FIXME",
     "quick fix",
     "hack",
+];
+
+/// Deferral pattern regexes — at most ONE deferral per message; first-match wins.
+const DEFERRAL_PATTERNS: &[&str] = &[
+    r"(?i)\bI'?ll come back to (this|that|it)",
+    r"(?i)\bdeferr?ing (this|that|it|until)",
+    r"(?i)\bdefer (this|that|it)(?: (to|until|for))?",
+    r"(?i)\bpunt(ing)? on (this|that|it)",
+    r"(?i)\bleav(e|ing) (this|that|it) for (later|now|next)",
+    r"(?i)\bskipping for now",
+    r"(?i)\bpark(ing)? (this|that|it) for now",
+    r"(?i)\bnext session",
+    r"(?i)\bcircle back (to|on)",
+];
+
+/// Human-readable labels (parallel to DEFERRAL_PATTERNS by index).
+const DEFERRAL_LABELS: &[&str] = &[
+    "come back later",
+    "deferring",
+    "defer",
+    "punt",
+    "leave for later",
+    "skipping for now",
+    "park for now",
+    "next session",
+    "circle back",
 ];
 
 /// Sub-agent session prefix (16 zeros). Sessions whose ID starts with
@@ -254,7 +280,46 @@ pub(crate) fn extract_assistant_text(content: &Option<serde_json::Value>) -> Str
 }
 
 // ---------------------------------------------------------------------------
-// Heuristic 4: P0 alert detection
+// Heuristic 4: Deferral detection
+// ---------------------------------------------------------------------------
+
+/// Compile the deferral regex set once.
+fn deferral_regex() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| RegexSet::new(DEFERRAL_PATTERNS).expect("deferral patterns must compile"))
+}
+
+/// Detect deferral language in assistant messages. At most one
+/// deferral per message (first-match wins, in declaration order).
+pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralSignal> {
+    let regex = deferral_regex();
+    let mut out = Vec::new();
+    for msg in messages {
+        if msg.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        let text = extract_assistant_text(&msg.content);
+        if text.is_empty() {
+            continue;
+        }
+        let matches = regex.matches(&text);
+        if !matches.matched_any() {
+            continue;
+        }
+        // Find the FIRST matched pattern in declaration order.
+        let first_idx = matches.iter().next().expect("matched_any is true");
+        let label = DEFERRAL_LABELS.get(first_idx).copied().unwrap_or("unknown");
+
+        out.push(DeferralSignal {
+            session_id: session_id.to_string(),
+            item: label.to_string(),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic 5: P0 alert detection
 // ---------------------------------------------------------------------------
 
 /// Group errors by tool, count distinct ROOT sessions (skip sub-agents).
@@ -509,6 +574,80 @@ mod tests {
         let msgs = vec![assistant(&long_text)];
         let out = detect_workarounds(&msgs, "s1");
         assert_eq!(out[0].context.chars().count(), 200);
+    }
+
+    // ---------- deferrals ----------
+
+    #[test]
+    fn deferrals_basic_match() {
+        let msgs = vec![assistant("I'll come back to this after the tests pass.")];
+        let out = detect_deferrals(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "s1");
+        assert_eq!(out[0].item, "come back later");
+    }
+
+    #[test]
+    fn deferrals_short_text_detected() {
+        let msgs = vec![assistant("next session")];
+        let out = detect_deferrals(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].item, "next session");
+    }
+
+    #[test]
+    fn deferrals_first_match_wins() {
+        let msgs = vec![assistant("I'll come back to this next session.")];
+        let out = detect_deferrals(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].item, "come back later");
+    }
+
+    #[test]
+    fn deferrals_user_role_skipped() {
+        let msgs = vec![user("please punt on this until next session")];
+        assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn deferrals_tool_blocks_excluded() {
+        let msgs = vec![Message {
+            role: Some("assistant".into()),
+            content: Some(json!([
+                {"type": "tool_use", "name": "bash", "input": {"note": "next session"}},
+                {"type": "text", "text": "I ran the command."},
+            ])),
+            name: None,
+        }];
+        let out = detect_deferrals(&msgs, "s1");
+        assert!(out.is_empty(), "tool_use blocks must be skipped");
+    }
+
+    #[test]
+    fn deferrals_no_match_returns_empty() {
+        let msgs = vec![assistant("All requested work is complete.")];
+        assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn deferrals_label_emitted_correctly() {
+        let msgs = vec![assistant("Let me defer that until the next pass.")];
+        let out = detect_deferrals(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].item, "defer");
+    }
+
+    #[test]
+    fn deferrals_overlap_with_workaround_both_fire() {
+        let msgs = vec![assistant(
+            "Skipping for now while we validate the migration.",
+        )];
+        let workarounds = detect_workarounds(&msgs, "s1");
+        let deferrals = detect_deferrals(&msgs, "s1");
+        assert_eq!(workarounds.len(), 1);
+        assert_eq!(workarounds[0].pattern, "for now");
+        assert_eq!(deferrals.len(), 1);
+        assert_eq!(deferrals[0].item, "skipping for now");
     }
 
     // ---------- p0 alerts ----------

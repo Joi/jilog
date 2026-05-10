@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, DateTime, Utc};
 
-use crate::detectors::{detect_corrections, detect_errors, detect_workarounds, detect_p0_alerts};
 use crate::detectors::MAX_ERROR_MESSAGE_LENGTH;
+use crate::detectors::{
+    detect_corrections, detect_deferrals, detect_errors, detect_p0_alerts, detect_workarounds,
+};
 use crate::error::JilogReviewError;
 use crate::reader::{ProcessedSessions, Reader};
-use crate::signal::{Correction, ErrorSignal, Signal, Workaround};
+use crate::signal::{Correction, DeferralSignal, ErrorSignal, Signal, Workaround};
 use crate::tracker::{IssueRef, Tracker};
 use crate::util::{python_repr, truncate_with_marker};
 
@@ -39,6 +41,7 @@ pub struct DigestReport {
     pub corrections: Vec<Correction>,
     pub errors: Vec<ErrorSignal>,
     pub workarounds: Vec<Workaround>,
+    pub deferrals: Vec<DeferralSignal>,
     pub p0_alerts: HashMap<String, BTreeSet<String>>,
     pub digest_path: PathBuf,
     pub created_issues: Vec<IssueRef>,
@@ -53,8 +56,8 @@ pub struct DigestReport {
 /// iterate readers → discover transcripts → load messages →
 /// run detectors → dedup against tracker → create issues → render digest.
 ///
-/// Note: Pattern and Deferral signals are produced by NO detector at this
-/// time. They are in the Signal enum for forward-compatibility only.
+/// Note: Pattern signals are produced by NO detector at this time. They are in
+/// the Signal enum for forward-compatibility only.
 pub fn run_review(
     readers: &[Box<dyn Reader>],
     tracker: &dyn Tracker,
@@ -63,6 +66,7 @@ pub fn run_review(
     let mut all_corrections: Vec<Correction> = Vec::new();
     let mut all_errors: Vec<ErrorSignal> = Vec::new();
     let mut all_workarounds: Vec<Workaround> = Vec::new();
+    let mut all_deferrals: Vec<DeferralSignal> = Vec::new();
     let mut sessions_scanned: usize = 0;
     let mut created_issues: Vec<IssueRef> = Vec::new();
 
@@ -101,10 +105,12 @@ pub fn run_review(
             let corrections = detect_corrections(&messages, &handle.session_id);
             let errors = detect_errors(&messages, &handle.session_id);
             let workarounds = detect_workarounds(&messages, &handle.session_id);
+            let deferrals = detect_deferrals(&messages, &handle.session_id);
 
             all_corrections.extend(corrections);
             all_errors.extend(errors);
             all_workarounds.extend(workarounds);
+            all_deferrals.extend(deferrals);
             sessions_scanned += 1;
 
             if let Some(ref mut ps) = processed {
@@ -138,6 +144,13 @@ pub fn run_review(
                 Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
+        for deferral in &all_deferrals {
+            let signal = Signal::Deferral(deferral.clone());
+            match tracker.create(&signal) {
+                Ok(issue_ref) => created_issues.push(issue_ref),
+                Err(e) => tracing::warn!("tracker.create failed: {}", e),
+            }
+        }
     }
 
     // Render and write digest.
@@ -150,6 +163,7 @@ pub fn run_review(
             &all_corrections,
             &all_errors,
             &all_workarounds,
+            &all_deferrals,
             &p0_alerts,
             &args.digest_dir,
         )?;
@@ -167,6 +181,7 @@ pub fn run_review(
         corrections: all_corrections,
         errors: all_errors,
         workarounds: all_workarounds,
+        deferrals: all_deferrals,
         p0_alerts,
         digest_path,
         created_issues,
@@ -175,21 +190,21 @@ pub fn run_review(
 }
 
 // ---------------------------------------------------------------------------
-// render_digest — byte-for-byte compatible with opsctl
+// render_digest — stable markdown digest format
 // ---------------------------------------------------------------------------
 
 /// Render a learning-digest markdown string.
 ///
-/// Output format is byte-compatible with the Python script and opsctl.
 /// Consumers that grep these digests depend on this exact format.
 pub fn render_digest(
     date: &str,
     corrections: &[Correction],
     errors: &[ErrorSignal],
     workarounds: &[Workaround],
+    deferrals: &[DeferralSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
 ) -> String {
-    let signals = corrections.len() + errors.len() + workarounds.len();
+    let signals = corrections.len() + errors.len() + workarounds.len() + deferrals.len();
     let mut buf = String::new();
     buf.push_str("---\n");
     buf.push_str(&format!("date: {}\n", date));
@@ -198,6 +213,7 @@ pub fn render_digest(
     buf.push_str(&format!("corrections: {}\n", corrections.len()));
     buf.push_str(&format!("errors: {}\n", errors.len()));
     buf.push_str(&format!("workarounds: {}\n", workarounds.len()));
+    buf.push_str(&format!("deferrals: {}\n", deferrals.len()));
     buf.push_str("---\n\n");
 
     buf.push_str(&format!("# Learning Digest — {}\n\n", date));
@@ -268,6 +284,17 @@ pub fn render_digest(
         buf.push('\n');
     }
 
+    // Deferrals
+    buf.push_str("## Deferrals\n\n");
+    if deferrals.is_empty() {
+        buf.push_str("_No deferrals detected._\n\n");
+    } else {
+        for d in deferrals {
+            buf.push_str(&format!("- `{}` pattern=`{}`\n", d.session_id, d.item));
+        }
+        buf.push('\n');
+    }
+
     buf
 }
 
@@ -281,12 +308,13 @@ pub fn write_digest(
     corrections: &[Correction],
     errors: &[ErrorSignal],
     workarounds: &[Workaround],
+    deferrals: &[DeferralSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     digest_dir: &Path,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = digest_dir.join(format!("learning-digest-{}.md", date));
-    let body = render_digest(date, corrections, errors, workarounds, p0_alerts);
+    let body = render_digest(date, corrections, errors, workarounds, deferrals, p0_alerts);
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -312,21 +340,23 @@ mod tests {
     #[test]
     fn digest_frontmatter_has_counts() {
         let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("corrections: 1"));
         assert!(body.contains("errors: 0"));
+        assert!(body.contains("deferrals: 0"));
     }
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
         assert!(body.contains("_No workarounds detected._"));
+        assert!(body.contains("_No deferrals detected._"));
     }
 
     #[test]
@@ -337,7 +367,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &p0);
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &p0);
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -348,7 +378,7 @@ mod tests {
             session_id: "abc".into(),
             context: "don't do that".into(),
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -360,14 +390,25 @@ mod tests {
             tool_name: "bash".into(),
             message: "x".repeat(600),
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &HashMap::new());
         assert!(body.contains("[truncated]"));
+    }
+
+    #[test]
+    fn digest_deferrals_render_item() {
+        let deferrals = vec![DeferralSignal {
+            session_id: "s1".into(),
+            item: "next session".into(),
+        }];
+        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &HashMap::new());
+        assert!(body.contains("signals_captured: 1"));
+        assert!(body.contains("- `s1` pattern=`next session`"));
     }
 
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &dir).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &dir).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);

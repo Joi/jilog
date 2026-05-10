@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 /// A learning signal extracted from session transcripts.
 ///
-/// `Pattern` and `Deferral` are reserved for future detectors; no current
-/// detector produces them. They appear in the enum for forward-compat only.
+/// `Pattern` is reserved for a future detector. It appears in the enum for
+/// forward-compat only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Signal {
@@ -14,7 +14,6 @@ pub enum Signal {
     Workaround(Workaround),
     /// Reserved: pattern detector not yet implemented.
     Pattern(PatternSignal),
-    /// Reserved: deferral detector not yet implemented.
     Deferral(DeferralSignal),
 }
 
@@ -76,7 +75,7 @@ pub struct PatternSignal {
     pub description: String,
 }
 
-/// Reserved: detected deferral. No detector produces this yet.
+/// Assistant text postponing work to a later session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeferralSignal {
     pub session_id: String,

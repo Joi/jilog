@@ -125,13 +125,14 @@ See the `Tracker` trait in `crates/jilog-review/src/tracker.rs` to implement you
 
 ## Signal anatomy
 
-Four signal types are detected today. Two more (`Pattern`, `Deferral`) are reserved in the enum for forward compatibility but no detector produces them yet.
+Five signal types are detected today. One more (`Pattern`) is reserved in the enum for forward compatibility but no detector produces it yet.
 
 | Signal        | What triggers it                                                    | Detector heuristic                                                                                       |
 |---------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | `Correction`  | User pushes back on an assistant turn in 15–200 chars               | `assistant → user → assistant` window with a short user message in the middle                            |
 | `Error`       | A tool call returned a structured failure                           | A `role: tool` message whose JSON content has `success: false`                                           |
 | `Workaround`  | Assistant text admits a temporary or hacky path                     | First-match across `for now`, `temporary`, `workaround`, `hardcoded`, `TODO`, `FIXME`, `quick fix`, `hack` |
+| `Deferral`    | Assistant text postpones work to a later session                    | First-match across `come back to`, `defer`, `punt on`, `leave for later`, `skipping for now`, `park for now`, `next session`, `circle back` |
 | `P0 Alert`    | The same tool failed in **3+ distinct root sessions** in the window | Aggregation pass over `Error` signals (sub-agent sessions with the all-zero prefix are excluded)         |
 
 Each emitted signal carries the `session_id` it came from, so digest and tracker entries always link back to the conversation that produced them.
@@ -150,6 +151,7 @@ p0_count: 1
 corrections: 3
 errors: 2
 workarounds: 2
+deferrals: 0
 ---
 
 # Learning Digest — 2026-05-09
@@ -173,6 +175,10 @@ workarounds: 2
 
 - `2f1c8d77-91ab-4c5d-8e6f-1a2b3c4d5e6f` pattern=`for now`: 'Hardcoding the retry count to 3 for now until we wire it through config.'
 - `8a4b1e09-3344-4abc-9def-0123456789ab` pattern=`TODO`: 'TODO: replace this fallback path once the upstream module exposes the new API.'
+
+## Deferrals
+
+_No deferrals detected._
 ````
 
 The frontmatter is machine-parseable. A common downstream check is "did yesterday's digest go silent on P0?" — `yq '.p0_count' learning-digest-*.md` gives a per-day series.
@@ -212,6 +218,7 @@ The issue title is built by `signal_title()` (see `crates/jilog-review/src/track
 [jilog/correction] <session_id>: <truncated context>
 [jilog/error]      <tool_name>:  <truncated message>
 [jilog/workaround] <pattern>:    <truncated context>
+[jilog/deferral]   <session_id>: <truncated item>
 ```
 
 A run that produced the digest above would land entries like these in `.beads/issues.jsonl` with `tracker.type = "beads"` (one JSON object per line, shown pretty-printed):
