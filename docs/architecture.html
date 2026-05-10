@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>jilog · how it works</title>
+<style>
+  :root {
+    --bg: #faf8f3;
+    --ink: #1a1a1a;
+    --muted: #6b6b6b;
+    --line: #d8d3c4;
+    --line-soft: #ebe6d8;
+    --navy: #1f3b5f;
+    --teal: #4a8a8a;
+    --terra: #d97757;
+    --gold: #c9a55c;
+    --card: #ffffff;
+    --code-bg: #f3efe5;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 56px 28px 80px; }
+  header { margin-bottom: 40px; }
+  .eyebrow {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--terra);
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  h1 {
+    font-size: 44px;
+    line-height: 1.05;
+    margin: 0 0 14px;
+    color: var(--navy);
+    letter-spacing: -0.02em;
+    font-weight: 700;
+  }
+  h1 code {
+    background: transparent;
+    padding: 0;
+    color: var(--navy);
+    font-family: "SF Mono", "Menlo", "Monaco", monospace;
+    font-size: 0.92em;
+  }
+  .lede {
+    font-size: 19px;
+    color: var(--ink);
+    max-width: 64ch;
+    line-height: 1.5;
+  }
+  .lede strong { color: var(--navy); }
+  .lede em { color: var(--terra); font-style: normal; font-weight: 600; }
+  h2 {
+    font-size: 26px;
+    margin: 64px 0 8px;
+    color: var(--navy);
+    letter-spacing: -0.01em;
+    font-weight: 700;
+  }
+  h2 .num {
+    color: var(--terra);
+    font-variant-numeric: tabular-nums;
+    margin-right: 12px;
+    font-weight: 700;
+  }
+  .sub { color: var(--muted); font-size: 15px; margin: 0 0 24px; max-width: 70ch; }
+  .sub code { background: rgba(31, 59, 95, 0.06); }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 24px 22px;
+    margin-bottom: 8px;
+  }
+  .diagram { padding: 24px 18px; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .caption { font-size: 13px; color: var(--muted); text-align: center; margin: 12px 0 0; font-style: italic; }
+  code { font-family: "SF Mono", "Menlo", "Monaco", monospace; font-size: 0.88em; background: rgba(31, 59, 95, 0.06); padding: 2px 6px; border-radius: 3px; color: var(--navy); }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin: 0;
+    font-family: "SF Mono", "Menlo", "Monaco", monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    overflow-x: auto;
+    color: #2d2d2d;
+  }
+  pre .c { color: #6b6b6b; font-style: italic; }   /* comments / muted */
+  pre .k { color: var(--navy); font-weight: 600; } /* keys / headers */
+  pre .v { color: var(--teal); }                   /* values */
+  pre .a { color: var(--terra); }                  /* accents / labels */
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-2 > .card { margin-bottom: 0; }
+  .grid-2 h4 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--terra); }
+
+  .signals { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 0; padding: 0; list-style: none; }
+  .signals li { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+  .signals .name { display: inline-block; padding: 3px 10px; border-radius: 3px; font-family: "SF Mono", monospace; font-size: 12px; color: #fff; font-weight: 600; margin-bottom: 10px; }
+  .signals .name.cor { background: var(--navy); }
+  .signals .name.err { background: var(--teal); }
+  .signals .name.wrk { background: var(--gold); color: #1a1a1a; }
+  .signals .name.p0  { background: var(--terra); }
+  .signals .what { font-weight: 600; color: var(--navy); margin-bottom: 4px; font-size: 14px; }
+  .signals .how { font-size: 13px; color: var(--muted); line-height: 1.4; }
+  .signals .how code { background: var(--code-bg); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th { font-weight: 600; color: var(--navy); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--line); }
+  td code { background: var(--code-bg); }
+  tr:last-child td { border-bottom: 0; }
+
+  ul.bullets { padding-left: 18px; margin: 0; }
+  ul.bullets li { margin-bottom: 8px; }
+  ul.bullets li b { color: var(--navy); }
+
+  .crates { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; padding: 0; list-style: none; }
+  .crates li { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
+  .crates b { color: var(--navy); font-family: "SF Mono", monospace; font-size: 14px; display: block; margin-bottom: 4px; }
+  .crates span { font-size: 14px; color: var(--muted); line-height: 1.45; }
+
+  .events { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; list-style: none; padding: 0; }
+  .events li { background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; font-size: 13px; }
+  .events code { background: transparent; padding: 0; color: var(--navy); font-weight: 600; display: block; margin-bottom: 2px; }
+  .events span { color: var(--muted); font-size: 12px; }
+
+  .commands {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 16px 18px;
+    font-family: "SF Mono", monospace;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  .commands .cmd { color: var(--navy); font-weight: 600; }
+  .commands .desc { color: var(--muted); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  footer a { color: var(--navy); text-decoration: none; border-bottom: 1px solid var(--line); }
+  footer a:hover { border-color: var(--terra); }
+  @media (max-width: 700px) {
+    .wrap { padding: 32px 18px 60px; }
+    h1 { font-size: 32px; }
+    .lede { font-size: 17px; }
+    h2 { font-size: 22px; }
+    .grid-2 { grid-template-columns: 1fr; }
+    pre { font-size: 11.5px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">Architecture · Rust workspace · MIT · status: pre-release</div>
+  <h1><code>jilog</code></h1>
+  <p class="lede"><strong>An append-only event ledger and nightly learning loop for personal AI infrastructure.</strong> jilog watches what your agents actually do, keeps a durable record of it, and surfaces patterns nightly &mdash; <em>what the system keeps getting wrong, where prompts are failing, what's worth fixing.</em></p>
+  <p class="sub" style="margin-top:14px;max-width:64ch">jilog is the <strong>observation and structuring layer</strong>. LLM synthesis, prompt rewrites, and triage decisions sit one level up &mdash; in the agent or workflow that wraps jilog. This keeps it Rust-pure, usable without an API key, and integrable with any agent stack.</p>
+</header>
+
+<h2><span class="num">01</span> What jilog watches</h2>
+<p class="sub">Each scan of session transcripts emits typed <code>Signal</code>s. Detectors are simple, deterministic heuristics &mdash; no LLM in the loop &mdash; so the same input always produces the same signals.</p>
+
+<ul class="signals">
+  <li>
+    <span class="name cor">Correction</span>
+    <div class="what">User pushes back on a turn</div>
+    <div class="how">An <code>assistant → user → assistant</code> window where the user message is 15&ndash;200 chars. Short pushback, not a new question.</div>
+  </li>
+  <li>
+    <span class="name err">Error</span>
+    <div class="what">A tool call returned a structured failure</div>
+    <div class="how">A <code>role: tool</code> message whose JSON content has <code>success: false</code>.</div>
+  </li>
+  <li>
+    <span class="name wrk">Workaround</span>
+    <div class="what">Assistant admits a hacky path</div>
+    <div class="how">First match across <code>for now</code>, <code>temporary</code>, <code>workaround</code>, <code>hardcoded</code>, <code>TODO</code>, <code>FIXME</code>, <code>quick fix</code>, <code>hack</code>.</div>
+  </li>
+  <li>
+    <span class="name p0">P0 Alert</span>
+    <div class="what">Same tool fails across many sessions</div>
+    <div class="how">Aggregation pass: a tool that errored in <strong>3+ distinct root sessions</strong> in the window (sub-agent sessions excluded).</div>
+  </li>
+</ul>
+<p class="caption">Each signal carries the <code>session_id</code> it came from, so digests and issues link back to the originating conversation.</p>
+
+<h2><span class="num">02</span> What jilog produces</h2>
+<p class="sub">A nightly run writes a markdown digest and (optionally) files issues to your tracker. The digest layout is byte-stable so downstream tooling can grep it.</p>
+
+<div class="grid-2">
+
+<div class="card">
+<h4>digest excerpt</h4>
+<pre><span class="c">---</span>
+<span class="k">date:</span> <span class="v">2026-05-09</span>
+<span class="k">signals_captured:</span> <span class="v">7</span>
+<span class="k">p0_count:</span> <span class="v">1</span>
+<span class="k">corrections:</span> <span class="v">3</span>
+<span class="k">errors:</span> <span class="v">2</span>
+<span class="k">workarounds:</span> <span class="v">2</span>
+<span class="c">---</span>
+
+<span class="a"># Learning Digest — 2026-05-09</span>
+
+<span class="a">## P0 Alerts</span>
+- <span class="k">**P0 ALERT**</span>: `bash` failed in 4
+  distinct sessions: 0e91a2b4…, 2f1c8d77…,
+  8a4b1e09…, c5d76f02…
+
+<span class="a">## Corrections</span>
+- `0e91a2b4-…` — 'no, use the gog cli for
+  calendar, not osascript'
+- `2f1c8d77-…` — 'wrong path — that file is
+  in jibrain/atlas, not switchboard/people'
+
+<span class="a">## Errors</span>
+- `0e91a2b4-…` / `bash`:
+    Command timed out after 30 seconds
+- `c5d76f02-…` / `read_file`:
+    ~ was not expanded; use $HOME
+
+<span class="a">## Workarounds</span>
+- `2f1c8d77-…` pattern=`for now`:
+    'Hardcoding the retry count to 3…'</pre>
+</div>
+
+<div class="card">
+<h4>issue filed in beads</h4>
+<pre>{
+  <span class="k">"id"</span>: <span class="v">"myproj-a1b"</span>,
+  <span class="k">"title"</span>: <span class="v">"[jilog/error] bash:
+       Command timed out after 30 seconds"</span>,
+  <span class="k">"type"</span>: <span class="v">"bug"</span>,
+  <span class="k">"priority"</span>: <span class="v">1</span>,
+  <span class="k">"status"</span>: <span class="v">"open"</span>,
+  <span class="k">"labels"</span>: [<span class="v">"jilog"</span>, <span class="v">"p0"</span>, <span class="v">"tool:bash"</span>],
+  <span class="k">"body"</span>: <span class="v">"Detected by jilog/review on
+   2026-05-09. Tool `bash` failed in 4
+   distinct root sessions in the last
+   24h, exceeding the P0 threshold (3).
+
+   Example sessions:
+   - 0e91a2b4-7d3f-…
+   - 2f1c8d77-91ab-…
+   - 8a4b1e09-3344-…
+   - c5d76f02-aabb-…
+
+   First observed message:
+   > Command timed out after 30s"</span>,
+  <span class="k">"source"</span>: <span class="v">"jilog/review"</span>,
+  <span class="k">"created"</span>: <span class="v">"2026-05-09T08:02:11Z"</span>
+}</pre>
+</div>
+
+</div>
+<p class="caption">On the next nightly run, this issue will be in <code>list_open()</code> and <strong>not refiled</strong>. <code>Tracker::create</code> dedups against open issues automatically.</p>
+
+<h2><span class="num">03</span> Two flows, one CLI</h2>
+<p class="sub">jilog has two independent data flows. <code>supervise</code> wraps recurring tasks and feeds the ledger directly. <code>review</code> reads agent session transcripts and emits signals. Both write to the same event ledger; both can be queried.</p>
+
+<div class="card diagram">
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="jilog data flows">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f3b5f"/>
+    </marker>
+    <marker id="arrow-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d97757"/>
+    </marker>
+  </defs>
+
+  <!-- column headers -->
+  <text x="100" y="32" text-anchor="middle" font-family="-apple-system" font-size="11" font-weight="700" fill="#d97757" letter-spacing="1.5">YOUR WORLD</text>
+  <text x="460" y="32" text-anchor="middle" font-family="-apple-system" font-size="11" font-weight="700" fill="#d97757" letter-spacing="1.5">jilog</text>
+  <text x="820" y="32" text-anchor="middle" font-family="-apple-system" font-size="11" font-weight="700" fill="#d97757" letter-spacing="1.5">OUTPUTS</text>
+
+  <!-- top flow: supervise -->
+  <rect x="20" y="70" width="180" height="60" rx="8" fill="#fff" stroke="#1f3b5f" stroke-width="1.5"/>
+  <text x="110" y="93" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">recurring tasks</text>
+  <text x="110" y="111" text-anchor="middle" font-family="-apple-system" font-size="11" fill="#6b6b6b">heartbeats, jobs,</text>
+  <text x="110" y="124" text-anchor="middle" font-family="-apple-system" font-size="11" fill="#6b6b6b">pipelines, cron</text>
+
+  <line x1="204" y1="100" x2="246" y2="100" stroke="#1f3b5f" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="225" y="92" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#1f3b5f">supervise</text>
+
+  <rect x="250" y="70" width="180" height="60" rx="8" fill="#1f3b5f"/>
+  <text x="340" y="93" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#fff">jilog supervise</text>
+  <text x="340" y="111" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#c4d2e0">wrap task; emit events:</text>
+  <text x="340" y="124" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#c9a55c">ingest · health · state_change</text>
+
+  <!-- bottom flow: review -->
+  <rect x="20" y="240" width="180" height="60" rx="8" fill="#fff" stroke="#1f3b5f" stroke-width="1.5"/>
+  <text x="110" y="263" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">AI sessions</text>
+  <text x="110" y="281" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#6b6b6b">~/.claude/projects</text>
+  <text x="110" y="294" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#6b6b6b">~/.amplifier/projects</text>
+
+  <line x1="204" y1="270" x2="246" y2="270" stroke="#1f3b5f" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="225" y="262" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#1f3b5f">readers</text>
+
+  <rect x="250" y="240" width="180" height="60" rx="8" fill="#4a8a8a"/>
+  <text x="340" y="263" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#fff">jilog review</text>
+  <text x="340" y="281" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#dceae9">parse → detect signals</text>
+  <text x="340" y="294" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#fff">corr · err · workaround · p0</text>
+
+  <!-- center: ledger sits between the two flows -->
+  <rect x="490" y="160" width="220" height="80" rx="10" fill="#fff" stroke="#1f3b5f" stroke-width="2"/>
+  <text x="600" y="186" text-anchor="middle" font-family="-apple-system" font-size="14" font-weight="700" fill="#1f3b5f">📦 event ledger</text>
+  <text x="600" y="206" text-anchor="middle" font-family="-apple-system" font-size="11" fill="#6b6b6b">append-only segment files</text>
+  <text x="600" y="221" text-anchor="middle" font-family="-apple-system" font-size="11" fill="#6b6b6b">+ rebuildable SQLite index</text>
+  <text x="600" y="236" text-anchor="middle" font-family="-apple-system" font-size="10" font-style="italic" fill="#c9a55c">durable · integrity-checked</text>
+
+  <!-- arrows from each flow into the ledger -->
+  <path d="M 432 100 Q 470 100 480 165" fill="none" stroke="#1f3b5f" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 432 270 Q 470 270 480 235" fill="none" stroke="#1f3b5f" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- arrows from ledger and review to outputs -->
+  <line x1="710" y1="180" x2="745" y2="100" stroke="#1f3b5f" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="730" y="135" font-family="SF Mono, monospace" font-size="10" fill="#1f3b5f">query</text>
+
+  <path d="M 432 285 Q 600 320 745 285" fill="none" stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-t)"/>
+  <text x="600" y="338" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#d97757">digest + issues</text>
+
+  <!-- right side: outputs -->
+  <rect x="750" y="70" width="150" height="60" rx="8" fill="#fff" stroke="#1f3b5f" stroke-width="1.5"/>
+  <text x="825" y="93" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">jilog query</text>
+  <text x="825" y="111" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">filter ledger events</text>
+  <text x="825" y="124" text-anchor="middle" font-family="SF Mono, monospace" font-size="10" fill="#6b6b6b">--since · --class</text>
+
+  <rect x="750" y="255" width="150" height="60" rx="8" fill="#fff" stroke="#d97757" stroke-width="1.5"/>
+  <text x="825" y="278" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">📋 digest + 📂 issues</text>
+  <text x="825" y="296" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">markdown report</text>
+  <text x="825" y="309" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">beads · github · kata</text>
+</svg>
+</div>
+<p class="caption"><code>supervise</code> instruments your jobs; <code>review</code> mines your agent transcripts. Both write events to the same ledger. A nightly <code>review</code> also files issues for novel patterns.</p>
+
+<h2><span class="num">04</span> The mental model</h2>
+<p class="sub">Four layers, top to bottom. Segment files are the source of truth; everything below them is derivable. Nothing generated is ever manually edited.</p>
+
+<div class="card diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Layered architecture: Intent / Event Plane / Projection / Action">
+  <!-- intent -->
+  <rect x="60" y="20" width="600" height="44" rx="6" fill="#fff" stroke="#1f3b5f" stroke-width="1.5"/>
+  <text x="80" y="48" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">Intent</text>
+  <text x="640" y="48" text-anchor="end" font-family="-apple-system" font-size="12" fill="#6b6b6b" font-style="italic">what your agents are supposed to do · config</text>
+
+  <!-- event plane -->
+  <rect x="60" y="78" width="600" height="64" rx="6" fill="#1f3b5f"/>
+  <text x="80" y="106" font-family="-apple-system" font-size="13" font-weight="700" fill="#fff">Event Plane</text>
+  <text x="640" y="106" text-anchor="end" font-family="-apple-system" font-size="12" fill="#c4d2e0" font-style="italic">append-only segment files · source of truth</text>
+  <text x="80" y="128" font-family="SF Mono, monospace" font-size="11" fill="#c9a55c">crc32 · per-zone · never deleted</text>
+
+  <!-- projection -->
+  <rect x="60" y="156" width="600" height="44" rx="6" fill="#fff" stroke="#4a8a8a" stroke-width="1.5"/>
+  <text x="80" y="184" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">Projection</text>
+  <text x="640" y="184" text-anchor="end" font-family="-apple-system" font-size="12" fill="#6b6b6b" font-style="italic">SQLite index · rebuildable at any time</text>
+
+  <!-- action -->
+  <rect x="60" y="214" width="600" height="44" rx="6" fill="#fff" stroke="#d97757" stroke-width="1.5"/>
+  <text x="80" y="242" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">Action</text>
+  <text x="640" y="242" text-anchor="end" font-family="-apple-system" font-size="12" fill="#6b6b6b" font-style="italic">jilog CLI · supervise · query · review · issues</text>
+</svg>
+</div>
+
+<h2><span class="num">05</span> Pluggable backends</h2>
+<p class="sub">Readers and trackers are independent extension points. Each <code>Reader</code> normalizes its native log format into <code>Vec&lt;Message&gt;</code>; detectors are blind to where the messages came from.</p>
+
+<div class="grid-2">
+<div class="card">
+<h4>Readers — where session logs live</h4>
+<table>
+  <tr><th>Reader</th><th>Scans</th></tr>
+  <tr><td><code>claude-code</code></td><td><code>~/.claude/projects/*/</code> JSONL</td></tr>
+  <tr><td><code>amplifier</code></td><td><code>~/.amplifier/projects/*/transcript.jsonl</code></td></tr>
+  <tr><td><code>nanoclaw</code></td><td>SSH into NanoClaw host, scan session logs</td></tr>
+  <tr><td><code>generic</code></td><td>Any JSONL matching the jilog signal schema</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h4>Trackers — where issues get filed</h4>
+<table>
+  <tr><th>Tracker</th><th>Backend</th></tr>
+  <tr><td><code>beads</code></td><td>JSONL in <code>.beads/</code>, git-managed</td></tr>
+  <tr><td><code>kata</code></td><td>Local SQLite daemon (wesm/kata)</td></tr>
+  <tr><td><code>github</code></td><td><code>gh issue</code> CLI wrapper</td></tr>
+  <tr><td><code>none</code></td><td>Markdown digest only, no issues filed</td></tr>
+</table>
+</div>
+</div>
+<p class="caption">Configure one or more in <code>jilog.toml</code>; the nightly loop merges signals across all configured readers and writes through to the configured tracker.</p>
+
+<h2><span class="num">06</span> Crates and event classes</h2>
+<p class="sub">A small Rust workspace with five crates, plus ten core event classes appended to the ledger.</p>
+
+<ul class="crates">
+  <li><b>ledger-core</b><span>Event types, segment format, CRC32 integrity, zone store.</span></li>
+  <li><b>ledger-sqlite</b><span>Rebuildable SQLite projection over segments. Throwaway state.</span></li>
+  <li><b>ledger-spool</b><span>Cross-machine transport with dedup and integrity checks.</span></li>
+  <li><b>jilog-review</b><span>Nightly engine: signal extraction, dedup, digest generation.</span></li>
+  <li><b>jilog</b><span>The CLI binary: <code>supervise</code>, <code>query</code>, <code>review</code>, <code>issues</code>, <code>status</code>.</span></li>
+</ul>
+
+<h4 style="margin:24px 0 10px;color:var(--terra);font-size:13px;letter-spacing:1px;text-transform:uppercase">Ten event classes</h4>
+<ul class="events">
+  <li><code>ingest</code><span>content arrived</span></li>
+  <li><code>route</code><span>directed to destination</span></li>
+  <li><code>decision</code><span>human or system decision</span></li>
+  <li><code>state_change</code><span>object state transition</span></li>
+  <li><code>health</code><span>system health observation</span></li>
+  <li><code>delivery</code><span>notification delivered</span></li>
+  <li><code>projection</code><span>projection refreshed</span></li>
+  <li><code>note_meta</code><span>operational note lifecycle</span></li>
+  <li><code>review</code><span>nightly review run</span></li>
+  <li><code>learning</code><span>pattern extracted from session</span></li>
+</ul>
+
+<h2><span class="num">07</span> Patterns it surfaces in practice</h2>
+<p class="sub">Drawn from real runs against Amplifier and Claude Code transcripts. The point isn't that any one is interesting in isolation &mdash; it's that the <em>same signal across many distinct sessions</em> is a load-bearing operational fact.</p>
+
+<ul class="bullets">
+  <li><b>P0 ALERT <code>bash</code></b> &mdash; agents hitting the default 30-second timeout on long-running builds, tests, or <code>find</code>. The fix is invariably one of <code>timeout=</code>, <code>run_in_background=true</code>, or "scope this to a directory."</li>
+  <li><b>workaround <code>[for now]</code></b> &mdash; feature work that landed with a hardcoded config value waiting for an env-var or settings plumbing pass.</li>
+  <li><b>workaround <code>[TODO]</code></b> &mdash; error paths the assistant explicitly flagged as incomplete; the highest-signal source of follow-up tickets.</li>
+  <li><b>correction</b> &mdash; short user pushbacks: <em>"wrong path"</em>, <em>"that's the old API"</em>, <em>"don't auto-resolve conflicts"</em>. Each one says some context (a skill, an <code>AGENTS.md</code> note, a frontmatter convention) wasn't loaded or wasn't followed.</li>
+  <li><b>error <code>read_file: ~ was not expanded</code></b> &mdash; recurring tilde-expansion bugs in tool surfaces; pass an absolute path or use <code>$HOME</code>.</li>
+</ul>
+
+<h2><span class="num">08</span> Commands</h2>
+<div class="commands">
+<div><span class="cmd">jilog supervise</span> <span class="desc"># wrap tasks with ledger events + retry</span></div>
+<div><span class="cmd">jilog query</span> <span class="desc">[--since N] [--json]   # filter ledger events</span></div>
+<div><span class="cmd">jilog review nightly</span> <span class="desc">[--json]    # digest + issue filing</span></div>
+<div><span class="cmd">jilog review sessions</span>           <span class="desc"># session-level summary by reader</span></div>
+<div><span class="cmd">jilog issues list</span>               <span class="desc"># open jilog-learning issues</span></div>
+<div><span class="cmd">jilog issues pending</span>            <span class="desc"># learnings not yet filed</span></div>
+<div><span class="cmd">jilog rebuild</span>                   <span class="desc"># rebuild SQLite from segments</span></div>
+<div><span class="cmd">jilog status</span>                    <span class="desc"># ledger health</span></div>
+</div>
+
+<footer>
+  <span>Extracted from <code>opsctl</code> · 2026-05-10 · Public API <code>0.1</code> · Used by opsctl, deshi (planned)</span>
+  <span><a href="https://github.com/Joi/jilog">github.com/Joi/jilog</a></span>
+</footer>
+
+</div>
+</body>
+</html>

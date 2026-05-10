@@ -4,6 +4,8 @@
 
 **Status: alpha — running in production on the author's systems; API may shift until 1.0.**
 
+📐 **[Architecture overview](https://raw.githack.com/Joi/jilog/main/docs/architecture.html)** — illustrated walkthrough of how jilog works.
+
 ---
 
 ## What it does
