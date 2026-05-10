@@ -1,0 +1,30 @@
+[package]
+name = "jilog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for jilog: pluggable session-log review and event ledger"
+
+[[bin]]
+name = "jilog"
+path = "src/main.rs"
+
+[dependencies]
+ledger-core = { workspace = true }
+ledger-sqlite = { workspace = true }
+ledger-spool = { workspace = true }
+jilog-review = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

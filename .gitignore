@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local config (if any)
+jilog.toml
+.jilog.toml
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

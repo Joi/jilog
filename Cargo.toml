@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ledger-core",
+    "crates/ledger-sqlite",
+    "crates/ledger-spool",
+    "crates/jilog-review",
+    "crates/jilog",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+repository = "https://github.com/Joi/jilog"
+description = "Pluggable session-log review and append-only event ledger"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Time and IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Integrity
+crc32fast = "1"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Pattern matching (workaround scanner in jilog-review)
+regex = "1"
+
+# File globbing (used by readers to discover transcripts)
+glob = "0.3"
+
+# Tempfile (for tests)
+tempfile = "3"
+
+# Internal crates
+ledger-core = { path = "crates/ledger-core" }
+ledger-sqlite = { path = "crates/ledger-sqlite" }
+ledger-spool = { path = "crates/ledger-spool" }
+jilog-review = { path = "crates/jilog-review" }
+
+[profile.release]
+opt-level = 2
+lto = "thin"

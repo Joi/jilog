@@ -1,0 +1,16 @@
+[package]
+name = "ledger-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Append-only event ledger: types, segments, and integrity"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }
