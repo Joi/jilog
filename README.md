@@ -20,6 +20,8 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
+**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, NanoClaw, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
+
 ### Why not LangSmith / Langfuse?
 
 Those tools do call-level tracing: spans, token counts, latency, cost per request. jilog does something different: it aggregates *patterns across sessions over time* and asks whether the system is actually getting better. The two are complementary — trace your LLM calls with OTEL/Langfuse; use jilog to close the loop on whether yesterday's corrections and workarounds are still happening next week.

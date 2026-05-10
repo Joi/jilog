@@ -183,6 +183,7 @@
   <h1><code>jilog</code></h1>
   <p class="lede"><strong>An append-only event ledger and nightly learning loop for personal AI infrastructure.</strong> jilog watches what your agents actually do, keeps a durable record of it, and surfaces patterns nightly &mdash; <em>what the system keeps getting wrong, where prompts are failing, what's worth fixing.</em></p>
   <p class="sub" style="margin-top:14px;max-width:64ch">jilog is the <strong>observation and structuring layer</strong>. LLM synthesis, prompt rewrites, and triage decisions sit one level up &mdash; in the agent or workflow that wraps jilog. This keeps it Rust-pure, usable without an API key, and integrable with any agent stack.</p>
+  <p class="sub" style="margin-top:14px;max-width:64ch;border-left:3px solid var(--terra);padding-left:14px"><strong style="color:var(--navy)">Cross-machine and cross-harness by design.</strong> Pluggable readers normalize sessions from <strong>Claude Code</strong>, <strong>Amplifier</strong>, <strong>NanoClaw</strong>, or any JSONL agent stack into one <code>Signal</code> type &mdash; the same nightly loop runs across all of them. <code>ledger-spool</code> replicates segment files between hosts, giving you one logical event ledger across a fleet (desktop, laptop, cloud worker, agent host) without a server in the middle.</p>
 </header>
 
 <h2><span class="num">01</span> What jilog watches</h2>
