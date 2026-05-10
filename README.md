@@ -1,98 +1,163 @@
 # jilog
 
-Pluggable session-log review and append-only event ledger.
+> An append-only event ledger and nightly learning loop for personal AI infrastructure.
 
-`jilog` provides two reusable building blocks for systems that want to learn
-from their own operational telemetry:
+**Status: early design / pre-release**
 
-1. **An append-only event ledger** (`ledger-core`, `ledger-sqlite`,
-   `ledger-spool`) — segment-based, integrity-checked, with a rebuildable
-   SQLite projection and a cross-machine spool transport.
-2. **A pluggable session-log review pipeline** (`jilog-review`) — a `Reader`
-   trait for "where do session logs live and how do they parse?", a `Tracker`
-   trait for "where do issues get filed?", and a set of detectors that emit
-   `Signal`s (corrections, errors, workarounds, P0 alerts) into a daily
-   markdown digest and/or an issue tracker.
+---
 
-The included CLI binary `jilog` wires a small TOML config to concrete
-implementations and runs the review pipeline.
+## What it does
 
-## Workspace layout
+jilog watches what your AI agents actually do — not call-level traces, but semantic events: content ingested, task supervised, correction applied, workaround used. It keeps a durable record of those events, then runs a nightly scan of your agent session transcripts to surface patterns: what the system keeps getting wrong, where prompts are failing, what's worth fixing.
+
+The output of a nightly run is:
+- A structured digest (markdown + JSON) of patterns found
+- New issues filed in your issue tracker for novel learnings
+- A check on whether last week's issues are still open ("did we actually improve?")
+- Structured signal ready for your agent to synthesize prompt improvement suggestions
+
+jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
+
+---
+
+## Architecture
 
 ```
-crates/
-  ledger-core/      append-only event ledger (types, segments, integrity)
-  ledger-sqlite/    rebuildable SQLite projection over segments
-  ledger-spool/     cross-machine spool transport for event segments
-  jilog-review/     Reader/Tracker traits, signal detectors, digest renderer
-  jilog/            CLI binary (config -> readers + tracker -> digest)
+Intent           ── What your agents are supposed to do (config)
+Event Plane      ── Append-only segment files (source of truth)
+Projection       ── SQLite index (rebuildable at any time)
+Action           ── jilog CLI
 ```
 
-## Built-in plugins
+Segment files are the authority. SQLite is a rebuildable index. Nothing generated is manually edited.
 
-**Readers** (where session logs live):
+---
 
-- `amplifier`  — `~/.amplifier/projects/*/transcript.jsonl` (Anthropic-style chat blocks)
-- `claude-code` — `~/.claude/projects/**/*.jsonl`
-- `generic`    — configurable path glob + JSONL message schema
-
-**Trackers** (where issues get filed):
-
-- `beads`   — reads/writes `.beads/issues.jsonl` via the `bd` CLI
-- `github`  — wraps `gh issue create / list / view`
-- `none`    — markdown digest only (no issue creation)
-
-## Quick start
+## Quick Start
 
 ```bash
-cargo install --path crates/jilog
+cargo install jilog
+
+# Configure
+cp jilog.example.toml jilog.toml
+
+# Wrap any recurring task with ledger events
+jilog supervise --task "jibrain-heartbeat" -- ./jibrain-heartbeat.sh
+
+# Query what happened
+jilog query --since 7d
+jilog query --since 24h --subsystem "review-*" --json
+
+# Run the nightly learning loop
+jilog review nightly
+jilog review nightly --json | your-agent synthesize-suggestions
 ```
 
-Drop a `jilog.toml` at `~/.jilog.toml`:
+---
+
+## Readers — pluggable session log types
+
+jilog can scan transcripts from different agent systems. Configure one or more readers:
+
+| Reader | Scans | Notes |
+|---|---|---|
+| `claude-code` | `~/.claude/projects/*/` JSONL | Default for Claude Code users |
+| `amplifier` | `~/.amplifier/projects/*/transcript.jsonl` | Amplifier sessions |
+| `nanoclaw` | SSH into NanoClaw host, scan session logs | Multi-channel setups |
+| `generic` | Any JSONL matching the jilog signal schema | BYO agent system |
 
 ```toml
-[[reader]]
-type = "amplifier"
-path = "~/.amplifier/projects"
-
+# jilog.toml
 [[reader]]
 type = "claude-code"
 path = "~/.claude/projects"
 
-[tracker]
-type = "beads"
-repo = "~/repos/my-project"
-
-[[zones]]
-id = "public-ops"
-ledger_path = "~/ops/ledgers/public-ops"
+[[reader]]
+type = "amplifier"
+path = "~/.amplifier/projects"
 ```
 
-Then:
+Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them.
+
+---
+
+## Trackers — pluggable issue backends
+
+Learnings from the nightly loop can be filed as issues in any supported tracker:
+
+| Tracker | Notes |
+|---|---|
+| `beads` | JSONL in `.beads/`, git-managed |
+| `kata` | Local SQLite daemon (wesm/kata) |
+| `github` | `gh issue` CLI wrapper |
+| `none` | Markdown digest only, no issue creation |
+
+```toml
+[tracker]
+type = "github"
+repo = "Joi/jilog"
+labels = ["jilog-learning"]
+```
+
+On subsequent nightly runs, jilog checks which `jilog-learning` issues are still open. If a pattern re-appears for an already-open issue, it's a bump — not a new filing. If the issue is closed and the pattern hasn't recurred, it counts as resolved.
+
+---
+
+## Commands
 
 ```bash
-jilog review nightly                # produce today's digest
-jilog review nightly --dry-run      # don't file issues, just print signals
-jilog query --class Decision --limit 50
+jilog supervise                     # Wrap tasks with ledger events + retry
+jilog query [--since N] [--json]    # Filter ledger events
+jilog review nightly [--json]       # Nightly learning digest + issue filing
+jilog review sessions               # Session-level summary by reader
+jilog issues list                   # Open jilog-learning issues across trackers
+jilog issues pending                # Learnings not yet filed
+jilog rebuild                       # Rebuild SQLite from segment files
+jilog status                        # Ledger health
 ```
 
-## Design
+---
 
-`jilog-review` operates on `Vec<Message>` (an Anthropic-style chat-message
-shape with `role` / `content` / `name`). Each `Reader` is responsible for
-turning its native session-log format into that shape; detectors are
-format-agnostic above the parse layer.
+## Event model
 
-`Tracker::create` is dedup-aware: implementations check `list_open()` first
-and return the existing `IssueRef` if a matching open issue already exists.
+Ten core event classes. All stored as append-only segment files; nothing is deleted.
 
-## Status
+| Class | When |
+|---|---|
+| `ingest` | Content arrived |
+| `route` | Content directed to destination |
+| `decision` | Human or system decision |
+| `state_change` | Object state transition |
+| `health` | System health observation |
+| `delivery` | Notification delivered |
+| `projection` | Projection refreshed |
+| `note_meta` | Operational note lifecycle |
+| `review` | Nightly review run |
+| `learning` | Pattern extracted from session |
 
-- Extracted from `opsctl` 2026-05-10. Same authors and license.
-- Public API is `0.1` — expect minor breaks until `0.2`.
-- 32+ tests in the ledger crates, 38+ tests in `jilog-review` (ported from
-  `opsctl::review_nightly`).
+---
+
+## Crates
+
+| Crate | Purpose |
+|---|---|
+| `ledger-core` | Event types, segment format, CRC32 integrity, zone store |
+| `ledger-sqlite` | Rebuildable SQLite projection, event queries |
+| `ledger-spool` | Cross-machine transport with dedup and integrity checks |
+| `jilog-review` | Nightly review engine: signal extraction, dedup, digest generation |
+| `jilog` | CLI binary: supervise, query, review, issues, status |
+
+Readers and trackers are compiled in via feature flags or separate crates in `readers/` and `trackers/`.
+
+---
+
+## Used by
+
+- **opsctl** — Joi Ito's private personal AI infrastructure control plane, uses jilog as its ledger substrate and extends it with manifest validation, claims, and Joi-specific readers.
+- **deshi** — *(planned)* Executive assistant by Tatsuya Ishibe / isbtty.
+
+---
 
 ## License
 
-MIT.
+MIT
