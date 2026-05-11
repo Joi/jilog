@@ -195,8 +195,14 @@ fn parse_class(s: &str) -> Result<EventClass> {
     }
 }
 
-/// Parse a time-window string: "7d", "4w", or "YYYY-MM-DD".
+/// Parse a time-window string: "24h", "7d", "4w", or "YYYY-MM-DD".
 pub(crate) fn parse_since(since: &str) -> Result<DateTime<Utc>> {
+    if let Some(hours_str) = since.strip_suffix('h') {
+        let hours: i64 = hours_str
+            .parse()
+            .with_context(|| format!("invalid hour count: {}", since))?;
+        return Ok(Utc::now() - Duration::hours(hours));
+    }
     if let Some(days_str) = since.strip_suffix('d') {
         let days: i64 = days_str
             .parse()
@@ -211,7 +217,7 @@ pub(crate) fn parse_since(since: &str) -> Result<DateTime<Utc>> {
     }
     // Try ISO date.
     let date = chrono::NaiveDate::parse_from_str(since, "%Y-%m-%d")
-        .with_context(|| format!("invalid date: {} (expected Nd, Nw, or YYYY-MM-DD)", since))?;
+        .with_context(|| format!("invalid date: {} (expected Nh, Nd, Nw, or YYYY-MM-DD)", since))?;
     Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc())
 }
 
