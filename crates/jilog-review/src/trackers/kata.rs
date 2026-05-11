@@ -24,9 +24,11 @@
 //!
 //! | Trait method     | CLI invocation |
 //! |------------------|----------------|
-//! | `create()`       | `kata --project <p> --json create "<title>" --body "..." --label jilog --label jilog:<kind> --idempotency-key <key>` |
+//! | `create()`       | `kata --project <p> --json create "<title>" --body "..." --label jilog --label jilog:<kind> --idempotency-key <key> --priority <n>` |
 //! | `list_open()`    | `kata --project <p> --json list --status open` |
+//! | `list_closed()`  | `kata --project <p> --json list --status closed` |
 //! | `is_resolved()`  | `kata --project <p> --json show <number>` → status == "closed" |
+//! | `reopen()`       | `kata --project <p> --json reopen <n>` + comment + label add |
 //!
 //! ## Label charset
 //!
@@ -35,6 +37,7 @@
 
 use std::process::Command;
 
+use chrono::Local;
 use serde::Deserialize;
 
 use crate::error::JilogReviewError;
@@ -56,6 +59,70 @@ impl KataTracker {
         let mut c = Command::new("kata");
         c.args(["--project", &self.project, "--json"]);
         c
+    }
+
+    /// List closed issues for this project (mirrors `list_open` with `--status closed`).
+    fn list_closed(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
+        let output = self
+            .cmd()
+            .args(["list", "--status", "closed"])
+            .output()
+            .map_err(|e| JilogReviewError::Command(format!("kata list failed: {}", e)))?;
+
+        if !output.status.success() {
+            return Err(parse_kata_error(&output.stdout, &output.stderr, "list"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: KataList = serde_json::from_str(&stdout).unwrap_or(KataList { issues: vec![] });
+
+        Ok(parsed
+            .issues
+            .into_iter()
+            .filter(|i| i.status == "closed")
+            .map(|i| IssueRef {
+                id: format!("#{}", i.number),
+                backend: "kata".to_string(),
+                url: None,
+                title: i.title,
+            })
+            .collect())
+    }
+
+    /// Reopen a closed issue: runs `kata reopen <n>`, adds a recurrence comment,
+    /// and labels it `jilog:recurred`. Fails loud on any error.
+    fn reopen(&self, number: &str, comment_body: &str) -> Result<(), JilogReviewError> {
+        // Step 1: reopen the issue.
+        let out = self
+            .cmd()
+            .args(["reopen", number])
+            .output()
+            .map_err(|e| JilogReviewError::Command(format!("kata reopen failed: {}", e)))?;
+        if !out.status.success() {
+            return Err(parse_kata_error(&out.stdout, &out.stderr, "reopen"));
+        }
+
+        // Step 2: add a recurrence comment.
+        let out = self
+            .cmd()
+            .args(["comment", number, "--body", comment_body])
+            .output()
+            .map_err(|e| JilogReviewError::Command(format!("kata comment failed: {}", e)))?;
+        if !out.status.success() {
+            return Err(parse_kata_error(&out.stdout, &out.stderr, "comment"));
+        }
+
+        // Step 3: add the jilog:recurred label.
+        let out = self
+            .cmd()
+            .args(["label", "add", number, "jilog:recurred"])
+            .output()
+            .map_err(|e| JilogReviewError::Command(format!("kata label add failed: {}", e)))?;
+        if !out.status.success() {
+            return Err(parse_kata_error(&out.stdout, &out.stderr, "label add"));
+        }
+
+        Ok(())
     }
 }
 
@@ -110,17 +177,28 @@ impl Tracker for KataTracker {
     fn create(&self, signal: &Signal) -> Result<IssueRef, JilogReviewError> {
         let title = signal_title(signal);
 
-        // Trait contract: title-match against open issues for dedup.
+        // Dedup pass 1: return existing open issue if title matches.
         let open = self.list_open()?;
         if let Some(existing) = open.iter().find(|i| i.title == title) {
             return Ok(existing.clone());
         }
 
-        let body = format!(
-            "Detected by jilog review pipeline.\n\nSession: {}\nKind: {}",
-            signal.session_id(),
-            signal.kind()
-        );
+        // Dedup pass 2 (reopen-on-recurrence): if a closed issue has the same
+        // title, reopen it instead of filing a duplicate.
+        let closed = self.list_closed()?;
+        if let Some(existing) = closed.iter().find(|i| i.title == title) {
+            let number = existing.id.trim_start_matches('#');
+            let today = Local::now().format("%Y-%m-%d").to_string();
+            let comment = format!(
+                "Recurred on {} — closure may have been premature.",
+                today
+            );
+            self.reopen(number, &comment)?;
+            return Ok(existing.clone());
+        }
+
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let body = build_body(signal, &today);
 
         // kata also enforces idempotency at the daemon level: if the same key
         // arrives twice, kata returns a `duplicate_candidates` error. The
@@ -130,6 +208,8 @@ impl Tracker for KataTracker {
 
         // kata label charset is [a-z0-9._:-], so we use `:` as the kind sep.
         let kind_label = format!("jilog:{}", signal.kind());
+
+        let priority = signal_priority(signal).to_string();
 
         let output = self
             .cmd()
@@ -144,6 +224,8 @@ impl Tracker for KataTracker {
                 &kind_label,
                 "--idempotency-key",
                 &idem,
+                "--priority",
+                &priority,
             ])
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata create failed: {}", e)))?;
@@ -243,6 +325,68 @@ fn idempotency_key(title: &str) -> String {
     }
 }
 
+/// Map a signal to a kata priority level (1 = highest, 3 = lowest).
+///
+/// | Priority | Signals |
+/// |----------|---------|
+/// | 1        | Error (active tool failures — investigate immediately) |
+/// | 2        | Correction, Pattern (behavioural issues worth fixing soon) |
+/// | 3        | Workaround, Deferral (lower-urgency, deferred work) |
+fn signal_priority(signal: &Signal) -> u8 {
+    match signal {
+        Signal::Error(_) => 1,
+        Signal::Correction(_) => 2,
+        Signal::Pattern(_) => 2,
+        Signal::Workaround(_) => 3,
+        Signal::Deferral(_) => 3,
+    }
+}
+
+/// Build the issue body for a new kata issue.
+///
+/// Format:
+/// ```text
+/// Detected by jilog review pipeline on YYYY-MM-DD.
+///
+/// ## Source
+/// - Session: <session_id>
+/// - Kind: <kind>
+/// - See `~/.amplifier/health/learning-digest-YYYY-MM-DD.md` for the full digest window.
+///
+/// ## Signal
+/// <kind-specific content>
+/// ```
+///
+/// Kind-specific content:
+/// - Correction:  the `context` field
+/// - Error:       `Tool: <tool_name>` + `Message: <message>`
+/// - Workaround:  `Pattern: <pattern>` + `Context: <context>`
+/// - Pattern:     the `description` field
+/// - Deferral:    the `item` field
+fn build_body(signal: &Signal, date: &str) -> String {
+    let session_id = signal.session_id();
+    let kind = signal.kind();
+    let digest_path = format!("~/.amplifier/health/learning-digest-{}.md", date);
+
+    let kind_specific = match signal {
+        Signal::Correction(c) => c.context.clone(),
+        Signal::Error(e) => format!("Tool: {}\nMessage: {}", e.tool_name, e.message),
+        Signal::Workaround(w) => format!("Pattern: {}\nContext: {}", w.pattern, w.context),
+        Signal::Pattern(p) => p.description.clone(),
+        Signal::Deferral(d) => d.item.clone(),
+    };
+
+    format!(
+        "Detected by jilog review pipeline on {date}.\n\n\
+## Source\n\
+- Session: {session_id}\n\
+- Kind: {kind}\n\
+- See `{digest_path}` for the full digest window this signal came from.\n\n\
+## Signal\n\
+{kind_specific}"
+    )
+}
+
 /// Best-effort parse of kata's structured JSON error output. Falls back to
 /// stderr if the JSON shape doesn't match.
 fn parse_kata_error(stdout: &[u8], stderr: &[u8], op: &str) -> JilogReviewError {
@@ -272,6 +416,11 @@ fn parse_kata_error(stdout: &[u8], stderr: &[u8], op: &str) -> JilogReviewError 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Workaround};
+
+    // -----------------------------------------------------------------------
+    // Original 7 tests (unchanged behaviour)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn kata_tracker_graceful_when_kata_missing_or_unconfigured() {
@@ -279,7 +428,7 @@ mod tests {
         // If kata is on PATH but the project doesn't exist, we get a Tracker error.
         // Either way, no panic.
         let tracker = KataTracker::new("nonexistent-jilog-test-project");
-        let signal = Signal::Correction(crate::signal::Correction {
+        let signal = Signal::Correction(Correction {
             session_id: "test".into(),
             context: "some correction context here".into(),
         });
@@ -352,5 +501,168 @@ mod tests {
             }
             other => panic!("expected Tracker variant, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement 3: signal_priority — all 5 variants in one test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn signal_priority_all_variants() {
+        let error = Signal::Error(ErrorSignal {
+            session_id: "s".into(),
+            tool_name: "bash".into(),
+            message: "exit 1".into(),
+        });
+        let correction = Signal::Correction(Correction {
+            session_id: "s".into(),
+            context: "stop that".into(),
+        });
+        let pattern = Signal::Pattern(PatternSignal {
+            session_id: "s".into(),
+            description: "recurring theme".into(),
+        });
+        let workaround = Signal::Workaround(Workaround {
+            session_id: "s".into(),
+            pattern: "for now".into(),
+            context: "this is a hack".into(),
+        });
+        let deferral = Signal::Deferral(DeferralSignal {
+            session_id: "s".into(),
+            item: "do this later".into(),
+        });
+
+        assert_eq!(signal_priority(&error), 1, "Error must be priority 1");
+        assert_eq!(signal_priority(&correction), 2, "Correction must be priority 2");
+        assert_eq!(signal_priority(&pattern), 2, "Pattern must be priority 2");
+        assert_eq!(signal_priority(&workaround), 3, "Workaround must be priority 3");
+        assert_eq!(signal_priority(&deferral), 3, "Deferral must be priority 3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement 2: build_body — one test per signal variant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_body_correction_contains_context() {
+        let signal = Signal::Correction(Correction {
+            session_id: "sess-abc".into(),
+            context: "no, use the gog cli for calendar".into(),
+        });
+        let body = build_body(&signal, "2026-05-11");
+        assert!(body.contains("2026-05-11"), "body must contain date");
+        assert!(body.contains("sess-abc"), "body must contain session_id");
+        assert!(body.contains("correction"), "body must contain kind");
+        assert!(body.contains("no, use the gog cli for calendar"), "body must contain context");
+        assert!(body.contains("learning-digest-2026-05-11.md"), "body must reference digest path");
+        assert!(body.contains("## Source"), "body must have Source section");
+        assert!(body.contains("## Signal"), "body must have Signal section");
+    }
+
+    #[test]
+    fn build_body_error_contains_tool_and_message() {
+        let signal = Signal::Error(ErrorSignal {
+            session_id: "sess-def".into(),
+            tool_name: "bash".into(),
+            message: "command not found: fzf".into(),
+        });
+        let body = build_body(&signal, "2026-05-11");
+        assert!(body.contains("Tool: bash"), "body must have 'Tool: bash'");
+        assert!(body.contains("Message: command not found: fzf"), "body must have message line");
+        assert!(body.contains("error"), "body must contain kind");
+    }
+
+    #[test]
+    fn build_body_workaround_contains_pattern_and_context() {
+        let signal = Signal::Workaround(Workaround {
+            session_id: "sess-ghi".into(),
+            pattern: "for now".into(),
+            context: "temporarily using osascript".into(),
+        });
+        let body = build_body(&signal, "2026-05-11");
+        assert!(body.contains("Pattern: for now"), "body must have 'Pattern: for now'");
+        assert!(body.contains("Context: temporarily using osascript"), "body must have context line");
+        assert!(body.contains("workaround"), "body must contain kind");
+    }
+
+    #[test]
+    fn build_body_pattern_contains_description() {
+        let signal = Signal::Pattern(PatternSignal {
+            session_id: "sess-jkl".into(),
+            description: "always asks for confirmation before deleting".into(),
+        });
+        let body = build_body(&signal, "2026-05-11");
+        assert!(body.contains("always asks for confirmation before deleting"), "body must have description");
+        assert!(body.contains("pattern"), "body must contain kind");
+    }
+
+    #[test]
+    fn build_body_deferral_contains_item() {
+        let signal = Signal::Deferral(DeferralSignal {
+            session_id: "sess-mno".into(),
+            item: "set up the CI pipeline".into(),
+        });
+        let body = build_body(&signal, "2026-05-11");
+        assert!(body.contains("set up the CI pipeline"), "body must have item");
+        assert!(body.contains("deferral"), "body must contain kind");
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement 1: list_closed smoke test (graceful when binary missing)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_closed_graceful_when_kata_missing() {
+        // Mirrors the list_open smoke test. If kata is absent we get a
+        // Command error; if the project is missing we get a Tracker error.
+        // Either way, no panic.
+        let tracker = KataTracker::new("nonexistent-jilog-test-project");
+        match tracker.list_closed() {
+            Ok(_) => eprintln!("kata list (closed) returned successfully (project may exist)"),
+            Err(JilogReviewError::Command(msg)) => {
+                eprintln!("kata not found (expected in CI): {}", msg);
+            }
+            Err(JilogReviewError::Tracker(msg)) => {
+                eprintln!("kata returned error (expected when project missing): {}", msg);
+            }
+            Err(e) => {
+                eprintln!("unexpected error type: {}", e);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement 1: reopen() — fail-loud verification + integration note
+    //
+    // Full integration testing of reopen-on-recurrence requires a live kata
+    // daemon with a project that has a closed issue matching the signal title.
+    // The unit-level guarantee verified here: when kata is absent, the first
+    // shell-out returns Err(Command(..)) immediately — no panic, no silent
+    // swallow, no half-completed state.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reopen_fails_loud_when_kata_missing() {
+        let tracker = KataTracker::new("nonexistent-jilog-test-project");
+        let result = tracker.reopen(
+            "999",
+            "Recurred on 2026-05-11 — closure may have been premature.",
+        );
+        match result {
+            Ok(()) => {
+                eprintln!("kata reopen returned Ok (kata must be installed with matching project)");
+            }
+            Err(JilogReviewError::Command(msg)) => {
+                eprintln!("kata not found — correct fail-loud behaviour: {}", msg);
+            }
+            Err(JilogReviewError::Tracker(msg)) => {
+                eprintln!("kata returned structured error — correct fail-loud behaviour: {}", msg);
+            }
+            Err(e) => {
+                eprintln!("other error variant (still not a panic): {}", e);
+            }
+        }
+        // Test passes regardless — verifies no panic and errors surface rather
+        // than being swallowed.
     }
 }

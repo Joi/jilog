@@ -10,7 +10,7 @@ use crate::detectors::MAX_ERROR_MESSAGE_LENGTH;
 use crate::error::JilogReviewError;
 use crate::reader::{ProcessedSessions, Reader};
 use crate::signal::{Correction, ErrorSignal, Signal, Workaround};
-use crate::tracker::{IssueRef, Tracker};
+use crate::tracker::{IssueRef, Tracker, signal_title};
 use crate::util::{python_repr, truncate_with_marker};
 
 // ---------------------------------------------------------------------------
@@ -115,26 +115,37 @@ pub fn run_review(
 
     let p0_alerts = detect_p0_alerts(&all_errors);
 
-    // Create issues if requested.
+    // Create issues if requested; build index keyed by signal_title for
+    // bidirectional digest annotations (improvement 4).
+    let mut issue_index: HashMap<String, IssueRef> = HashMap::new();
     if args.create_issues && !args.dry_run {
         for correction in &all_corrections {
             let signal = Signal::Correction(correction.clone());
             match tracker.create(&signal) {
-                Ok(issue_ref) => created_issues.push(issue_ref),
+                Ok(issue_ref) => {
+                    issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    created_issues.push(issue_ref);
+                }
                 Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
         for error in &all_errors {
             let signal = Signal::Error(error.clone());
             match tracker.create(&signal) {
-                Ok(issue_ref) => created_issues.push(issue_ref),
+                Ok(issue_ref) => {
+                    issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    created_issues.push(issue_ref);
+                }
                 Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
         for workaround in &all_workarounds {
             let signal = Signal::Workaround(workaround.clone());
             match tracker.create(&signal) {
-                Ok(issue_ref) => created_issues.push(issue_ref),
+                Ok(issue_ref) => {
+                    issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    created_issues.push(issue_ref);
+                }
                 Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
@@ -152,6 +163,7 @@ pub fn run_review(
             &all_workarounds,
             &p0_alerts,
             &args.digest_dir,
+            &issue_index,
         )?;
     }
 
@@ -175,19 +187,26 @@ pub fn run_review(
 }
 
 // ---------------------------------------------------------------------------
-// render_digest — byte-for-byte compatible with opsctl
+// render_digest — byte-for-byte compatible with opsctl (unaffected lines)
 // ---------------------------------------------------------------------------
 
 /// Render a learning-digest markdown string.
 ///
-/// Output format is byte-compatible with the Python script and opsctl.
-/// Consumers that grep these digests depend on this exact format.
+/// Output format is byte-compatible with the Python script and opsctl for
+/// lines where no issue was filed. Consumers that grep these digests depend
+/// on this exact format.
+///
+/// When `issue_index` contains an entry for a signal (keyed by its
+/// `signal_title`), the bullet line for that signal is annotated with
+/// ` (→ backend#N)` before the trailing newline. Lines for signals without
+/// a matching IssueRef are byte-identical to the pre-improvement-4 output.
 pub fn render_digest(
     date: &str,
     corrections: &[Correction],
     errors: &[ErrorSignal],
     workarounds: &[Workaround],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
+    issue_index: &HashMap<String, IssueRef>,
 ) -> String {
     let signals = corrections.len() + errors.len() + workarounds.len();
     let mut buf = String::new();
@@ -228,10 +247,15 @@ pub fn render_digest(
         buf.push_str("_No corrections detected._\n\n");
     } else {
         for c in corrections {
+            let annotation = issue_annotation(
+                issue_index,
+                &signal_title(&Signal::Correction(c.clone())),
+            );
             buf.push_str(&format!(
-                "- `{}` — {}\n",
+                "- `{}` — {}{}\n",
                 c.session_id,
-                python_repr(&c.context)
+                python_repr(&c.context),
+                annotation
             ));
         }
         buf.push('\n');
@@ -244,9 +268,13 @@ pub fn render_digest(
     } else {
         for e in errors {
             let msg = truncate_with_marker(&e.message, MAX_ERROR_MESSAGE_LENGTH);
+            let annotation = issue_annotation(
+                issue_index,
+                &signal_title(&Signal::Error(e.clone())),
+            );
             buf.push_str(&format!(
-                "- `{}` / `{}`: {}\n",
-                e.session_id, e.tool_name, msg
+                "- `{}` / `{}`: {}{}\n",
+                e.session_id, e.tool_name, msg, annotation
             ));
         }
         buf.push('\n');
@@ -258,11 +286,16 @@ pub fn render_digest(
         buf.push_str("_No workarounds detected._\n\n");
     } else {
         for w in workarounds {
+            let annotation = issue_annotation(
+                issue_index,
+                &signal_title(&Signal::Workaround(w.clone())),
+            );
             buf.push_str(&format!(
-                "- `{}` pattern=`{}`: {}\n",
+                "- `{}` pattern=`{}`: {}{}\n",
                 w.session_id,
                 w.pattern,
-                python_repr(&w.context)
+                python_repr(&w.context),
+                annotation
             ));
         }
         buf.push('\n');
@@ -276,6 +309,9 @@ pub fn render_digest(
 // ---------------------------------------------------------------------------
 
 /// Write a digest file to `<digest_dir>/learning-digest-<date>.md`.
+///
+/// `issue_index` is forwarded to `render_digest` for bidirectional linking
+/// annotations. Pass `&HashMap::new()` when no tracker is active.
 pub fn write_digest(
     date: &str,
     corrections: &[Correction],
@@ -283,12 +319,32 @@ pub fn write_digest(
     workarounds: &[Workaround],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     digest_dir: &Path,
+    issue_index: &HashMap<String, IssueRef>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = digest_dir.join(format!("learning-digest-{}.md", date));
-    let body = render_digest(date, corrections, errors, workarounds, p0_alerts);
+    let body = render_digest(date, corrections, errors, workarounds, p0_alerts, issue_index);
     std::fs::write(&path, body)?;
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build the `(→ backend#N)` annotation suffix for a digest bullet line.
+///
+/// Returns an empty string if `signal_key` is not in `issue_index` (so the
+/// bullet is byte-identical to the pre-annotation format for that line).
+fn issue_annotation(issue_index: &HashMap<String, IssueRef>, signal_key: &str) -> String {
+    match issue_index.get(signal_key) {
+        Some(issue) => {
+            // IssueRef.id is "#N" for kata; strip the leading '#' to avoid "kata##N".
+            let id_num = issue.id.trim_start_matches('#');
+            format!(" (→ {}#{})", issue.backend, id_num)
+        }
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,10 +365,15 @@ mod tests {
         dir
     }
 
+    // Helper: empty issue index (no tracker active).
+    fn no_issues() -> HashMap<String, IssueRef> {
+        HashMap::new()
+    }
+
     #[test]
     fn digest_frontmatter_has_counts() {
         let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new(), &no_issues());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
@@ -322,7 +383,7 @@ mod tests {
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
@@ -337,7 +398,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &p0);
+        let body = render_digest("2026-04-30", &[], &[], &[], &p0, &no_issues());
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -348,7 +409,7 @@ mod tests {
             session_id: "abc".into(),
             context: "don't do that".into(),
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new(), &no_issues());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -360,16 +421,97 @@ mod tests {
             tool_name: "bash".into(),
             message: "x".repeat(600),
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &HashMap::new());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &HashMap::new(), &no_issues());
         assert!(body.contains("[truncated]"));
     }
 
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &dir).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Improvement 4: bidirectional linking annotation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn digest_annotation_appended_to_correction_bullet() {
+        let correction = Correction {
+            session_id: "0e91a2b4".into(),
+            context: "no, use the gog cli for calendar".into(),
+        };
+        let signal = Signal::Correction(correction.clone());
+        let issue_ref = IssueRef {
+            id: "#7".to_string(),
+            backend: "kata".to_string(),
+            url: None,
+            title: signal_title(&signal),
+        };
+        let mut index = HashMap::new();
+        index.insert(signal_title(&signal), issue_ref);
+
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &HashMap::new(), &index);
+        // Annotation must appear at end of bullet line, before newline.
+        assert!(
+            body.contains("(→ kata#7)"),
+            "annotation missing in:\n{}", body
+        );
+        // Must not produce double-hash.
+        assert!(!body.contains("kata##"), "double-hash found in:\n{}", body);
+    }
+
+    #[test]
+    fn digest_no_annotation_when_issue_index_empty() {
+        let correction = Correction {
+            session_id: "abc".into(),
+            context: "fix it".into(),
+        };
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &HashMap::new(), &no_issues());
+        // Line must end with content then newline — no trailing annotation.
+        assert!(!body.contains("(→"), "unexpected annotation in:\n{}", body);
+    }
+
+    #[test]
+    fn digest_annotation_byte_stable_for_unaffected_lines() {
+        // A correction WITH an annotation and one WITHOUT — unaffected line
+        // must be byte-identical to the no-annotation render.
+        let c_annotated = Correction { session_id: "ann".into(), context: "do this".into() };
+        let c_plain = Correction { session_id: "pla".into(), context: "plain line".into() };
+
+        let signal_annotated = Signal::Correction(c_annotated.clone());
+        let issue_ref = IssueRef {
+            id: "#3".to_string(),
+            backend: "kata".to_string(),
+            url: None,
+            title: signal_title(&signal_annotated),
+        };
+        let mut index = HashMap::new();
+        index.insert(signal_title(&signal_annotated), issue_ref);
+
+        let body_with = render_digest(
+            "2026-05-11",
+            &[c_annotated.clone(), c_plain.clone()],
+            &[], &[], &HashMap::new(), &index,
+        );
+        let body_without = render_digest(
+            "2026-05-11",
+            &[c_annotated.clone(), c_plain.clone()],
+            &[], &[], &HashMap::new(), &no_issues(),
+        );
+
+        // The plain line must be identical in both renders.
+        let plain_line_with = body_with.lines().find(|l| l.contains("plain line")).unwrap();
+        let plain_line_without = body_without.lines().find(|l| l.contains("plain line")).unwrap();
+        assert_eq!(plain_line_with, plain_line_without, "unaffected line changed");
+
+        // The annotated line must differ (has the annotation).
+        let ann_line_with = body_with.lines().find(|l| l.contains("do this")).unwrap();
+        let ann_line_without = body_without.lines().find(|l| l.contains("do this")).unwrap();
+        assert_ne!(ann_line_with, ann_line_without, "annotated line should differ");
+        assert!(ann_line_with.ends_with("(→ kata#3)"), "annotation must be at end of line");
     }
 }
