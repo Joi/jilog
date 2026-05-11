@@ -11,7 +11,7 @@ use crate::detectors::{
 };
 use crate::error::JilogReviewError;
 use crate::reader::{ProcessedSessions, Reader};
-use crate::signal::{Correction, ErrorSignal, Signal, Workaround};
+use crate::signal::{Correction, DeferralSignal, ErrorSignal, Signal, Workaround};
 use crate::tracker::{IssueRef, Tracker, signal_title};
 use crate::util::{python_repr, truncate_with_marker};
 
@@ -352,7 +352,7 @@ pub fn write_digest(
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = digest_dir.join(format!("learning-digest-{}.md", date));
-    let body = render_digest(date, corrections, errors, workarounds, p0_alerts, issue_index);
+    let body = render_digest(date, corrections, errors, workarounds, deferrals, p0_alerts, issue_index);
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn digest_frontmatter_has_counts() {
         let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
@@ -429,7 +429,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &p0, &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &p0, &no_issues());
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -440,7 +440,7 @@ mod tests {
             session_id: "abc".into(),
             context: "don't do that".into(),
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new(), &no_issues());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -452,7 +452,7 @@ mod tests {
             tool_name: "bash".into(),
             message: "x".repeat(600),
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &HashMap::new(), &no_issues());
         assert!(body.contains("[truncated]"));
     }
 
@@ -462,7 +462,7 @@ mod tests {
             session_id: "s1".into(),
             item: "next session".into(),
         }];
-        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &HashMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &HashMap::new(), &no_issues());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("- `s1` pattern=`next session`"));
     }
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -496,7 +496,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &HashMap::new(), &index);
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &HashMap::new(), &index);
         // Annotation must appear at end of bullet line, before newline.
         assert!(
             body.contains("(→ kata#7)"),
@@ -512,7 +512,7 @@ mod tests {
             session_id: "abc".into(),
             context: "fix it".into(),
         };
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &HashMap::new(), &no_issues());
         // Line must end with content then newline — no trailing annotation.
         assert!(!body.contains("(→"), "unexpected annotation in:\n{}", body);
     }
@@ -537,12 +537,12 @@ mod tests {
         let body_with = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &HashMap::new(), &index,
+            &[], &[], &[], &HashMap::new(), &index,
         );
         let body_without = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &HashMap::new(), &no_issues(),
+            &[], &[], &[], &HashMap::new(), &no_issues(),
         );
 
         // The plain line must be identical in both renders.
