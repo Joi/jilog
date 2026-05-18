@@ -94,21 +94,62 @@ impl Reader for ClaudeCodeReader {
     }
 
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
-        // Parse line by line; skip lines that don't parse as Message.
         let content = std::fs::read_to_string(&handle.path)?;
         let mut out = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(msg) = serde_json::from_str::<Message>(line) {
-                // Only keep lines that have at least a role field.
-                if msg.role.is_some() {
-                    out.push(msg);
-                }
+            // Parse to Value first so we can handle both shapes:
+            //   legacy flat: {"role": "...", "content": "..."}
+            //   wrapped:     {"type": "user", "message": {"role": "...", "content": "..."}}
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(msg) = extract_message(&value) {
+                out.push(msg);
             }
         }
         Ok(out)
+    }
+}
+
+/// Pull a Schema-B `Message` out of a Claude Code JSONL line.
+///
+/// Real Claude Code lines wrap the chat content under `message`:
+///   `{"type":"user","message":{"role":"user","content":...}}`
+///   `{"type":"assistant","message":{"role":"assistant","content":[...]}}`
+///
+/// Legacy/synthetic lines also appear (`{"role":"user","content":"..."}`),
+/// so both shapes are accepted. Returns `None` for non-chat lines such as
+/// `type=last-prompt`, `permission-mode`, `attachment`, `ai-title`,
+/// `file-history-snapshot`.
+fn extract_message(value: &serde_json::Value) -> Option<Message> {
+    // Wrapped form: inner `message` object carries role/content.
+    if let Some(inner) = value.get("message") {
+        if inner.get("role").is_some() {
+            // Carry the outer "type" forward as a hint when the inner has no name.
+            let mut msg: Message = serde_json::from_value(inner.clone()).ok()?;
+            if msg.role.is_some() {
+                if msg.name.is_none() {
+                    if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
+                        if t != "user" && t != "assistant" && t != "system" {
+                            msg.name = Some(t.to_string());
+                        }
+                    }
+                }
+                return Some(msg);
+            }
+        }
+    }
+
+    // Flat form: top-level role/content.
+    let msg: Message = serde_json::from_value(value.clone()).ok()?;
+    if msg.role.is_some() {
+        Some(msg)
+    } else {
+        None
     }
 }
 
@@ -150,6 +191,34 @@ mod tests {
         let msgs = reader.load(&handles[0]).unwrap();
         // Only lines with `role` field are kept
         assert_eq!(msgs.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_code_reader_unwraps_message_field() {
+        let root = test_dir("wrapped");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("-Users-joi-repos-x");
+        fs::create_dir_all(&proj).unwrap();
+
+        // Real-shape Claude Code lines: type+message wrapper, mixed with
+        // session-meta lines that have no role and must be skipped.
+        let content = r#"{"type":"last-prompt","leafUuid":"abc","sessionId":"x"}
+{"type":"user","uuid":"u1","message":{"role":"user","content":"hello"}}
+{"type":"permission-mode","permissionMode":"acceptEdits","sessionId":"x"}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+{"type":"ai-title","title":"t","sessionId":"x"}"#;
+        fs::write(proj.join("real-session.jsonl"), content).unwrap();
+
+        let reader = ClaudeCodeReader::new(&root);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1);
+
+        let msgs = reader.load(&handles[0]).unwrap();
+        assert_eq!(msgs.len(), 2, "user + assistant only — meta lines skipped");
+        assert_eq!(msgs[0].role.as_deref(), Some("user"));
+        assert_eq!(msgs[1].role.as_deref(), Some("assistant"));
         let _ = fs::remove_dir_all(&root);
     }
 }
