@@ -168,7 +168,16 @@ pub fn run_review(
     let date_str = args.date.format("%Y-%m-%d").to_string();
     let digest_path = args.digest_dir.join(format!("learning-digest-{}.md", date_str));
 
-    if !args.dry_run {
+    // Preserve an earlier-written digest for the same date when this run
+    // has nothing new to record. Without this, a mid-day re-run that sees
+    // only already-processed sessions (sessions_scanned == 0) would
+    // overwrite the populated digest with an empty one. The signal lists
+    // only contain THIS run's findings, not the prior run's, so we have
+    // no way to "merge" — skipping the write is the conservative choice.
+    let should_write = !args.dry_run
+        && !(sessions_scanned == 0 && digest_path.exists());
+
+    if should_write {
         write_digest(
             &date_str,
             &all_corrections,
@@ -473,6 +482,78 @@ mod tests {
         let path = write_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mid-day re-run preservation: a second run that finds zero new sessions
+    // must NOT overwrite a digest written by an earlier run for the same
+    // date.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_review_preserves_existing_digest_when_nothing_scanned() {
+        use crate::trackers::NoneTracker;
+        use chrono::{NaiveDate, Utc};
+
+        let dir = test_dir("preserve");
+        let date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let digest_path = dir.join("learning-digest-2026-05-18.md");
+
+        // Seed: a populated digest from an earlier run.
+        let seeded = "---\ndate: 2026-05-18\nsignals_captured: 99\n---\nSEEDED-FROM-EARLIER-RUN\n";
+        fs::write(&digest_path, seeded).unwrap();
+
+        // Re-run with zero readers (sessions_scanned = 0) on the same date.
+        let readers: Vec<Box<dyn Reader>> = Vec::new();
+        let tracker = NoneTracker;
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date,
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &tracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 0);
+
+        // Critical: the seeded content must still be there.
+        let body = fs::read_to_string(&digest_path).unwrap();
+        assert!(
+            body.contains("SEEDED-FROM-EARLIER-RUN"),
+            "mid-day re-run with 0 sessions overwrote the populated digest"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_writes_digest_when_file_absent_even_with_no_sessions() {
+        use crate::trackers::NoneTracker;
+        use chrono::{NaiveDate, Utc};
+
+        let dir = test_dir("first-empty");
+        let date = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+        let digest_path = dir.join("learning-digest-2026-05-18.md");
+        assert!(!digest_path.exists());
+
+        let readers: Vec<Box<dyn Reader>> = Vec::new();
+        let tracker = NoneTracker;
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date,
+            dry_run: false,
+            create_issues: false,
+        };
+        run_review(&readers, &tracker, &args).unwrap();
+
+        // First run of the day with nothing to scan still produces a
+        // digest skeleton, so downstream tooling can grep for today's file.
+        assert!(digest_path.exists(), "first run of the day should write the empty digest");
+        let body = fs::read_to_string(&digest_path).unwrap();
+        assert!(body.contains("signals_captured: 0"));
         let _ = fs::remove_dir_all(&dir);
     }
 
