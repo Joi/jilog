@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, GenericReader, SessionIdSource},
+    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, CopilotReader, GenericReader, SessionIdSource},
     trackers::{BeadsTracker, GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
@@ -36,6 +36,14 @@ pub enum ReaderConfig {
         path: Option<String>,
     },
     ClaudeCode {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    Codex {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    Copilot {
         #[serde(default)]
         path: Option<String>,
     },
@@ -129,6 +137,20 @@ impl JilogConfig {
                             .map(expand_tilde)
                             .unwrap_or_else(|| expand_tilde("~/.claude/projects"));
                         Box::new(ClaudeCodeReader::new(dir))
+                    }
+                    ReaderConfig::Codex { path } => {
+                        let dir = path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(|| expand_tilde("~/.codex/sessions"));
+                        Box::new(CodexReader::new(dir))
+                    }
+                    ReaderConfig::Copilot { path } => {
+                        let dir = path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(|| expand_tilde("~/.copilot/session-state"));
+                        Box::new(CopilotReader::new(dir))
                     }
                     ReaderConfig::Generic { name, path, session_id_from } => {
                         let source = match session_id_from {

@@ -57,6 +57,14 @@ path = "~/.claude/projects"
 type = "amplifier"
 path = "~/.amplifier/projects"
 
+[[reader]]
+type = "codex"
+path = "~/.codex/sessions"
+
+[[reader]]
+type = "copilot"
+path = "~/.copilot/session-state"
+
 [tracker]
 type = "github"
 repo = "your-org/your-repo"
@@ -90,8 +98,10 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 
 | Reader | Scans | Status |
 |---|---|---|
-| `claude-code` | `~/.claude/projects/*/` JSONL | ✅ built-in |
-| `amplifier` | `~/.amplifier/projects/*/transcript.jsonl` | ✅ built-in |
+| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | ✅ built-in |
+| `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ built-in |
+| `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | ✅ built-in |
+| `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | ✅ built-in |
 | `generic` | Any JSONL matching the jilog signal schema | ✅ built-in |
 | `nanoclaw` | SSH into NanoClaw host, scan session logs | 🔜 planned |
 
