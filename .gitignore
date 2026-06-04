@@ -12,3 +12,5 @@ jilog.toml
 *.swp
 *.swo
 .DS_Store
+# roborev snapshots
+/.roborev/
