@@ -14,3 +14,4 @@ jilog.toml
 .DS_Store
 # roborev snapshots
 /.roborev/
+.kata.local.toml
