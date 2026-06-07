@@ -1,6 +1,6 @@
 //! KataTracker — shells out to the `kata` CLI.
 //!
-//! [kata](https://github.com/wesm/kata) is a local-first issue tracker with a
+//! [kata](https://github.com/kenn-io/kata) is a local-first issue tracker with a
 //! user-global SQLite store behind a daemon. Unlike beads (per-repo `.beads/`
 //! directories), kata has one DB containing many named projects.
 //!

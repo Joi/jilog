@@ -118,7 +118,7 @@ Learnings from the nightly loop can be filed as issues in any supported tracker:
 | `beads` | JSONL in `.beads/`, git-managed | ✅ built-in |
 | `github` | `gh issue` CLI wrapper | ✅ built-in |
 | `none` | Markdown digest only, no issue creation | ✅ built-in |
-| `kata` | Local SQLite daemon ([wesm/kata](https://github.com/wesm/kata)) | ✅ built-in |
+| `kata` | Local SQLite daemon ([kenn-io/kata](https://github.com/kenn-io/kata)) | ✅ built-in |
 
 ```toml
 [tracker]
@@ -127,7 +127,7 @@ repo = "Joi/jilog"
 labels = ["jilog-learning"]
 ```
 
-Or against a kata local daemon ([wesm/kata](https://github.com/wesm/kata)):
+Or against a kata local daemon ([kenn-io/kata](https://github.com/kenn-io/kata)):
 
 ```toml
 [tracker]
