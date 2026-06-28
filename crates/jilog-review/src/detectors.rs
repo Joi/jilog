@@ -111,6 +111,14 @@ pub fn detect_corrections(messages: &[Message], session_id: &str) -> Vec<Correct
             continue;
         }
 
+        // A "user" turn whose content is a tool_result block is a tool echo
+        // injected by the runtime (Amplifier/Claude represent tool results as
+        // user-role messages), NOT a genuine user correction. Exclude these
+        // regardless of `is_error`. See jilog#21yg.
+        if contains_tool_result(&u.content) {
+            continue;
+        }
+
         let content_str = content_to_string(&u.content);
         if content_str.len() > MAX_CORRECTION_LENGTH {
             continue;
@@ -133,6 +141,18 @@ fn content_to_string(content: &Option<serde_json::Value>) -> String {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
         None => String::new(),
+    }
+}
+
+/// True if the message content is an array containing at least one
+/// `tool_result` block. Such "user" turns are tool echoes injected by the
+/// runtime, not genuine user corrections. See jilog#21yg.
+fn contains_tool_result(content: &Option<serde_json::Value>) -> bool {
+    match content {
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|block| {
+            block.get("type") == Some(&serde_json::Value::String("tool_result".into()))
+        }),
+        _ => false,
     }
 }
 
@@ -433,6 +453,96 @@ mod tests {
         assert!(detect_corrections(&[], "s1").is_empty());
         assert!(detect_corrections(&[assistant("a")], "s1").is_empty());
         assert!(detect_corrections(&[assistant("a"), user("hi there friend")], "s1").is_empty());
+    }
+
+    /// Helper: a user-role turn carrying a single tool_result content block,
+    /// mirroring how Amplifier/Claude transcripts echo tool output.
+    fn tool_result_user(content: &str, is_error: bool) -> Message {
+        Message {
+            role: Some("user".into()),
+            content: Some(json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_x",
+                    "is_error": is_error,
+                    "content": content,
+                }
+            ])),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn corrections_tool_result_user_turn_excluded() {
+        // Regression for jilog#21yg: tool_result echoes (is_error=false) must
+        // NOT be classified as corrections.
+        let msgs = vec![
+            assistant("ran it"),
+            tool_result_user("(Bash completed with no output)", false),
+            assistant("next"),
+        ];
+        assert!(
+            detect_corrections(&msgs, "s1").is_empty(),
+            "tool_result user turns must not be corrections"
+        );
+    }
+
+    #[test]
+    fn corrections_tool_result_error_user_turn_excluded() {
+        // jilog#21yg: even is_error=true tool_result blocks are tool echoes,
+        // not user corrections.
+        let msgs = vec![
+            assistant("a"),
+            tool_result_user(
+                "<tool_use_error>File has not been read yet. Read it first.</tool_use_error>",
+                true,
+            ),
+            assistant("b"),
+        ];
+        assert!(detect_corrections(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn corrections_real_user_string_still_detected() {
+        // Genuine short user corrections (plain string content) must survive
+        // the tool_result filter unchanged.
+        let msgs = vec![
+            assistant("first"),
+            user("no, you misunderstood the goal here"),
+            assistant("second"),
+        ];
+        let out = detect_corrections(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].context, "no, you misunderstood the goal here");
+    }
+
+    #[test]
+    fn corrections_digest_2026_06_24_fixture() {
+        // Fixture drawn from the 2026-06-24 learning digest (jilog#21yg): a
+        // run of tool_result echoes interleaved with two genuine user turns.
+        // Only the two real user messages must classify as corrections.
+        let msgs = vec![
+            assistant("a0"),
+            tool_result_user("--- icon def block ---\n39:  const I = {};", false),
+            assistant("a1"),
+            user("read the deck and make sure the edits land"),
+            assistant("a2"),
+            tool_result_user(
+                "<tool_use_error>File has not been read yet.</tool_use_error>",
+                true,
+            ),
+            assistant("a3"),
+            user("yes - clean it up please"),
+            assistant("a4"),
+            tool_result_user("=== reverted ===\n## main...origin/main", false),
+            assistant("a5"),
+            tool_result_user("(Bash completed with no output)", false),
+            assistant("a6"),
+        ];
+        let out = detect_corrections(&msgs, "agent-a446ccbb9e59d3bc4");
+        assert_eq!(out.len(), 2, "only the two real user turns are corrections");
+        assert_eq!(out[0].context, "read the deck and make sure the edits land");
+        assert_eq!(out[1].context, "yes - clean it up please");
     }
 
     // ---------- errors ----------
