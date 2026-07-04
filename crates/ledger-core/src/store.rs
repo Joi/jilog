@@ -24,9 +24,11 @@
 //!   in order). We use it for tracking the latest sequence number per
 //!   source, so iteration is deterministic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::LedgerError;
 use crate::segment::Segment;
@@ -320,6 +322,112 @@ impl SegmentStore {
         Ok(gaps)
     }
 
+    /// Verify only segments not yet covered by the verification checkpoint,
+    /// plus re-check any previously recorded failures.
+    ///
+    /// Cost is O(new segments) instead of O(all history) — the checkpoint at
+    /// `{root}/.verify-checkpoint.json` records, per source, the highest seq
+    /// that has verified clean, along with any known failures. A missing or
+    /// unreadable checkpoint falls back to a full verify (then rewrites it).
+    ///
+    /// Limitation: a segment that verified clean once and rots afterwards is
+    /// only caught by `verify_full()` — incremental runs never re-read it.
+    pub fn verify_incremental(&self) -> Result<VerifyReport, LedgerError> {
+        let ckpt = self.load_checkpoint();
+        self.verify_with_checkpoint(ckpt)
+    }
+
+    /// Re-verify every segment (same cost as `verify_all`) and rewrite the
+    /// verification checkpoint from the results.
+    pub fn verify_full(&self) -> Result<VerifyReport, LedgerError> {
+        self.verify_with_checkpoint(VerifyCheckpoint::default())
+    }
+
+    /// Shared engine for the two verify entry points: check everything the
+    /// checkpoint doesn't cover (plus recorded failures, so repairs clear and
+    /// persistent corruption keeps surfacing), then persist the new checkpoint.
+    fn verify_with_checkpoint(&self, ckpt: VerifyCheckpoint) -> Result<VerifyReport, LedgerError> {
+        let entries = self.list_segments()?;
+
+        let prior_failures: BTreeSet<(String, u64)> = ckpt
+            .failures
+            .iter()
+            .map(|(src, seq, _)| (src.clone(), *seq))
+            .collect();
+
+        let mut verified = ckpt.verified;
+        let mut newly_verified = 0usize;
+        let mut skipped = 0usize;
+        let mut failures: Vec<(String, u64, String)> = Vec::new();
+
+        for (source, seq, path) in entries {
+            let watermark = verified.get(&source).copied().unwrap_or(0);
+            if seq <= watermark && !prior_failures.contains(&(source.clone(), seq)) {
+                skipped += 1;
+                continue;
+            }
+
+            let failure = match Segment::read_from_file(&path) {
+                Ok(segment) => match segment.verify() {
+                    Ok(true) => None,
+                    Ok(false) => Some("checksum mismatch".to_string()),
+                    Err(e) => Some(format!("verify error: {e}")),
+                },
+                Err(e) => Some(format!("read error: {e}")),
+            };
+
+            match failure {
+                None => {
+                    newly_verified += 1;
+                    let w = verified.entry(source.clone()).or_insert(0);
+                    if seq > *w {
+                        *w = seq;
+                    }
+                }
+                Some(msg) => failures.push((source, seq, msg)),
+            }
+        }
+
+        self.save_checkpoint(&VerifyCheckpoint {
+            version: 1,
+            verified,
+            failures: failures.clone(),
+        })?;
+
+        Ok(VerifyReport {
+            newly_verified,
+            skipped,
+            failures,
+        })
+    }
+
+    /// Path of the verification checkpoint (sibling of `segments/`, NOT
+    /// inside it — `list_segments()` must never pick it up).
+    fn checkpoint_path(&self) -> PathBuf {
+        self.root.join(".verify-checkpoint.json")
+    }
+
+    /// Load the checkpoint; a missing or unreadable file degrades to the
+    /// empty checkpoint, which makes the next verify a full one.
+    fn load_checkpoint(&self) -> VerifyCheckpoint {
+        fs::read_to_string(self.checkpoint_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist the checkpoint atomically (tmp + rename) so a crash mid-write
+    /// leaves the old checkpoint intact rather than a truncated one.
+    fn save_checkpoint(&self, ckpt: &VerifyCheckpoint) -> Result<(), LedgerError> {
+        fs::create_dir_all(&self.root)?;
+        let body = serde_json::to_string_pretty(ckpt)
+            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+        let tmp = self.root.join(".verify-checkpoint.json.tmp");
+        fs::write(&tmp, body)?;
+        fs::rename(&tmp, self.checkpoint_path())?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -328,6 +436,29 @@ impl SegmentStore {
     fn segment_path(&self, segment: &Segment) -> PathBuf {
         self.segments_dir().join(segment.filename())
     }
+}
+
+/// On-disk state behind incremental verification. Private — callers only see
+/// `VerifyReport`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct VerifyCheckpoint {
+    version: u32,
+    /// Per source: highest seq that has verified clean.
+    verified: BTreeMap<String, u64>,
+    /// Known failures `(source, seq, message)`, re-checked every run.
+    failures: Vec<(String, u64, String)>,
+}
+
+/// Outcome of a `verify_incremental()` / `verify_full()` pass.
+#[derive(Debug)]
+pub struct VerifyReport {
+    /// Segments read and verified clean during this run.
+    pub newly_verified: usize,
+    /// Segments skipped because the checkpoint already covers them.
+    pub skipped: usize,
+    /// All currently known failures as `(source, seq, message)` — includes
+    /// failures found this run and unrepaired ones from earlier runs.
+    pub failures: Vec<(String, u64, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +632,144 @@ mod tests {
         let gaps = store.detect_gaps().unwrap();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0], ("macazbd".to_string(), 2));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Helper: write a deliberately corrupt segment file (checksum tampered
+    /// after sealing, so `verify()` reports a mismatch on read-back).
+    fn write_corrupt_segment(store: &SegmentStore, dir: &PathBuf, source: &str, seq: u64) {
+        let mut seg = sealed_segment(source, seq, 1);
+        seg.checksum = seg.checksum.wrapping_add(1);
+        store.ensure_dirs().unwrap();
+        seg.write_to_file(dir.join("segments").join(seg.filename())).unwrap();
+    }
+
+    #[test]
+    fn test_verify_incremental_first_run_checks_all_and_writes_checkpoint() {
+        let dir = test_dir("verify-incr-first");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 2)).unwrap();
+        store.write_segment(&sealed_segment("macazbd", 2, 1)).unwrap();
+
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 2);
+        assert_eq!(report.skipped, 0);
+        assert!(report.failures.is_empty());
+        assert!(dir.join(".verify-checkpoint.json").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_skips_previously_verified() {
+        let dir = test_dir("verify-incr-skip");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("jibotmac", 1, 1)).unwrap();
+
+        store.verify_incremental().unwrap();
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 0);
+        assert_eq!(report.skipped, 2);
+        assert!(report.failures.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_checks_only_new_segments() {
+        let dir = test_dir("verify-incr-new");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("macazbd", 2, 1)).unwrap();
+        store.verify_incremental().unwrap();
+
+        store.write_segment(&sealed_segment("macazbd", 3, 1)).unwrap();
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 1);
+        assert_eq!(report.skipped, 2);
+        assert!(report.failures.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_reports_corrupt_new_segment() {
+        let dir = test_dir("verify-incr-corrupt");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.verify_incremental().unwrap();
+
+        write_corrupt_segment(&store, &dir, "macazbd", 2);
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].0, "macazbd");
+        assert_eq!(report.failures[0].1, 2);
+        assert!(report.failures[0].2.contains("checksum"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_rechecks_failure_until_repaired() {
+        let dir = test_dir("verify-incr-repair");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.verify_incremental().unwrap();
+        write_corrupt_segment(&store, &dir, "macazbd", 2);
+        store.verify_incremental().unwrap();
+
+        // Still failing on the next run (remembered + re-checked).
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.newly_verified, 0);
+
+        // Repair by writing the segment correctly, then the failure clears.
+        let seg = sealed_segment("macazbd", 2, 1);
+        seg.write_to_file(dir.join("segments").join(seg.filename())).unwrap();
+        let report = store.verify_incremental().unwrap();
+        assert!(report.failures.is_empty(), "repaired segment still failing: {:?}", report.failures);
+        assert_eq!(report.newly_verified, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_corrupt_checkpoint_reverifies_all() {
+        let dir = test_dir("verify-incr-badckpt");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("macazbd", 2, 1)).unwrap();
+        store.verify_incremental().unwrap();
+
+        fs::write(dir.join(".verify-checkpoint.json"), "not json {").unwrap();
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 2);
+        assert_eq!(report.skipped, 0);
+        assert!(report.failures.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_full_rechecks_everything_and_resets_checkpoint() {
+        let dir = test_dir("verify-full");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("macazbd", 2, 1)).unwrap();
+        store.verify_incremental().unwrap();
+
+        let report = store.verify_full().unwrap();
+        assert_eq!(report.newly_verified, 2);
+        assert_eq!(report.skipped, 0);
+        assert!(report.failures.is_empty());
+
+        // Checkpoint still valid for the next incremental run.
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 0);
+        assert_eq!(report.skipped, 2);
 
         let _ = fs::remove_dir_all(&dir);
     }
