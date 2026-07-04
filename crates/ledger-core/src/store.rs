@@ -354,15 +354,22 @@ impl SegmentStore {
             .iter()
             .map(|(src, seq, _)| (src.clone(), *seq))
             .collect();
+        // A segment recorded as a gap last time but present now is a backfill:
+        // below the watermark yet never read — it must be verified.
+        let prior_missing: BTreeSet<(String, u64)> = ckpt.missing.into_iter().collect();
 
         let mut verified = ckpt.verified;
         let mut newly_verified = 0usize;
         let mut skipped = 0usize;
         let mut failures: Vec<(String, u64, String)> = Vec::new();
 
-        for (source, seq, path) in entries {
+        for (source, seq, path) in entries.iter() {
+            let (source, seq, path) = (source.clone(), *seq, path);
             let watermark = verified.get(&source).copied().unwrap_or(0);
-            if seq <= watermark && !prior_failures.contains(&(source.clone(), seq)) {
+            if seq <= watermark
+                && !prior_failures.contains(&(source.clone(), seq))
+                && !prior_missing.contains(&(source.clone(), seq))
+            {
                 skipped += 1;
                 continue;
             }
@@ -388,10 +395,27 @@ impl SegmentStore {
             }
         }
 
+        // Record the gaps currently below each watermark so a later backfill
+        // into one of them gets picked up by the next incremental run.
+        let mut present_by_source: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+        for (source, seq, _) in entries.iter() {
+            present_by_source.entry(source.as_str()).or_default().insert(*seq);
+        }
+        let mut missing: Vec<(String, u64)> = Vec::new();
+        for (source, watermark) in verified.iter() {
+            let present = present_by_source.get(source.as_str());
+            for seq in 1..=*watermark {
+                if !present.is_some_and(|s| s.contains(&seq)) {
+                    missing.push((source.clone(), seq));
+                }
+            }
+        }
+
         self.save_checkpoint(&VerifyCheckpoint {
             version: 1,
             verified,
             failures: failures.clone(),
+            missing,
         })?;
 
         Ok(VerifyReport {
@@ -424,7 +448,10 @@ impl SegmentStore {
             .map_err(|e| LedgerError::Serialization(e.to_string()))?;
         let tmp = self.root.join(".verify-checkpoint.json.tmp");
         fs::write(&tmp, body)?;
-        fs::rename(&tmp, self.checkpoint_path())?;
+        if let Err(e) = fs::rename(&tmp, self.checkpoint_path()) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -447,6 +474,12 @@ struct VerifyCheckpoint {
     verified: BTreeMap<String, u64>,
     /// Known failures `(source, seq, message)`, re-checked every run.
     failures: Vec<(String, u64, String)>,
+    /// Sequence gaps below the watermark at checkpoint time. `write_segment`
+    /// permits backfilling gaps, and a backfilled segment sits below the
+    /// watermark — without this list it would never be verified at all.
+    /// `#[serde(default)]` keeps checkpoints from before this field readable.
+    #[serde(default)]
+    missing: Vec<(String, u64)>,
 }
 
 /// Outcome of a `verify_incremental()` / `verify_full()` pass.
@@ -749,6 +782,56 @@ mod tests {
         assert_eq!(report.newly_verified, 2);
         assert_eq!(report.skipped, 0);
         assert!(report.failures.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_verify_incremental_verifies_backfilled_gap_segment() {
+        let dir = test_dir("verify-incr-backfill");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        // Write 1 and 3 (gap at 2 — write_segment permits this), verify.
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("macazbd", 3, 1)).unwrap();
+        store.verify_incremental().unwrap();
+
+        // Backfill the gap; it sits below the watermark but has never been
+        // read — the next incremental run must verify it, not skip it.
+        store.write_segment(&sealed_segment("macazbd", 2, 1)).unwrap();
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 1);
+        assert_eq!(report.skipped, 2);
+        assert!(report.failures.is_empty());
+
+        // And a corrupt backfill into a remaining gap must surface.
+        store.write_segment(&sealed_segment("jibotmac", 1, 1)).unwrap();
+        store.write_segment(&sealed_segment("jibotmac", 3, 1)).unwrap();
+        store.verify_incremental().unwrap();
+        write_corrupt_segment(&store, &dir, "jibotmac", 2);
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].1, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_checkpoint_without_missing_field_still_parses() {
+        let dir = test_dir("verify-incr-old-ckpt");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+
+        // Simulate a checkpoint written before the `missing` field existed.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(".verify-checkpoint.json"),
+            r#"{"version":1,"verified":{"macazbd":1},"failures":[]}"#,
+        )
+        .unwrap();
+
+        let report = store.verify_incremental().unwrap();
+        assert_eq!(report.newly_verified, 0, "old checkpoint must still be honored");
+        assert_eq!(report.skipped, 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
