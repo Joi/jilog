@@ -1,5 +1,7 @@
 # jilog
 
+[![Rust](https://github.com/Joi/jilog/actions/workflows/rust.yml/badge.svg)](https://github.com/Joi/jilog/actions/workflows/rust.yml)
+
 > An append-only event ledger and nightly learning loop for personal AI infrastructure.
 
 **Status: alpha — running in production on the author's systems; API may shift until 1.0.**
@@ -42,57 +44,57 @@ Segment files are the authority. SQLite is a rebuildable index. Nothing generate
 
 ---
 
-## Quick Start
+## Quick Start (5 minutes)
+
+**1. Install** — pinned release or moving main:
 
 ```bash
-cargo install --git https://github.com/Joi/jilog jilog
+cargo install --git https://github.com/Joi/jilog --tag v0.2.0 jilog   # pinned
+cargo install --git https://github.com/Joi/jilog jilog                # moving main
 ```
 
-Create `~/.jilog.toml`:
+**2. Configure one reader.** Create `~/.jilog.toml` pointing at whichever agent you already run — one reader is enough to start (add more later; see the readers table below):
 
 ```toml
 [[reader]]
 type = "claude-code"
 path = "~/.claude/projects"
+```
 
+**3. Run the review:**
+
+```bash
+jilog review nightly --since 7d
+```
+
+**4. Read the digest.** The path is printed on completion (default `~/.jilog/digests/learning-digest-<date>.md`) — corrections, errors, workarounds, deferrals, health patterns, and spend from the last 7 days. That's the loop; run it nightly from cron/launchd.
+
+From there, grow into the rest:
+
+```toml
+# More readers — amplifier/context-intelligence add health patterns + spend
 [[reader]]
 type = "amplifier"
 path = "~/.amplifier/projects"
 
-[[reader]]
-type = "context-intelligence"
-path = "~/.amplifier/projects"
-
-[[reader]]
-type = "codex"
-path = "~/.codex/sessions"
-
-[[reader]]
-type = "copilot"
-path = "~/.copilot/session-state"
-
+# A tracker turns recurring signals into issues (kata, github, none)
 [tracker]
 type = "github"
 repo = "your-org/your-repo"
-labels = ["jilog-learning"]
 
-[[zones]]
+# Zones for the event ledger (jilog query; supervise is planned)
+[[zone]]
 id = "ops"
 ledger_path = "~/.jilog/ledgers/ops"
 ```
 
-Then:
-
 ```bash
-# Wrap any recurring task with ledger events
-jilog supervise --task "jibrain-heartbeat" -- ./jibrain-heartbeat.sh
-
-# Query what happened
+# Query the event ledger
 jilog query --since 7d
 jilog query --since 24h --subsystem "review-*" --json
 
-# Run the nightly learning loop
-jilog review nightly
+# Nightly loop with issue filing, machine-readable output
+jilog review nightly --create-issues
 jilog review nightly --json | your-agent synthesize-suggestions
 ```
 
@@ -192,72 +194,88 @@ Boundary: jilog reports spend it **observed** in session files. It does not fetc
 
 ---
 
-## Example: a day's digest
+## Example: a real digest
 
 `jilog review nightly` writes `<digest_dir>/learning-digest-<YYYY-MM-DD>.md`. The format is byte-stable — downstream tooling greps these files, so detectors and the renderer preserve the exact layout shown here.
 
+This is a real digest from the author's machine (2026-07-05, 7-day window, 348 sessions), trimmed to a few lines per section:
+
 ````markdown
 ---
-date: 2026-05-09
-signals_captured: 7
-p0_count: 1
-corrections: 3
-errors: 2
-workarounds: 2
-deferrals: 0
+date: 2026-07-05
+signals_captured: 77
+p0_count: 0
+corrections: 12
+errors: 56
+workarounds: 6
+deferrals: 1
+patterns: 2
 ---
 
-# Learning Digest — 2026-05-09
+# Learning Digest — 2026-07-05
 
 ## P0 Alerts
 
-- **P0 ALERT**: `bash` failed in 4 distinct sessions: 0e91a2b4-..., 2f1c8d77-..., 8a4b1e09-..., c5d76f02-...
+_No P0 alerts._
 
 ## Corrections
 
-- `0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2` — 'no, use the gog cli for calendar, not osascript'
-- `2f1c8d77-91ab-4c5d-8e6f-1a2b3c4d5e6f` — 'wrong path — that file is in jibrain/atlas, not switchboard/people'
-- `8a4b1e09-3344-4abc-9def-0123456789ab` — 'stop. read the AGENTS.md before guessing again.'
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` — 'do granola re-auth'
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` — 'it looks like you skipped the dash.ito.com build'
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` — 'fix the launchd issue'
 
 ## Errors
 
-- `0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2` / `bash`: Command timed out after 30 seconds
-- `c5d76f02-aabb-4ccd-9eef-fedcba987654` / `read_file`: ~ was not expanded; use $HOME or an absolute path
+- `0000000000000000-907abeae456d42fe_self` / `todo`: {"message":"Todo 0 missing required fields (content, status, activeForm)"}
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` / `bash`: {"message":"Command timed out after 30 seconds"}
+- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` / `bash`: {"message":"Command timed out after 25 seconds"}
 
 ## Workarounds
 
-- `2f1c8d77-91ab-4c5d-8e6f-1a2b3c4d5e6f` pattern=`for now`: 'Hardcoding the retry count to 3 for now until we wire it through config.'
-- `8a4b1e09-3344-4abc-9def-0123456789ab` pattern=`TODO`: 'TODO: replace this fallback path once the upstream module exposes the new API.'
+- `0000000000000000-79f0e43ee2304cdb_self` pattern=`TODO`: 'All data collected. Let me update the todo list and finalize — this is the "nothing new to process" path.'
 
 ## Deferrals
 
-_No deferrals detected._
+- `ae5a0552-47f6-4030-af78-09fe71542d3d` pattern=`next session`
+
+## Patterns
+
+- `0000000000000000-cfa24544004845c7_self` kind=`iteration_runaway`: 53 tool calls without a user message 04:32-04:38
+- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` kind=`iteration_runaway`: 38 tool calls without a user message 01:35-01:54
+
+## Spend
+
+- **Total**: $441.83598225 across 323 of 347 session(s) with usage data
+- **Tokens**: 127488222 in / 1619003 out
+
+### Spend by role
+
+- `(root)`: $68.89777650
+- `joi-gtd-morning-runner`: $5.59667100
+- `self`: $364.83495800
+
+### Spend by model
+
+- `claude-haiku-4-5-20251001`: $0.62172475
+- `claude-opus-4-8`: $439.32940550
+- `claude-sonnet-5`: $1.88485200
 ````
 
-The frontmatter is machine-parseable. A common downstream check is "did yesterday's digest go silent on P0?" — `yq '.p0_count' learning-digest-*.md` gives a per-day series.
+The frontmatter is machine-parseable. A common downstream check is "did yesterday's digest go silent on P0?" — `yq '.p0_count' learning-digest-*.md` gives a per-day series. The Patterns lines are the health detectors at work (two sub-agent runs blew past 25 tool calls without a user turn), and Spend is what those 347 sessions actually cost, split by sub-agent role and model.
 
 ---
 
 ## Example: dry-run output
 
-`--dry-run` skips writing the digest file and skips creating issues, but still prints what would have been emitted. Useful for tuning detectors or inspecting a fresh window before letting it touch the tracker:
+`--dry-run` skips writing the digest file and skips creating issues, but still prints the summary counts. Useful for tuning detectors or inspecting a fresh window before letting it touch the tracker (real output, same run as the digest above):
 
 ```
-$ jilog review nightly --dry-run --since 24h
-scanned 38 sessions across 2 readers (amplifier=31, claude-code=7)
-
-[correction] 0e91a2b4-... 'no, use the gog cli for calendar, not osascript'
-[correction] 2f1c8d77-... 'wrong path — that file is in jibrain/atlas, not switchboard/people'
-[error]      0e91a2b4-... bash: Command timed out after 30 seconds
-[error]      c5d76f02-... read_file: ~ was not expanded; use $HOME or an absolute path
-[workaround] 2f1c8d77-... [for now] 'Hardcoding the retry count to 3 for now until we wire it through config.'
-[workaround] 8a4b1e09-... [TODO]    'TODO: replace this fallback path once the upstream module exposes the new API.'
-
-[p0]         bash failed in 4 distinct sessions (threshold=3)
-
-would write:  ~/ops/digests/learning-digest-2026-05-09.md
-would create: 7 issues in tracker=kata (dry-run, skipped)
+$ jilog review nightly --dry-run --since 7d
+12 corrections, 56 errors, 6 workarounds, 1 deferrals, 2 patterns, 0 P0 alert(s), 348 session(s) scanned
+Spend: $441.83598225 across 323 of 347 session(s) with usage data
 ```
+
+Add `--json` for the machine-readable version — same counts plus per-tool P0 session lists, the spend breakdown, and refs for any issues created.
 
 ---
 
@@ -319,15 +337,11 @@ The point of the nightly review is not that any single one of these is interesti
 ## Commands
 
 ```bash
-jilog supervise                     # Wrap tasks with ledger events + retry
-jilog query [--since N] [--json]    # Filter ledger events
 jilog review nightly [--json]       # Nightly learning digest + issue filing
-jilog review sessions               # Session-level summary by reader
-jilog issues list                   # Open jilog-learning issues across trackers
-jilog issues pending                # Learnings not yet filed
-jilog rebuild                       # Rebuild SQLite from segment files
-jilog status                        # Ledger health
+jilog query [--since N] [--json]    # Filter ledger events
 ```
+
+Planned (the ledger crates already support them; CLI wiring pending): `supervise` (wrap tasks with ledger events + retry), `review sessions`, `issues list`, `issues pending`, `rebuild`, `status`.
 
 ---
 
@@ -358,7 +372,7 @@ Ten core event classes. All stored as append-only segment files; nothing is dele
 | `ledger-sqlite` | Rebuildable SQLite projection, event queries |
 | `ledger-spool` | Cross-machine transport with dedup and integrity checks |
 | `jilog-review` | Nightly review engine: `Reader` + `Tracker` traits, signal detectors, digest renderer |
-| `jilog` | CLI binary: supervise, query, review, issues, status |
+| `jilog` | CLI binary: review, query (supervise/issues/status planned) |
 
 Built-in readers and trackers live as modules within `jilog-review`. Implement the `Reader` or `Tracker` trait to add your own without forking.
 
