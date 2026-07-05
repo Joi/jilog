@@ -143,37 +143,37 @@ impl Reader for AmplifierReader {
         &self,
         handle: &TranscriptHandle,
     ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
-        // Only events.jsonl carries kernel events; a transcript.jsonl handle
-        // has messages only, so health detectors get nothing for it.
-        let is_events = handle
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s == "events.jsonl")
-            .unwrap_or(false);
-        if !is_events {
-            return Ok(None);
+        match session_events_path(handle) {
+            Some(path) => load_session_events_jsonl(&path).map(Some),
+            None => Ok(None),
         }
-        load_session_events_jsonl(&handle.path).map(Some)
     }
 
     fn load_stats(
         &self,
         handle: &TranscriptHandle,
     ) -> Result<Option<SessionStats>, JilogReviewError> {
-        // Usage data rides on llm:response events; transcript.jsonl handles
-        // have chat messages only.
-        let is_events = handle
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s == "events.jsonl")
-            .unwrap_or(false);
-        if !is_events {
-            return Ok(None);
+        match session_events_path(handle) {
+            Some(path) => load_session_stats_jsonl(&path, &handle.session_id),
+            None => Ok(None),
         }
-        load_session_stats_jsonl(&handle.path, &handle.session_id)
     }
+}
+
+/// The events.jsonl carrying this session's kernel events: the handle's own
+/// path when the session was discovered via events.jsonl, or the sibling
+/// events.jsonl when it was discovered via transcript.jsonl (discover
+/// prefers transcript.jsonl for message fidelity, but kernel events and
+/// usage stats only exist in the event log). None when the session has no
+/// event log at all — health detectors and the Spend section then get
+/// nothing for it.
+fn session_events_path(handle: &TranscriptHandle) -> Option<PathBuf> {
+    let name = handle.path.file_name().and_then(|n| n.to_str())?;
+    if name == "events.jsonl" {
+        return Some(handle.path.clone());
+    }
+    let sibling = handle.path.parent()?.join("events.jsonl");
+    if sibling.exists() { Some(sibling) } else { None }
 }
 
 /// Parse a `transcript.jsonl` file (Schema-B; one chat message per line).
@@ -279,10 +279,11 @@ pub(crate) fn load_events_jsonl(path: &std::path::Path) -> Result<Vec<Message>, 
 /// - `prompt:submit`      → `UserMessage`
 ///
 /// `tool:post` is deliberately NOT mapped — the call is counted at `tool:pre`
-/// and mapping both would double-count. Lines that don't parse, name another
-/// event, or lack a parseable top-level `timestamp` are skipped silently: the
-/// window-based detectors depend on real timestamps, so a fabricated fallback
-/// would produce false storms.
+/// and mapping both would double-count. The timestamp is read from top-level
+/// `timestamp` (context-intelligence contract) or `ts` (Amplifier's own log
+/// format). Lines that don't parse, name another event, or lack a parseable
+/// timestamp are skipped silently: the window-based detectors depend on real
+/// timestamps, so a fabricated fallback would produce false storms.
 pub(crate) fn load_session_events_jsonl(
     path: &std::path::Path,
 ) -> Result<Vec<SessionEvent>, JilogReviewError> {
@@ -306,6 +307,7 @@ pub(crate) fn load_session_events_jsonl(
         };
         let timestamp = match value
             .get("timestamp")
+            .or_else(|| value.get("ts"))
             .and_then(|v| v.as_str())
             .and_then(parse_iso8601)
         {
@@ -584,6 +586,23 @@ not json
     }
 
     #[test]
+    fn load_session_events_accepts_ts_timestamp_key() {
+        // Amplifier's own log format uses "ts" (the context-intelligence
+        // stream uses "timestamp"); both must parse.
+        let dir = test_dir("ts-key");
+        let path = dir.join("events.jsonl");
+        let body = r#"{"ts": "2026-07-01T09:00:00.123456+00:00", "lvl": "INFO", "event": "tool:pre", "session_id": "s", "data": {"tool_name": "bash", "tool_input": {"command": "ls"}}}
+{"ts": "2026-07-01T09:01:00+00:00", "lvl": "INFO", "event": "session:resume", "session_id": "s", "data": {}}
+"#;
+        fs::write(&path, body).unwrap();
+        let events = load_session_events_jsonl(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, SessionEventKind::ToolCall);
+        assert_eq!(events[1].kind, SessionEventKind::Resume);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_session_events_detail_is_key_sorted_canonical() {
         let dir = test_dir("canonical-detail");
         let path = dir.join("events.jsonl");
@@ -596,6 +615,36 @@ not json
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].detail, events[1].detail);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_uses_sibling_events_for_transcript_handles() {
+        // A session with BOTH files is discovered via transcript.jsonl
+        // (message fidelity) but must still yield events and stats from the
+        // sibling events.jsonl.
+        let root = test_dir("sibling-events");
+        let s = root.join("proj").join("sessions").join("sess-both");
+        fs::create_dir_all(&s).unwrap();
+        fs::write(s.join("transcript.jsonl"), r#"{"role":"user","content":"hi"}"#).unwrap();
+        fs::write(
+            s.join("events.jsonl"),
+            r#"{"event":"session:resume","data":{},"timestamp":"2026-01-01T09:00:00+00:00"}
+{"event":"llm:response","data":{"model":"m","usage":{"cost_usd":0.5,"input_tokens":10,"output_tokens":2}},"timestamp":"2026-01-01T09:00:01+00:00"}
+"#,
+        )
+        .unwrap();
+
+        let reader = AmplifierReader::new(&root);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(handles[0].path.ends_with("transcript.jsonl"));
+
+        let events = reader.load_events(&handles[0]).unwrap().expect("sibling events");
+        assert_eq!(events.len(), 2);
+        let stats = reader.load_stats(&handles[0]).unwrap().expect("sibling stats");
+        assert_eq!(stats.cost_usd.as_deref(), Some("0.5"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
