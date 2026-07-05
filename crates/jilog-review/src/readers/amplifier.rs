@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::error::JilogReviewError;
-use crate::reader::{Message, Reader, TranscriptHandle};
-use crate::util::expand_tilde;
+use crate::reader::{Message, Reader, SessionEvent, SessionEventKind, TranscriptHandle};
+use crate::util::{expand_tilde, parse_iso8601};
 
 /// Reader for Amplifier-style session transcripts.
 pub struct AmplifierReader {
@@ -133,6 +133,24 @@ impl Reader for AmplifierReader {
             load_transcript_jsonl(&handle.path)
         }
     }
+
+    fn load_events(
+        &self,
+        handle: &TranscriptHandle,
+    ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
+        // Only events.jsonl carries kernel events; a transcript.jsonl handle
+        // has messages only, so health detectors get nothing for it.
+        let is_events = handle
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s == "events.jsonl")
+            .unwrap_or(false);
+        if !is_events {
+            return Ok(None);
+        }
+        load_session_events_jsonl(&handle.path).map(Some)
+    }
 }
 
 /// Parse a `transcript.jsonl` file (Schema-B; one chat message per line).
@@ -220,6 +238,75 @@ pub(crate) fn load_events_jsonl(path: &std::path::Path) -> Result<Vec<Message>, 
             }
             _ => {}
         }
+    }
+    Ok(out)
+}
+
+/// Parse an Amplifier-format `events.jsonl` into [`SessionEvent`]s for the
+/// health detectors. Works for both Amplifier's own event log and the
+/// context-intelligence stream (same line format plus an ignored top-level
+/// `workspace` key).
+///
+/// Mapping:
+/// - `context:compaction` → `Compaction`
+/// - `session:resume`     → `Resume`
+/// - `tool:pre`           → `ToolCall` (tool_name = `data.tool_name`,
+///                           detail = key-sorted JSON of `data.tool_input`)
+/// - `llm:response`       → `LlmResponse`
+/// - `prompt:submit`      → `UserMessage`
+///
+/// `tool:post` is deliberately NOT mapped — the call is counted at `tool:pre`
+/// and mapping both would double-count. Lines that don't parse, name another
+/// event, or lack a parseable top-level `timestamp` are skipped silently: the
+/// window-based detectors depend on real timestamps, so a fabricated fallback
+/// would produce false storms.
+pub(crate) fn load_session_events_jsonl(
+    path: &std::path::Path,
+) -> Result<Vec<SessionEvent>, JilogReviewError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = match value.get("event").and_then(|v| v.as_str()) {
+            Some("context:compaction") => SessionEventKind::Compaction,
+            Some("session:resume") => SessionEventKind::Resume,
+            Some("tool:pre") => SessionEventKind::ToolCall,
+            Some("llm:response") => SessionEventKind::LlmResponse,
+            Some("prompt:submit") => SessionEventKind::UserMessage,
+            _ => continue,
+        };
+        let timestamp = match value
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_iso8601)
+        {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let (tool_name, detail) = if kind == SessionEventKind::ToolCall {
+            let data = value.get("data");
+            let tool_name = data
+                .and_then(|d| d.get("tool_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // serde_json's default Map is a BTreeMap, so to_string() is a
+            // key-sorted canonical form — identical arguments compare equal.
+            let detail = data
+                .and_then(|d| d.get("tool_input"))
+                .map(|v| v.to_string());
+            (tool_name, detail)
+        } else {
+            (None, None)
+        };
+
+        out.push(SessionEvent { kind, timestamp, tool_name, detail });
     }
     Ok(out)
 }
@@ -344,6 +431,86 @@ not json
         let msgs = load_transcript_jsonl(&path).unwrap();
         assert_eq!(msgs.len(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_events_maps_kinds_and_skips_bad_lines() {
+        let dir = test_dir("session-events");
+        let path = dir.join("events.jsonl");
+        // One of each mapped event, a tool:post (must NOT double-count), an
+        // unmapped event, a line without a timestamp, and a garbage line.
+        let body = r#"{"event":"session:resume","data":{},"timestamp":"2026-01-01T09:00:00+00:00"}
+{"event":"prompt:submit","data":{"prompt":"hi"},"timestamp":"2026-01-01T09:00:01+00:00"}
+{"event":"context:compaction","data":{},"timestamp":"2026-01-01T09:00:02+00:00"}
+{"event":"tool:pre","data":{"tool_name":"bash","tool_input":{"command":"ls"}},"timestamp":"2026-01-01T09:00:03+00:00"}
+{"event":"tool:post","data":{"tool_name":"bash","result":{"success":true}},"timestamp":"2026-01-01T09:00:04+00:00"}
+{"event":"llm:response","data":{"raw":{"content":[]}},"timestamp":"2026-01-01T09:00:05+00:00"}
+{"event":"session:start","data":{},"timestamp":"2026-01-01T09:00:06+00:00"}
+{"event":"tool:pre","data":{"tool_name":"bash","tool_input":{"command":"ls"}}}
+{not json
+"#;
+        fs::write(&path, body).unwrap();
+
+        let events = load_session_events_jsonl(&path).unwrap();
+        let kinds: Vec<SessionEventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SessionEventKind::Resume,
+                SessionEventKind::UserMessage,
+                SessionEventKind::Compaction,
+                SessionEventKind::ToolCall,
+                SessionEventKind::LlmResponse,
+            ]
+        );
+        let call = &events[3];
+        assert_eq!(call.tool_name.as_deref(), Some("bash"));
+        assert_eq!(call.detail.as_deref(), Some(r#"{"command":"ls"}"#));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_events_detail_is_key_sorted_canonical() {
+        let dir = test_dir("canonical-detail");
+        let path = dir.join("events.jsonl");
+        // Same arguments, different key order on the wire: identical detail.
+        let body = r#"{"event":"tool:pre","data":{"tool_name":"bash","tool_input":{"b":2,"a":1}},"timestamp":"2026-01-01T09:00:00+00:00"}
+{"event":"tool:pre","data":{"tool_name":"bash","tool_input":{"a":1,"b":2}},"timestamp":"2026-01-01T09:00:01+00:00"}
+"#;
+        fs::write(&path, body).unwrap();
+        let events = load_session_events_jsonl(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].detail, events[1].detail);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_load_events_none_for_transcript_some_for_events() {
+        let root = test_dir("load-events-gate");
+        let s1 = root.join("proj").join("sessions").join("sess-t");
+        fs::create_dir_all(&s1).unwrap();
+        fs::write(s1.join("transcript.jsonl"), r#"{"role":"user","content":"hi"}"#).unwrap();
+        let s2 = root.join("proj").join("sessions").join("sess-e");
+        fs::create_dir_all(&s2).unwrap();
+        fs::write(
+            s2.join("events.jsonl"),
+            r#"{"event":"session:resume","data":{},"timestamp":"2026-01-01T09:00:00+00:00"}"#,
+        )
+        .unwrap();
+
+        let reader = AmplifierReader::new(&root);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 2);
+        for h in &handles {
+            let events = reader.load_events(h).unwrap();
+            if h.session_id == "sess-t" {
+                assert!(events.is_none(), "transcript.jsonl has no event stream");
+            } else {
+                assert_eq!(events.unwrap().len(), 1);
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

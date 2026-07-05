@@ -71,6 +71,24 @@ pub fn python_repr(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// parse_iso8601 — shared by the event-stream readers
+// ---------------------------------------------------------------------------
+
+/// Parse an ISO-8601 timestamp, with or without a timezone offset
+/// (naive timestamps are taken as UTC). Returns None on failure so
+/// callers can fall back or skip the line.
+pub(crate) fn parse_iso8601(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(Utc.from_utc_datetime(&naive));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests — ported from opsctl/src/review_nightly.rs
 // ---------------------------------------------------------------------------
 

@@ -10,8 +10,9 @@ use crate::detectors::{
     detect_corrections, detect_deferrals, detect_errors, detect_p0_alerts, detect_workarounds,
 };
 use crate::error::JilogReviewError;
+use crate::health::detect_health_patterns;
 use crate::reader::{ProcessedSessions, Reader};
-use crate::signal::{Correction, DeferralSignal, ErrorSignal, Signal, Workaround};
+use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Signal, Workaround};
 use crate::tracker::{IssueRef, Tracker, signal_title};
 use crate::util::{python_repr, truncate_with_marker};
 
@@ -42,6 +43,8 @@ pub struct DigestReport {
     pub errors: Vec<ErrorSignal>,
     pub workarounds: Vec<Workaround>,
     pub deferrals: Vec<DeferralSignal>,
+    /// Health patterns from readers with an event stream (see [`crate::health`]).
+    pub patterns: Vec<PatternSignal>,
     pub p0_alerts: HashMap<String, BTreeSet<String>>,
     pub digest_path: PathBuf,
     pub created_issues: Vec<IssueRef>,
@@ -53,11 +56,8 @@ pub struct DigestReport {
 // ---------------------------------------------------------------------------
 
 /// Top-level orchestrator:
-/// iterate readers → discover transcripts → load messages →
+/// iterate readers → discover transcripts → load messages (+ events) →
 /// run detectors → dedup against tracker → create issues → render digest.
-///
-/// Note: Pattern signals are produced by NO detector at this time. They are in
-/// the Signal enum for forward-compatibility only.
 pub fn run_review(
     readers: &[Box<dyn Reader>],
     tracker: &dyn Tracker,
@@ -67,6 +67,7 @@ pub fn run_review(
     let mut all_errors: Vec<ErrorSignal> = Vec::new();
     let mut all_workarounds: Vec<Workaround> = Vec::new();
     let mut all_deferrals: Vec<DeferralSignal> = Vec::new();
+    let mut all_patterns: Vec<PatternSignal> = Vec::new();
     let mut sessions_scanned: usize = 0;
     let mut created_issues: Vec<IssueRef> = Vec::new();
 
@@ -94,23 +95,35 @@ pub fn run_review(
             }
 
             let messages = match reader.load(&handle) {
-                Ok(msgs) if !msgs.is_empty() => msgs,
-                Ok(_) => continue, // empty transcript
+                Ok(msgs) => msgs,
                 Err(e) => {
                     tracing::warn!("reader '{}' load failed for {}: {}", reader.name(), handle.session_id, e);
                     continue;
                 }
             };
 
-            let corrections = detect_corrections(&messages, &handle.session_id);
-            let errors = detect_errors(&messages, &handle.session_id);
-            let workarounds = detect_workarounds(&messages, &handle.session_id);
-            let deferrals = detect_deferrals(&messages, &handle.session_id);
+            // Optional richer event stream for health-pattern detection;
+            // Ok(None) means the reader has messages only.
+            let events = match reader.load_events(&handle) {
+                Ok(evts) => evts.unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(
+                        "reader '{}' load_events failed for {}: {}",
+                        reader.name(), handle.session_id, e
+                    );
+                    Vec::new()
+                }
+            };
 
-            all_corrections.extend(corrections);
-            all_errors.extend(errors);
-            all_workarounds.extend(workarounds);
-            all_deferrals.extend(deferrals);
+            if messages.is_empty() && events.is_empty() {
+                continue; // nothing to analyze
+            }
+
+            all_corrections.extend(detect_corrections(&messages, &handle.session_id));
+            all_errors.extend(detect_errors(&messages, &handle.session_id));
+            all_workarounds.extend(detect_workarounds(&messages, &handle.session_id));
+            all_deferrals.extend(detect_deferrals(&messages, &handle.session_id));
+            all_patterns.extend(detect_health_patterns(&events, &handle.session_id));
             sessions_scanned += 1;
 
             if let Some(ref mut ps) = processed {
@@ -162,6 +175,16 @@ pub fn run_review(
                 Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
+        for pattern in &all_patterns {
+            let signal = Signal::Pattern(pattern.clone());
+            match tracker.create(&signal) {
+                Ok(issue_ref) => {
+                    issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    created_issues.push(issue_ref);
+                }
+                Err(e) => tracing::warn!("tracker.create failed: {}", e),
+            }
+        }
     }
 
     // Render and write digest.
@@ -184,6 +207,7 @@ pub fn run_review(
             &all_errors,
             &all_workarounds,
             &all_deferrals,
+            &all_patterns,
             &p0_alerts,
             &args.digest_dir,
             &issue_index,
@@ -203,6 +227,7 @@ pub fn run_review(
         errors: all_errors,
         workarounds: all_workarounds,
         deferrals: all_deferrals,
+        patterns: all_patterns,
         p0_alerts,
         digest_path,
         created_issues,
@@ -230,10 +255,12 @@ pub fn render_digest(
     errors: &[ErrorSignal],
     workarounds: &[Workaround],
     deferrals: &[DeferralSignal],
+    patterns: &[PatternSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     issue_index: &HashMap<String, IssueRef>,
 ) -> String {
-    let signals = corrections.len() + errors.len() + workarounds.len() + deferrals.len();
+    let signals =
+        corrections.len() + errors.len() + workarounds.len() + deferrals.len() + patterns.len();
     let mut buf = String::new();
     buf.push_str("---\n");
     buf.push_str(&format!("date: {}\n", date));
@@ -243,6 +270,7 @@ pub fn render_digest(
     buf.push_str(&format!("errors: {}\n", errors.len()));
     buf.push_str(&format!("workarounds: {}\n", workarounds.len()));
     buf.push_str(&format!("deferrals: {}\n", deferrals.len()));
+    buf.push_str(&format!("patterns: {}\n", patterns.len()));
     buf.push_str("---\n\n");
 
     buf.push_str(&format!("# Learning Digest — {}\n\n", date));
@@ -338,6 +366,24 @@ pub fn render_digest(
         buf.push('\n');
     }
 
+    // Patterns (session-health; see crate::health)
+    buf.push_str("## Patterns\n\n");
+    if patterns.is_empty() {
+        buf.push_str("_No patterns detected._\n\n");
+    } else {
+        for p in patterns {
+            let annotation = issue_annotation(
+                issue_index,
+                &signal_title(&Signal::Pattern(p.clone())),
+            );
+            buf.push_str(&format!(
+                "- `{}` kind=`{}`: {}{}\n",
+                p.session_id, p.pattern_kind, p.evidence, annotation
+            ));
+        }
+        buf.push('\n');
+    }
+
     buf
 }
 
@@ -355,13 +401,16 @@ pub fn write_digest(
     errors: &[ErrorSignal],
     workarounds: &[Workaround],
     deferrals: &[DeferralSignal],
+    patterns: &[PatternSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     digest_dir: &Path,
     issue_index: &HashMap<String, IssueRef>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = digest_dir.join(format!("learning-digest-{}.md", date));
-    let body = render_digest(date, corrections, errors, workarounds, deferrals, p0_alerts, issue_index);
+    let body = render_digest(
+        date, corrections, errors, workarounds, deferrals, patterns, p0_alerts, issue_index,
+    );
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -411,7 +460,7 @@ mod tests {
     #[test]
     fn digest_frontmatter_has_counts() {
         let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
@@ -422,12 +471,13 @@ mod tests {
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
         assert!(body.contains("_No workarounds detected._"));
         assert!(body.contains("_No deferrals detected._"));
+        assert!(body.contains("_No patterns detected._"));
     }
 
     #[test]
@@ -438,7 +488,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &p0, &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &p0, &no_issues());
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -449,7 +499,7 @@ mod tests {
             session_id: "abc".into(),
             context: "don't do that".into(),
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), &no_issues());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -461,8 +511,45 @@ mod tests {
             tool_name: "bash".into(),
             message: "x".repeat(600),
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &[], &HashMap::new(), &no_issues());
         assert!(body.contains("[truncated]"));
+    }
+
+    #[test]
+    fn digest_patterns_render_kind_and_evidence() {
+        let patterns = vec![PatternSignal {
+            session_id: "s1".into(),
+            description: "compaction storm: 4 compactions within 10 minutes".into(),
+            pattern_kind: "compaction_storm".into(),
+            evidence: "4 compactions 09:01-09:08".into(),
+        }];
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &patterns, &HashMap::new(), &no_issues());
+        assert!(body.contains("signals_captured: 1"));
+        assert!(body.contains("patterns: 1"));
+        assert!(body.contains("## Patterns"));
+        assert!(body.contains("- `s1` kind=`compaction_storm`: 4 compactions 09:01-09:08"));
+    }
+
+    #[test]
+    fn digest_patterns_annotated_when_issue_filed() {
+        let pattern = PatternSignal {
+            session_id: "s1".into(),
+            description: "stuck loop: `bash` called 5 times with identical arguments".into(),
+            pattern_kind: "stuck_loop".into(),
+            evidence: "`bash` x5 identical arguments 09:00-09:04".into(),
+        };
+        let signal = Signal::Pattern(pattern.clone());
+        let issue_ref = IssueRef {
+            id: "#9".to_string(),
+            backend: "kata".to_string(),
+            url: None,
+            title: signal_title(&signal),
+        };
+        let mut index = HashMap::new();
+        index.insert(signal_title(&signal), issue_ref);
+
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &[pattern], &HashMap::new(), &index);
+        assert!(body.contains("(→ kata#9)"), "annotation missing in:\n{}", body);
     }
 
     #[test]
@@ -471,7 +558,7 @@ mod tests {
             session_id: "s1".into(),
             item: "next session".into(),
         }];
-        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &[], &HashMap::new(), &no_issues());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("- `s1` pattern=`next session`"));
     }
@@ -479,7 +566,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), &dir, &no_issues()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -577,7 +664,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &HashMap::new(), &index);
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), &index);
         // Annotation must appear at end of bullet line, before newline.
         assert!(
             body.contains("(→ kata#7)"),
@@ -593,7 +680,7 @@ mod tests {
             session_id: "abc".into(),
             context: "fix it".into(),
         };
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &HashMap::new(), &no_issues());
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), &no_issues());
         // Line must end with content then newline — no trailing annotation.
         assert!(!body.contains("(→"), "unexpected annotation in:\n{}", body);
     }
@@ -618,12 +705,12 @@ mod tests {
         let body_with = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &HashMap::new(), &index,
+            &[], &[], &[], &[], &HashMap::new(), &index,
         );
         let body_without = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &HashMap::new(), &no_issues(),
+            &[], &[], &[], &[], &HashMap::new(), &no_issues(),
         );
 
         // The plain line must be identical in both renders.

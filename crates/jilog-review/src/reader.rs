@@ -24,6 +24,41 @@ pub struct Message {
 }
 
 // ---------------------------------------------------------------------------
+// SessionEvent — kernel-ish session events for health detectors
+// ---------------------------------------------------------------------------
+
+/// Kernel-ish session events for detectors that need more than messages
+/// (see [`crate::health`]). Produced by [`Reader::load_events`]; readers
+/// whose source format has no event stream return `Ok(None)` and health
+/// detectors simply produce nothing for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub kind: SessionEventKind,
+    pub timestamp: DateTime<Utc>,
+    /// Tool name for `ToolCall` events; None otherwise.
+    pub tool_name: Option<String>,
+    /// Kind-specific payload. For `ToolCall` this is the canonical
+    /// (key-sorted) JSON serialization of the tool arguments, so identical
+    /// arguments compare equal as strings.
+    pub detail: Option<String>,
+}
+
+/// The event classes health detectors care about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEventKind {
+    /// A context compaction ran.
+    Compaction,
+    /// The session was resumed.
+    Resume,
+    /// A tool was invoked.
+    ToolCall,
+    /// The LLM produced a response.
+    LlmResponse,
+    /// The user submitted a message.
+    UserMessage,
+}
+
+// ---------------------------------------------------------------------------
 // TranscriptHandle — a discovered transcript file
 // ---------------------------------------------------------------------------
 
@@ -59,6 +94,19 @@ pub trait Reader: Send + Sync {
     /// Parse a single transcript file into messages.
     /// Implementations MUST silently skip unparseable lines.
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError>;
+
+    /// Optional richer event stream for health-pattern detection.
+    ///
+    /// Default: `Ok(None)` — the reader has messages only, and health
+    /// detectors produce nothing for its sessions. Implementations MUST
+    /// silently skip unparseable lines and events without a parseable
+    /// timestamp (the window-based detectors depend on real timestamps).
+    fn load_events(
+        &self,
+        _handle: &TranscriptHandle,
+    ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

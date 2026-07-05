@@ -33,13 +33,13 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 
 use crate::error::JilogReviewError;
-use crate::reader::{Message, Reader, TranscriptHandle};
-use crate::util::expand_tilde;
+use crate::reader::{Message, Reader, SessionEvent, TranscriptHandle};
+use crate::util::{expand_tilde, parse_iso8601};
 
-use super::amplifier::load_events_jsonl;
+use super::amplifier::{load_events_jsonl, load_session_events_jsonl};
 
 /// Reader for Amplifier context-intelligence session event logs.
 pub struct ContextIntelligenceReader {
@@ -156,6 +156,15 @@ impl Reader for ContextIntelligenceReader {
         // parser ignores — same event names, same payload shapes under `data`.
         load_events_jsonl(&handle.path)
     }
+
+    fn load_events(
+        &self,
+        handle: &TranscriptHandle,
+    ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
+        // Every discovered handle is an events.jsonl (that is the only file
+        // this reader globs), so the richer stream is always available.
+        load_session_events_jsonl(&handle.path).map(Some)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,19 +211,6 @@ pub(crate) fn check_session_metadata(ci_dir: &Path) -> Result<CiMetadata, String
     }
 
     Ok(meta)
-}
-
-/// Parse an ISO-8601 timestamp, with or without a timezone offset
-/// (naive timestamps are taken as UTC). Returns None on failure so the
-/// caller can fall back to file mtime.
-fn parse_iso8601(s: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Some(Utc.from_utc_datetime(&naive));
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +372,34 @@ mod tests {
         // success:false must survive so detect_errors fires on the tool line.
         let tool_content = msgs[2].content.as_ref().unwrap();
         assert_eq!(tool_content.get("success").and_then(|v| v.as_bool()), Some(false));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_events_returns_session_events() {
+        let root = test_dir("load-events");
+        let ci = make_session(&root, "sess-ev", Some(VALID_META));
+        let body = r#"{"data":{},"event":"session:resume","timestamp":"2026-01-01T09:00:00+00:00","workspace":"w"}
+{"data":{},"event":"context:compaction","timestamp":"2026-01-01T09:01:00+00:00","workspace":"w"}
+{"data":{"tool_input":{"command":"ls"},"tool_name":"bash"},"event":"tool:pre","timestamp":"2026-01-01T09:02:00+00:00","workspace":"w"}
+"#;
+        fs::write(ci.join("events.jsonl"), body).unwrap();
+
+        let reader = ContextIntelligenceReader::new(&root);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1);
+
+        let events = reader
+            .load_events(&handles[0])
+            .unwrap()
+            .expect("context-intelligence always has an event stream");
+        assert_eq!(events.len(), 3);
+        use crate::reader::SessionEventKind;
+        assert_eq!(events[0].kind, SessionEventKind::Resume);
+        assert_eq!(events[1].kind, SessionEventKind::Compaction);
+        assert_eq!(events[2].kind, SessionEventKind::ToolCall);
+        assert_eq!(events[2].tool_name.as_deref(), Some("bash"));
         let _ = fs::remove_dir_all(&root);
     }
 

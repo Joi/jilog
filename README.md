@@ -102,17 +102,19 @@ jilog review nightly --json | your-agent synthesize-suggestions
 
 jilog can scan transcripts from different agent systems. Configure one or more readers:
 
-| Reader | Scans | Status |
-|---|---|---|
-| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | ✅ built-in |
-| `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ built-in |
-| `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ built-in |
-| `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | ✅ built-in |
-| `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | ✅ built-in |
-| `generic` | Any JSONL matching the jilog signal schema | ✅ built-in |
-| `nanoclaw` | SSH into NanoClaw host, scan session logs | 🔜 planned |
+| Reader | Scans | Health signals | Status |
+|---|---|---|---|
+| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | — | ✅ built-in |
+| `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ (events.jsonl sessions) | ✅ built-in |
+| `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ | ✅ built-in |
+| `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | — | ✅ built-in |
+| `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
+| `generic` | Any JSONL matching the jilog signal schema | — | ✅ built-in |
+| `nanoclaw` | SSH into NanoClaw host, scan session logs | — | 🔜 planned |
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
+
+**Health signals** require a richer event stream than chat messages (compactions, resumes, tool calls with arguments). Readers with ✅ implement `Reader::load_events`; the others degrade gracefully — the same pipeline runs, they just never produce `Pattern` signals.
 
 ---
 
@@ -153,7 +155,7 @@ See the `Tracker` trait in `crates/jilog-review/src/tracker.rs` to implement you
 
 ## Signal anatomy
 
-Five signal types are detected today. One more (`Pattern`) is reserved in the enum for forward compatibility but no detector produces it yet.
+Six signal types are detected today.
 
 | Signal        | What triggers it                                                    | Detector heuristic                                                                                       |
 |---------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
@@ -161,9 +163,23 @@ Five signal types are detected today. One more (`Pattern`) is reserved in the en
 | `Error`       | A tool call returned a structured failure                           | A `role: tool` message whose JSON content has `success: false`                                           |
 | `Workaround`  | Assistant text admits a temporary or hacky path                     | First-match across `for now`, `temporary`, `workaround`, `hardcoded`, `TODO`, `FIXME`, `quick fix`, `hack` |
 | `Deferral`    | Assistant text postpones work to a later session                    | First-match across `come back to`, `defer`, `punt on`, `leave for later`, `skipping for now`, `park for now`, `next session`, `circle back` |
+| `Pattern`     | The session's event stream shows a mechanical health problem       | Four detectors over `SessionEvent` streams — see the table below                                          |
 | `P0 Alert`    | The same tool failed in **3+ distinct root sessions** in the window | Aggregation pass over `Error` signals (sub-agent sessions with the all-zero prefix are excluded)         |
 
 Each emitted signal carries the `session_id` it came from, so digest and tracker entries always link back to the conversation that produced them.
+
+### Health-pattern detectors
+
+`Pattern` signals come from four pure-Rust detectors over the kernel-ish event stream of readers that implement `load_events` (amplifier, context-intelligence). Thresholds follow the amplifier context-intelligence signals-reference, tuned conservatively; the constants live in `crates/jilog-review/src/health.rs`.
+
+| `pattern_kind`      | Fires when                                                        |
+|---------------------|-------------------------------------------------------------------|
+| `compaction_storm`  | ≥3 compaction events within a 10-minute window                    |
+| `stuck_loop`        | Same tool called with identical arguments ≥4 times consecutively  |
+| `resume_storm`      | ≥3 resumes of one session within 30 minutes                       |
+| `iteration_runaway` | ≥25 tool calls with no intervening user message                   |
+
+Each `Pattern` carries an `evidence` string (e.g. `4 compactions 09:01-09:08`) that lands verbatim in the digest's Patterns section and in filed issues.
 
 ---
 

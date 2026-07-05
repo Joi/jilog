@@ -521,6 +521,7 @@ mod tests {
         let pattern = Signal::Pattern(PatternSignal {
             session_id: "s".into(),
             description: "recurring theme".into(),
+            ..Default::default()
         });
         let workaround = Signal::Workaround(Workaround {
             session_id: "s".into(),
@@ -590,6 +591,7 @@ mod tests {
         let signal = Signal::Pattern(PatternSignal {
             session_id: "sess-jkl".into(),
             description: "always asks for confirmation before deleting".into(),
+            ..Default::default()
         });
         let body = build_body(&signal, "2026-05-11");
         assert!(body.contains("always asks for confirmation before deleting"), "body must have description");

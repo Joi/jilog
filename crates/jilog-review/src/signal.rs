@@ -3,16 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 /// A learning signal extracted from session transcripts.
-///
-/// `Pattern` is reserved for a future detector. It appears in the enum for
-/// forward-compat only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Signal {
     Correction(Correction),
     Error(ErrorSignal),
     Workaround(Workaround),
-    /// Reserved: pattern detector not yet implemented.
+    /// A mechanical session-health pattern (see [`crate::health`]).
     Pattern(PatternSignal),
     Deferral(DeferralSignal),
 }
@@ -68,11 +65,23 @@ pub struct Workaround {
     pub context: String,
 }
 
-/// Reserved: detected recurring pattern. No detector produces this yet.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A detected session-health pattern (compaction storm, stuck loop, resume
+/// storm, iteration runaway — see [`crate::health`] for the detectors and
+/// thresholds).
+///
+/// `pattern_kind` and `evidence` were added after the struct first shipped;
+/// they default to empty when deserializing older serialized signals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PatternSignal {
     pub session_id: String,
+    /// Human-readable one-line summary (used in issue titles).
     pub description: String,
+    /// Stable snake_case detector id, e.g. "compaction_storm".
+    #[serde(default)]
+    pub pattern_kind: String,
+    /// Compact factual backing, e.g. "4 compactions 09:01-09:08".
+    #[serde(default)]
+    pub evidence: String,
 }
 
 /// Assistant text postponing work to a later session.

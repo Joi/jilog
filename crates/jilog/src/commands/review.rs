@@ -112,11 +112,12 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         );
     } else {
         println!(
-            "{} corrections, {} errors, {} workarounds, {} deferrals, {} P0 alert(s), {} session(s) scanned",
+            "{} corrections, {} errors, {} workarounds, {} deferrals, {} patterns, {} P0 alert(s), {} session(s) scanned",
             report.corrections.len(),
             report.errors.len(),
             report.workarounds.len(),
             report.deferrals.len(),
+            report.patterns.len(),
             report.p0_alerts.len(),
             report.sessions_scanned,
         );
@@ -182,6 +183,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         "errors": report.errors.len(),
         "workarounds": report.workarounds.len(),
         "deferrals": report.deferrals.len(),
+        "patterns": report.patterns.len(),
         "p0_alerts": serde_json::Value::Object(p0_alerts),
         "digest_path": digest_path,
         "created_issues": serde_json::Value::Array(created_issues),
@@ -234,6 +236,7 @@ mod tests {
             errors: Vec::new(),
             workarounds: Vec::new(),
             deferrals: Vec::new(),
+            patterns: Vec::new(),
             p0_alerts,
             digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
             created_issues: vec![IssueRef {
@@ -302,6 +305,7 @@ mod tests {
                 "errors",
                 "workarounds",
                 "deferrals",
+                "patterns",
                 "p0_alerts",
                 "digest_path",
                 "created_issues",
