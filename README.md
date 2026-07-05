@@ -4,6 +4,8 @@
 
 **Status: alpha — running in production on the author's systems; API may shift until 1.0.**
 
+Works with Amplifier: a built-in reader scans Amplifier session transcripts, and the same nightly loop covers Claude Code, Codex, and GitHub Copilot sessions.
+
 📐 **[Architecture overview](https://raw.githack.com/Joi/jilog/main/docs/architecture.html)** — illustrated walkthrough of how jilog works.
 
 ---
@@ -20,7 +22,7 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
-**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, NanoClaw, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
+**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them (a NanoClaw reader is planned). `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
 
 ### Why not LangSmith / Langfuse?
 
