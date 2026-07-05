@@ -254,30 +254,27 @@
 </div>
 
 <div class="card">
-<h4>issue filed in beads</h4>
+<h4>issue filed in kata</h4>
 <pre>{
-  <span class="k">"id"</span>: <span class="v">"myproj-a1b"</span>,
+  <span class="k">"number"</span>: <span class="v">42</span>,
   <span class="k">"title"</span>: <span class="v">"[jilog/error] bash:
        Command timed out after 30 seconds"</span>,
-  <span class="k">"type"</span>: <span class="v">"bug"</span>,
   <span class="k">"priority"</span>: <span class="v">1</span>,
   <span class="k">"status"</span>: <span class="v">"open"</span>,
-  <span class="k">"labels"</span>: [<span class="v">"jilog"</span>, <span class="v">"p0"</span>, <span class="v">"tool:bash"</span>],
-  <span class="k">"body"</span>: <span class="v">"Detected by jilog/review on
-   2026-05-09. Tool `bash` failed in 4
-   distinct root sessions in the last
-   24h, exceeding the P0 threshold (3).
+  <span class="k">"labels"</span>: [<span class="v">"jilog"</span>, <span class="v">"jilog:error"</span>],
+  <span class="k">"body"</span>: <span class="v">"Detected by jilog review
+   pipeline on 2026-05-09.
 
-   Example sessions:
-   - 0e91a2b4-7d3f-…
-   - 2f1c8d77-91ab-…
-   - 8a4b1e09-3344-…
-   - c5d76f02-aabb-…
+   ## Source
+   - Session: 0e91a2b4-7d3f-…
+   - Kind: error
+   - See `~/.amplifier/health/
+     learning-digest-2026-05-09.md`
 
-   First observed message:
-   > Command timed out after 30s"</span>,
-  <span class="k">"source"</span>: <span class="v">"jilog/review"</span>,
-  <span class="k">"created"</span>: <span class="v">"2026-05-09T08:02:11Z"</span>
+   ## Signal
+   Tool: bash
+   Message: Command timed out
+   after 30 seconds"</span>
 }</pre>
 </div>
 
@@ -358,7 +355,7 @@
   <rect x="750" y="255" width="150" height="60" rx="8" fill="#fff" stroke="#d97757" stroke-width="1.5"/>
   <text x="825" y="278" text-anchor="middle" font-family="-apple-system" font-size="13" font-weight="700" fill="#1f3b5f">📋 digest + 📂 issues</text>
   <text x="825" y="296" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">markdown report</text>
-  <text x="825" y="309" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">beads · github · kata</text>
+  <text x="825" y="309" text-anchor="middle" font-family="-apple-system" font-size="10" fill="#6b6b6b">kata · github</text>
 </svg>
 </div>
 <p class="caption"><code>supervise</code> instruments your jobs; <code>review</code> mines your agent transcripts. Both write events to the same ledger. A nightly <code>review</code> also files issues for novel patterns.</p>
@@ -410,7 +407,6 @@
 <h4>Trackers — where issues get filed</h4>
 <table>
   <tr><th>Tracker</th><th>Backend</th></tr>
-  <tr><td><code>beads</code></td><td>JSONL in <code>.beads/</code>, git-managed</td></tr>
   <tr><td><code>kata</code></td><td>Local SQLite daemon (kenn-io/kata)</td></tr>
   <tr><td><code>github</code></td><td><code>gh issue</code> CLI wrapper</td></tr>
   <tr><td><code>none</code></td><td>Markdown digest only, no issues filed</td></tr>

@@ -122,10 +122,9 @@ Learnings from the nightly loop can be filed as issues in any supported tracker:
 
 | Tracker | Notes | Status |
 |---|---|---|
-| `beads` | JSONL in `.beads/`, git-managed | ✅ built-in |
+| `kata` | Local SQLite daemon ([kenn-io/kata](https://github.com/kenn-io/kata)) | ✅ built-in |
 | `github` | `gh issue` CLI wrapper | ✅ built-in |
 | `none` | Markdown digest only, no issue creation | ✅ built-in |
-| `kata` | Local SQLite daemon ([kenn-io/kata](https://github.com/kenn-io/kata)) | ✅ built-in |
 
 ```toml
 [tracker]
@@ -232,7 +231,7 @@ scanned 38 sessions across 2 readers (amplifier=31, claude-code=7)
 [p0]         bash failed in 4 distinct sessions (threshold=3)
 
 would write:  ~/ops/digests/learning-digest-2026-05-09.md
-would create: 7 issues in tracker=beads (dry-run, skipped)
+would create: 7 issues in tracker=kata (dry-run, skipped)
 ```
 
 ---
@@ -250,43 +249,29 @@ The issue title is built by `signal_title()` (see `crates/jilog-review/src/track
 [jilog/deferral]   <session_id>: <truncated item>
 ```
 
-A run that produced the digest above would land entries like these in `.beads/issues.jsonl` with `tracker.type = "beads"` (one JSON object per line, shown pretty-printed):
+With `tracker.type = "kata"`, a run that produced the digest above shells out to the `kata` CLI once per new signal. This is the exact invocation jilog builds for the `bash` timeout error:
 
-```jsonl
-{
-  "id": "myproj-a1b",
-  "title": "[jilog/error] bash: Command timed out after 30 seconds",
-  "type": "bug",
-  "priority": 1,
-  "status": "open",
-  "labels": ["jilog", "p0", "tool:bash"],
-  "body": "Detected by jilog/review on 2026-05-09.\n\nTool `bash` failed in 4 distinct root sessions in the last 24h, exceeding the P0 threshold (3).\n\nExample sessions:\n- 0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2\n- 2f1c8d77-91ab-4c5d-8e6f-1a2b3c4d5e6f\n- 8a4b1e09-3344-4abc-9def-0123456789ab\n- c5d76f02-aabb-4ccd-9eef-fedcba987654\n\nFirst observed message:\n> Command timed out after 30 seconds\n",
-  "source": "jilog/review",
-  "created": "2026-05-09T08:02:11Z"
-}
-{
-  "id": "myproj-a1c",
-  "title": "[jilog/workaround] for now: 'Hardcoding the retry count to 3 for now until we wire it through co...'",
-  "type": "chore",
-  "priority": 3,
-  "status": "open",
-  "labels": ["jilog", "tech-debt", "pattern:for-now"],
-  "body": "Detected by jilog/review on 2026-05-09.\n\nSession: 2f1c8d77-91ab-4c5d-8e6f-1a2b3c4d5e6f\nPattern: `for now`\n\nContext:\n> Hardcoding the retry count to 3 for now until we wire it through config.\n",
-  "source": "jilog/review",
-  "created": "2026-05-09T08:02:11Z"
-}
-{
-  "id": "myproj-a1d",
-  "title": "[jilog/correction] 0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2: 'no, use the gog cli for calendar, not osascr...'",
-  "type": "task",
-  "priority": 3,
-  "status": "open",
-  "labels": ["jilog", "correction"],
-  "body": "Detected by jilog/review on 2026-05-09.\n\nUser correction in session 0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2:\n> no, use the gog cli for calendar, not osascript\n\nReview the assistant turn that immediately preceded this correction; the surrounding context likely points at a documented preference, a stale cached path, or a missing skill.\n",
-  "source": "jilog/review",
-  "created": "2026-05-09T08:02:11Z"
-}
+```console
+$ kata --project jilog --json create \
+    "[jilog/error] bash: Command timed out after 30 seconds" \
+    --body "Detected by jilog review pipeline on 2026-05-09.
+
+## Source
+- Session: 0e91a2b4-7d3f-4e2a-9c1b-44a7f3d8a1e2
+- Kind: error
+- See \`~/.amplifier/health/learning-digest-2026-05-09.md\` for the full digest window this signal came from.
+
+## Signal
+Tool: bash
+Message: Command timed out after 30 seconds" \
+    --label jilog --label jilog:error \
+    --idempotency-key "[jilog/error]-bash:-Command-timed-out-after-30-seconds" \
+    --priority 1
 ```
+
+Priorities are fixed per kind: errors file at priority 1, corrections and patterns at 2, workarounds and deferrals at 3. The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
+
+Recurrence reopens rather than duplicates: if a **closed** kata issue carries the same title, jilog reopens it, comments `Recurred on <date> — closure may have been premature.`, and adds the `jilog:recurred` label.
 
 The next nightly run that observes the same `bash`-timeout cluster will see the existing `[jilog/error] bash: Command timed out after 30 seconds` issue in `list_open()` and **not** file a duplicate — it will return the same `IssueRef`, which is what the digest links back to.
 

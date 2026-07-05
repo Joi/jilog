@@ -13,7 +13,7 @@ use crate::util::truncate_chars;
 pub struct IssueRef {
     /// Tracker-specific issue ID (e.g. "opsctl-abc", "#42", "digest-1234").
     pub id: String,
-    /// Which backend created this ref ("beads", "github", "none").
+    /// Which backend created this ref ("kata", "github", "none").
     pub backend: String,
     /// Optional URL to the issue.
     pub url: Option<String>,
@@ -30,7 +30,7 @@ pub struct IssueRef {
 /// Implementations MUST dedup: `create()` checks `list_open()` for an
 /// issue whose title matches `signal_title(signal)` before creating.
 pub trait Tracker: Send + Sync {
-    /// Stable name for this backend (e.g. "beads", "github", "none").
+    /// Stable name for this backend (e.g. "kata", "github", "none").
     fn name(&self) -> &str;
 
     /// Create an issue for `signal`, or return the existing one if a

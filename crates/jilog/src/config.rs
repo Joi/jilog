@@ -8,7 +8,7 @@ use serde::Deserialize;
 use jilog_review::{
     Reader, Tracker,
     readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, SessionIdSource},
-    trackers::{BeadsTracker, GithubTracker, KataTracker, NoneTracker},
+    trackers::{GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
 
@@ -74,7 +74,14 @@ pub enum GenericSessionIdSource {
 #[derive(Debug, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum TrackerConfig {
-    Beads { repo: String },
+    /// Removed backend (beads is deprecated). Still parsed so that configs
+    /// naming it fail at load with an error listing the remaining options,
+    /// instead of a generic unknown-variant message.
+    Beads {
+        #[serde(default)]
+        #[allow(dead_code)]
+        repo: Option<String>,
+    },
     Github { repo: String },
     /// kata local-first tracker. `project` is the kata project name
     /// (created via `kata init --project <name>` in a workspace dir).
@@ -99,7 +106,18 @@ impl JilogConfig {
     pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("read config at {}", path.as_ref().display()))?;
-        let cfg: Self = toml::from_str(&raw).with_context(|| "parse jilog.toml")?;
+        Self::from_toml_str(&raw)
+    }
+
+    /// Parse and validate config from a TOML string.
+    pub fn from_toml_str(raw: &str) -> anyhow::Result<Self> {
+        let cfg: Self = toml::from_str(raw).with_context(|| "parse jilog.toml")?;
+        if matches!(cfg.tracker, TrackerConfig::Beads { .. }) {
+            anyhow::bail!(
+                "tracker type \"beads\" was removed in jilog 0.2.0 (beads is deprecated); \
+                 set [tracker] type to one of: \"kata\", \"github\", \"none\""
+            );
+        }
         Ok(cfg)
     }
 
@@ -180,8 +198,8 @@ impl JilogConfig {
     /// Build a Tracker implementation from config.
     pub fn into_tracker(&self) -> Box<dyn Tracker> {
         match &self.tracker {
-            TrackerConfig::Beads { repo } => {
-                Box::new(BeadsTracker::new(expand_tilde(repo)))
+            TrackerConfig::Beads { .. } => {
+                unreachable!("tracker=\"beads\" is rejected in JilogConfig::from_toml_str")
             }
             TrackerConfig::Github { repo } => {
                 Box::new(GithubTracker::new(repo))
@@ -191,5 +209,49 @@ impl JilogConfig {
             }
             TrackerConfig::None => Box::new(NoneTracker),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beads_tracker_rejected_with_loud_error() {
+        // With and without the old `repo` field — both must fail the same way.
+        for raw in [
+            "[tracker]\ntype = \"beads\"\nrepo = \"~/ops\"\n",
+            "[tracker]\ntype = \"beads\"\n",
+        ] {
+            let err = JilogConfig::from_toml_str(raw)
+                .expect_err("beads config must be rejected")
+                .to_string();
+            assert!(err.contains("beads"), "error names beads: {err}");
+            assert!(err.contains("\"kata\""), "error names kata: {err}");
+            assert!(err.contains("\"github\""), "error names github: {err}");
+            assert!(err.contains("\"none\""), "error names none: {err}");
+        }
+    }
+
+    #[test]
+    fn remaining_trackers_still_parse() {
+        let cfg = JilogConfig::from_toml_str(
+            "[tracker]\ntype = \"kata\"\nproject = \"jilog\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.tracker, TrackerConfig::Kata { .. }));
+
+        let cfg = JilogConfig::from_toml_str(
+            "[tracker]\ntype = \"github\"\nrepo = \"o/r\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.tracker, TrackerConfig::Github { .. }));
+
+        let cfg = JilogConfig::from_toml_str("").unwrap();
+        assert!(matches!(cfg.tracker, TrackerConfig::None));
     }
 }

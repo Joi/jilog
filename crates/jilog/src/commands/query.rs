@@ -345,7 +345,7 @@ mod tests {
         let mut db = LedgerDb::open(&db_path).unwrap();
 
         let now = Utc::now();
-        write_dispatch_event(&store, &mut db, "src1", 1, "hook-beads-logger",
+        write_dispatch_event(&store, &mut db, "src1", 1, "hook-kata-logger",
             "logged 3 issues", now - Duration::hours(1));
         write_dispatch_event(&store, &mut db, "src1", 2, "hook-feature-capture",
             "captured 2 features", now - Duration::hours(2));
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn glob_match_prefix_wildcard() {
-        assert!(glob_match("hook-*", "hook-beads-logger"));
+        assert!(glob_match("hook-*", "hook-kata-logger"));
         assert!(glob_match("hook-*", "hook-feature-capture"));
         assert!(glob_match("hook-*", "hook-"));
         assert!(!glob_match("hook-*", "nightly-extractor"));
