@@ -181,6 +181,15 @@ Each emitted signal carries the `session_id` it came from, so digest and tracker
 
 Each `Pattern` carries an `evidence` string (e.g. `4 compactions 09:01-09:08`) that lands verbatim in the digest's Patterns section and in filed issues.
 
+### Cost-weighted digests
+
+Amplifier providers stamp `cost_usd` per LLM call into the session files jilog already reads. Readers with an event stream (amplifier, context-intelligence) sum `usage.{cost_usd,input_tokens,output_tokens}` across `llm:response` events per session; money math is `rust_decimal` end to end, never floats. Two things come out of this:
+
+- A **Spend** section in the digest — total, per-role, and per-model breakdowns. Sub-agent roles are parsed from the session-id suffix (`<uuid>_<role>`). The section renders only when at least one scanned session carried usage data; unpriced models (cost `null`) count tokens but no dollars.
+- A **week-over-week cost annotation** — a signal whose issue was already open before the run is a recurrence, and its digest line gains the summed cost of the sessions it recurred in: `(recurred in sessions totaling $4.20)`. Cost as weight: the recurring problems burning the most money surface first.
+
+Boundary: jilog reports spend it **observed** in session files. It does not fetch prices, maintain rate tables, or reconcile with provider billing.
+
 ---
 
 ## Example: a day's digest

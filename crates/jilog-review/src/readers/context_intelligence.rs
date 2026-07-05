@@ -36,10 +36,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::error::JilogReviewError;
-use crate::reader::{Message, Reader, SessionEvent, TranscriptHandle};
+use crate::reader::{Message, Reader, SessionEvent, SessionStats, TranscriptHandle};
 use crate::util::{expand_tilde, parse_iso8601};
 
-use super::amplifier::{load_events_jsonl, load_session_events_jsonl};
+use super::amplifier::{load_events_jsonl, load_session_events_jsonl, load_session_stats_jsonl};
 
 /// Reader for Amplifier context-intelligence session event logs.
 pub struct ContextIntelligenceReader {
@@ -164,6 +164,13 @@ impl Reader for ContextIntelligenceReader {
         // Every discovered handle is an events.jsonl (that is the only file
         // this reader globs), so the richer stream is always available.
         load_session_events_jsonl(&handle.path).map(Some)
+    }
+
+    fn load_stats(
+        &self,
+        handle: &TranscriptHandle,
+    ) -> Result<Option<SessionStats>, JilogReviewError> {
+        load_session_stats_jsonl(&handle.path, &handle.session_id)
     }
 }
 

@@ -21,13 +21,14 @@ fn test_dir(name: &str) -> PathBuf {
 }
 
 /// Event lines exhibiting a compaction storm (3 compactions in 8 minutes),
-/// a stuck loop (bash x4 identical arguments), and enough chat traffic to
-/// also produce a user/assistant exchange. `workspace` is present on every
-/// line (the amplifier parser ignores it, the CI stream requires it).
+/// a stuck loop (bash x4 identical arguments), priced usage on the
+/// llm:response, and enough chat traffic to also produce a user/assistant
+/// exchange. `workspace` is present on every line (the amplifier parser
+/// ignores it, the CI stream requires it).
 fn storm_fixture_lines() -> String {
     let mut lines = vec![
         r#"{"data":{"prompt":"please fix the build"},"event":"prompt:submit","timestamp":"2026-07-01T09:00:00+00:00","workspace":"w"}"#.to_string(),
-        r#"{"data":{"raw":{"content":[{"text":"on it","type":"text"}]}},"event":"llm:response","timestamp":"2026-07-01T09:00:05+00:00","workspace":"w"}"#.to_string(),
+        r#"{"data":{"model":"claude-opus-4-8","raw":{"content":[{"text":"on it","type":"text"}]},"usage":{"cost_usd":0.42,"input_tokens":1000,"output_tokens":100}},"event":"llm:response","timestamp":"2026-07-01T09:00:05+00:00","workspace":"w"}"#.to_string(),
         r#"{"data":{},"event":"context:compaction","timestamp":"2026-07-01T09:01:00+00:00","workspace":"w"}"#.to_string(),
         r#"{"data":{},"event":"context:compaction","timestamp":"2026-07-01T09:04:00+00:00","workspace":"w"}"#.to_string(),
         r#"{"data":{},"event":"context:compaction","timestamp":"2026-07-01T09:08:00+00:00","workspace":"w"}"#.to_string(),
@@ -77,6 +78,13 @@ fn amplifier_events_fixture_produces_pattern_section() {
         "digest:\n{}",
         body
     );
+    assert!(body.contains("## Spend"), "digest:\n{}", body);
+    assert!(
+        body.contains("- **Total**: $0.42 across 1 of 1 session(s) with usage data"),
+        "digest:\n{}",
+        body
+    );
+    assert!(body.contains("- `claude-opus-4-8`: $0.42"), "digest:\n{}", body);
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -112,5 +120,12 @@ fn context_intelligence_events_fixture_produces_pattern_section() {
     );
     // The same fixture also flows through the message path (frontmatter counts it).
     assert!(body.contains("patterns: 2"), "digest:\n{}", body);
+    assert!(body.contains("## Spend"), "digest:\n{}", body);
+    assert!(
+        body.contains("- **Total**: $0.42 across 1 of 1 session(s) with usage data"),
+        "digest:\n{}",
+        body
+    );
+    assert!(body.contains("- **Tokens**: 1000 in / 100 out"), "digest:\n{}", body);
     let _ = fs::remove_dir_all(&root);
 }

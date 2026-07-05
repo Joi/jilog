@@ -18,8 +18,13 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, TimeZone, Utc};
 
+use rust_decimal::Decimal;
+
 use crate::error::JilogReviewError;
-use crate::reader::{Message, Reader, SessionEvent, SessionEventKind, TranscriptHandle};
+use crate::reader::{
+    Message, Reader, SessionEvent, SessionEventKind, SessionStats, TranscriptHandle,
+    parse_session_role,
+};
 use crate::util::{expand_tilde, parse_iso8601};
 
 /// Reader for Amplifier-style session transcripts.
@@ -150,6 +155,24 @@ impl Reader for AmplifierReader {
             return Ok(None);
         }
         load_session_events_jsonl(&handle.path).map(Some)
+    }
+
+    fn load_stats(
+        &self,
+        handle: &TranscriptHandle,
+    ) -> Result<Option<SessionStats>, JilogReviewError> {
+        // Usage data rides on llm:response events; transcript.jsonl handles
+        // have chat messages only.
+        let is_events = handle
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s == "events.jsonl")
+            .unwrap_or(false);
+        if !is_events {
+            return Ok(None);
+        }
+        load_session_stats_jsonl(&handle.path, &handle.session_id)
     }
 }
 
@@ -309,6 +332,97 @@ pub(crate) fn load_session_events_jsonl(
         out.push(SessionEvent { kind, timestamp, tool_name, detail });
     }
     Ok(out)
+}
+
+/// Sum usage/cost across the `llm:response` events of an Amplifier-format
+/// `events.jsonl` (also used by the context-intelligence reader — same line
+/// format).
+///
+/// Reads `data.usage.{cost_usd,input_tokens,output_tokens}` and attributes
+/// cost to `data.model` (falling back to `data.raw.model`). Money math is
+/// [`Decimal`] end to end — costs are taken from the JSON literal's
+/// shortest-roundtrip text (or a string value verbatim), never summed as
+/// floats. Returns `Ok(None)` when no event carried a `usage` object, so
+/// sessions without usage data stay out of the digest's Spend section.
+pub(crate) fn load_session_stats_jsonl(
+    path: &std::path::Path,
+    session_id: &str,
+) -> Result<Option<SessionStats>, JilogReviewError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut saw_usage = false;
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut total_cost: Option<Decimal> = None;
+    let mut model_costs: std::collections::BTreeMap<String, Decimal> =
+        std::collections::BTreeMap::new();
+
+    for line in content.lines() {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("event").and_then(|v| v.as_str()) != Some("llm:response") {
+            continue;
+        }
+        let data = match value.get("data") {
+            Some(d) => d,
+            None => continue,
+        };
+        let usage = match data.get("usage") {
+            Some(u) if u.is_object() => u,
+            _ => continue,
+        };
+        saw_usage = true;
+        input_tokens += usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        output_tokens += usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let cost = usage.get("cost_usd").and_then(json_decimal);
+        if let Some(cost) = cost {
+            total_cost = Some(total_cost.unwrap_or(Decimal::ZERO) + cost);
+            let model = data
+                .get("model")
+                .and_then(|v| v.as_str())
+                .or_else(|| data.get("raw").and_then(|r| r.get("model")).and_then(|v| v.as_str()));
+            if let Some(model) = model {
+                *model_costs.entry(model.to_string()).or_insert(Decimal::ZERO) += cost;
+            }
+        }
+    }
+
+    if !saw_usage {
+        return Ok(None);
+    }
+    Ok(Some(SessionStats {
+        cost_usd: total_cost.map(|d| d.to_string()),
+        input_tokens,
+        output_tokens,
+        role: parse_session_role(session_id),
+        model_costs: model_costs
+            .into_iter()
+            .map(|(m, d)| (m, d.to_string()))
+            .collect(),
+    }))
+}
+
+/// Read a JSON value as a [`Decimal`].
+///
+/// Numbers go through their shortest-roundtrip text (what `serde_json`
+/// prints), which reproduces the upstream literal for any realistic cost
+/// value; strings are parsed verbatim. Null, missing, and unparseable
+/// values are treated as "no cost".
+fn json_decimal(v: &serde_json::Value) -> Option<Decimal> {
+    use std::str::FromStr;
+    match v {
+        serde_json::Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
+        serde_json::Value::String(s) => Decimal::from_str(s).ok(),
+        _ => None,
+    }
 }
 
 /// Pull a plain-text representation of an assistant turn from an
@@ -510,6 +624,113 @@ not json
                 assert_eq!(events.unwrap().len(), 1);
             }
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---------- session stats ----------
+
+    fn write_stats_fixture(name: &str, lines: &str) -> (PathBuf, PathBuf) {
+        let dir = test_dir(name);
+        let path = dir.join("events.jsonl");
+        fs::write(&path, lines).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn stats_decimal_precision_no_float_drift() {
+        // Ten 0.1-style values must sum exactly — the classic float trap.
+        let mut lines = String::new();
+        for _ in 0..10 {
+            lines.push_str(
+                r#"{"event":"llm:response","data":{"model":"claude-opus-4-8","usage":{"cost_usd":0.1,"input_tokens":100,"output_tokens":10}}}"#,
+            );
+            lines.push('\n');
+        }
+        let (dir, path) = write_stats_fixture("decimal-precision", &lines);
+        let stats = load_session_stats_jsonl(&path, "sess").unwrap().unwrap();
+        assert_eq!(stats.cost_usd.as_deref(), Some("1.0"));
+        assert_eq!(stats.input_tokens, 1000);
+        assert_eq!(stats.output_tokens, 100);
+        assert_eq!(stats.model_costs.get("claude-opus-4-8").map(String::as_str), Some("1.0"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_null_cost_session_has_usage_but_no_cost() {
+        // Unpriced model: usage present, cost_usd null → Some(stats) with
+        // cost_usd None, tokens still counted.
+        let lines = r#"{"event":"llm:response","data":{"model":"claude-fable-5","usage":{"cost_usd":null,"input_tokens":500,"output_tokens":50}}}
+"#;
+        let (dir, path) = write_stats_fixture("null-cost", lines);
+        let stats = load_session_stats_jsonl(&path, "sess").unwrap().unwrap();
+        assert_eq!(stats.cost_usd, None);
+        assert_eq!(stats.input_tokens, 500);
+        assert!(stats.model_costs.is_empty(), "no cost → no model attribution");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_mixed_priced_and_unpriced_models() {
+        let lines = r#"{"event":"llm:response","data":{"model":"claude-opus-4-8","usage":{"cost_usd":0.25,"input_tokens":10,"output_tokens":1}}}
+{"event":"llm:response","data":{"model":"claude-fable-5","usage":{"cost_usd":null,"input_tokens":20,"output_tokens":2}}}
+{"event":"llm:response","data":{"model":"claude-opus-4-8","usage":{"cost_usd":0.05,"input_tokens":30,"output_tokens":3}}}
+"#;
+        let (dir, path) = write_stats_fixture("mixed-models", lines);
+        let stats = load_session_stats_jsonl(&path, "sess").unwrap().unwrap();
+        assert_eq!(stats.cost_usd.as_deref(), Some("0.30"));
+        assert_eq!(stats.input_tokens, 60);
+        assert_eq!(stats.model_costs.len(), 1, "unpriced model not attributed");
+        assert_eq!(stats.model_costs.get("claude-opus-4-8").map(String::as_str), Some("0.30"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_none_when_no_usage_events() {
+        let lines = r#"{"event":"prompt:submit","data":{"prompt":"hello"}}
+{"event":"llm:response","data":{"raw":{"content":[{"type":"text","text":"hi"}]}}}
+"#;
+        let (dir, path) = write_stats_fixture("no-usage", lines);
+        assert!(load_session_stats_jsonl(&path, "sess").unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_role_parsed_from_session_id_suffix() {
+        let lines = r#"{"event":"llm:response","data":{"model":"m","usage":{"cost_usd":1.5,"input_tokens":1,"output_tokens":1}}}
+"#;
+        let (dir, path) = write_stats_fixture("role-suffix", lines);
+        let stats = load_session_stats_jsonl(&path, "0e91a2b4-7d3f_explore").unwrap().unwrap();
+        assert_eq!(stats.role.as_deref(), Some("explore"));
+        let root = load_session_stats_jsonl(&path, "0e91a2b4-7d3f").unwrap().unwrap();
+        assert_eq!(root.role, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_string_cost_and_raw_model_fallback() {
+        // cost_usd as a JSON string is taken verbatim; model falls back to
+        // data.raw.model when data.model is absent.
+        let lines = r#"{"event":"llm:response","data":{"raw":{"model":"claude-haiku-4-5"},"usage":{"cost_usd":"0.0003","input_tokens":1,"output_tokens":1}}}
+"#;
+        let (dir, path) = write_stats_fixture("string-cost", lines);
+        let stats = load_session_stats_jsonl(&path, "sess").unwrap().unwrap();
+        assert_eq!(stats.cost_usd.as_deref(), Some("0.0003"));
+        assert_eq!(stats.model_costs.get("claude-haiku-4-5").map(String::as_str), Some("0.0003"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reader_load_stats_none_for_transcript_handles() {
+        let root = test_dir("stats-gate");
+        let s = root.join("proj").join("sessions").join("sess-t");
+        fs::create_dir_all(&s).unwrap();
+        fs::write(s.join("transcript.jsonl"), r#"{"role":"user","content":"hi"}"#).unwrap();
+
+        let reader = AmplifierReader::new(&root);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(reader.load_stats(&handles[0]).unwrap().is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

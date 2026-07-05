@@ -122,6 +122,15 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
             report.sessions_scanned,
         );
 
+        if let Some(sp) = &report.spend {
+            if let Some(total) = &sp.total_cost_usd {
+                println!(
+                    "Spend: ${} across {} of {} session(s) with usage data",
+                    total, sp.sessions_with_cost, sp.sessions_with_stats
+                );
+            }
+        }
+
         if !args.dry_run {
             println!("Digest: {}", report.digest_path.display());
         }
@@ -176,6 +185,25 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         serde_json::Value::String(report.digest_path.display().to_string())
     };
 
+    // Spend is null when no scanned session carried usage data. Costs are
+    // string-decimals (observed values summed with rust_decimal, no floats).
+    let spend = match &report.spend {
+        None => serde_json::Value::Null,
+        Some(sp) => serde_json::json!({
+            "total_usd": sp.total_cost_usd.as_ref().map(|d| d.to_string()),
+            "sessions_with_stats": sp.sessions_with_stats,
+            "sessions_with_cost": sp.sessions_with_cost,
+            "input_tokens": sp.input_tokens,
+            "output_tokens": sp.output_tokens,
+            "role_costs_usd": sp.role_costs.iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "model_costs_usd": sp.model_costs.iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        }),
+    };
+
     serde_json::json!({
         "schema_version": 1,
         "sessions_scanned": report.sessions_scanned,
@@ -185,6 +213,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         "deferrals": report.deferrals.len(),
         "patterns": report.patterns.len(),
         "p0_alerts": serde_json::Value::Object(p0_alerts),
+        "spend": spend,
         "digest_path": digest_path,
         "created_issues": serde_json::Value::Array(created_issues),
     })
@@ -238,6 +267,7 @@ mod tests {
             deferrals: Vec::new(),
             patterns: Vec::new(),
             p0_alerts,
+            spend: None,
             digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
             created_issues: vec![IssueRef {
                 id: "#42".to_string(),
@@ -307,6 +337,7 @@ mod tests {
                 "deferrals",
                 "patterns",
                 "p0_alerts",
+                "spend",
                 "digest_path",
                 "created_issues",
             ])

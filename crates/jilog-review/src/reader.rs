@@ -59,6 +59,38 @@ pub enum SessionEventKind {
 }
 
 // ---------------------------------------------------------------------------
+// SessionStats — observed per-session usage/cost
+// ---------------------------------------------------------------------------
+
+/// Per-session usage and spend, as observed in the session files.
+///
+/// Produced by [`Reader::load_stats`]. jilog reports spend it observed —
+/// it does not fetch prices, maintain rate tables, or reconcile with
+/// provider billing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionStats {
+    /// Sum of per-call `cost_usd`. String-decimal to preserve upstream
+    /// precision; None when no call carried a cost (e.g. unpriced models).
+    pub cost_usd: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Sub-agent role parsed from the session-id suffix (`<uuid>_<role>`),
+    /// if any.
+    pub role: Option<String>,
+    /// Model → summed cost (string-decimal), for calls that carried a cost.
+    pub model_costs: std::collections::BTreeMap<String, String>,
+}
+
+/// Parse the sub-agent role from a session id of the form `<uuid>_<role>`.
+/// Returns None for root sessions (no underscore) and empty suffixes.
+pub fn parse_session_role(session_id: &str) -> Option<String> {
+    match session_id.split_once('_') {
+        Some((_, role)) if !role.is_empty() => Some(role.to_string()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TranscriptHandle — a discovered transcript file
 // ---------------------------------------------------------------------------
 
@@ -105,6 +137,18 @@ pub trait Reader: Send + Sync {
         &self,
         _handle: &TranscriptHandle,
     ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
+        Ok(None)
+    }
+
+    /// Optional per-session usage/spend stats for cost-weighted digests.
+    ///
+    /// Default: `Ok(None)` — the reader's source format carries no usage
+    /// data, and that session simply doesn't contribute to the digest's
+    /// Spend section.
+    fn load_stats(
+        &self,
+        _handle: &TranscriptHandle,
+    ) -> Result<Option<SessionStats>, JilogReviewError> {
         Ok(None)
     }
 }
@@ -182,6 +226,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parse_session_role_suffix_forms() {
+        assert_eq!(parse_session_role("abc-123_explore").as_deref(), Some("explore"));
+        // Everything after the FIRST underscore is the role (roles may
+        // themselves contain underscores; uuids never do).
+        assert_eq!(parse_session_role("abc-123_web_search").as_deref(), Some("web_search"));
+        assert_eq!(parse_session_role("abc-123"), None);
+        assert_eq!(parse_session_role("abc-123_"), None);
+        assert_eq!(parse_session_role(""), None);
     }
 
     #[test]
