@@ -89,6 +89,25 @@ pub(crate) fn parse_iso8601(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 // ---------------------------------------------------------------------------
+// json_decimal — shared by the usage/spend readers
+// ---------------------------------------------------------------------------
+
+/// Read a JSON value as a [`rust_decimal::Decimal`].
+///
+/// Numbers go through their shortest-roundtrip text (what `serde_json`
+/// prints), which reproduces the upstream literal for any realistic cost
+/// value; strings are parsed verbatim. Null, missing, and unparseable
+/// values are treated as "no cost".
+pub(crate) fn json_decimal(v: &serde_json::Value) -> Option<rust_decimal::Decimal> {
+    use std::str::FromStr;
+    match v {
+        serde_json::Value::Number(n) => rust_decimal::Decimal::from_str(&n.to_string()).ok(),
+        serde_json::Value::String(s) => rust_decimal::Decimal::from_str(s).ok(),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — ported from opsctl/src/review_nightly.rs
 // ---------------------------------------------------------------------------
 

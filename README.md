@@ -72,10 +72,14 @@ jilog review nightly --since 7d
 From there, grow into the rest:
 
 ```toml
-# More readers — amplifier/context-intelligence add health patterns + spend
+# More readers — amplifier/context-intelligence/pi add health patterns + spend
 [[reader]]
 type = "amplifier"
 path = "~/.amplifier/projects"
+
+[[reader]]
+type = "pi"
+path = "~/.pi/agent/sessions"
 
 # A tracker turns recurring signals into issues (kata, github, none)
 [tracker]
@@ -111,6 +115,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 | `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ | ✅ built-in |
 | `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | — | ✅ built-in |
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
+| `pi` | `~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl` ([pi.dev](https://pi.dev) coding agent, session format v3; user + assistant + toolResult messages, per-call usage/cost → spend section) | ✅ | ✅ built-in |
 | `generic` | Any JSONL matching the jilog signal schema | — | ✅ built-in |
 | `nanoclaw` | SSH into NanoClaw host, scan session logs | — | 🔜 planned |
 

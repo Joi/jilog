@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, SessionIdSource},
+    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, PiReader, SessionIdSource},
     trackers::{GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
@@ -50,6 +50,12 @@ pub enum ReaderConfig {
         path: Option<String>,
     },
     Copilot {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// pi coding agent (pi.dev) session files
+    /// (`~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl`).
+    Pi {
         #[serde(default)]
         path: Option<String>,
     },
@@ -183,6 +189,13 @@ impl JilogConfig {
                             .unwrap_or_else(|| expand_tilde("~/.copilot/session-state"));
                         Box::new(CopilotReader::new(dir))
                     }
+                    ReaderConfig::Pi { path } => {
+                        let dir = path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(|| expand_tilde("~/.pi/agent/sessions"));
+                        Box::new(PiReader::new(dir))
+                    }
                     ReaderConfig::Generic { name, path, session_id_from } => {
                         let source = match session_id_from {
                             GenericSessionIdSource::ParentDir => SessionIdSource::ParentDir,
@@ -235,6 +248,20 @@ mod tests {
             assert!(err.contains("\"github\""), "error names github: {err}");
             assert!(err.contains("\"none\""), "error names none: {err}");
         }
+    }
+
+    #[test]
+    fn pi_reader_parses_with_and_without_path() {
+        let cfg = JilogConfig::from_toml_str(
+            "[[reader]]\ntype = \"pi\"\npath = \"~/.pi/agent/sessions\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.readers[0], ReaderConfig::Pi { .. }));
+        assert_eq!(cfg.into_readers().len(), 1);
+
+        let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap();
+        assert!(matches!(cfg.readers[0], ReaderConfig::Pi { path: None }));
+        assert_eq!(cfg.into_readers()[0].name(), "pi");
     }
 
     #[test]

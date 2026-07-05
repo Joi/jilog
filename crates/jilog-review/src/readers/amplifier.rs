@@ -25,7 +25,7 @@ use crate::reader::{
     Message, Reader, SessionEvent, SessionEventKind, SessionStats, TranscriptHandle,
     parse_session_role,
 };
-use crate::util::{expand_tilde, parse_iso8601};
+use crate::util::{expand_tilde, json_decimal, parse_iso8601};
 
 /// Reader for Amplifier-style session transcripts.
 pub struct AmplifierReader {
@@ -410,21 +410,6 @@ pub(crate) fn load_session_stats_jsonl(
             .map(|(m, d)| (m, d.to_string()))
             .collect(),
     }))
-}
-
-/// Read a JSON value as a [`Decimal`].
-///
-/// Numbers go through their shortest-roundtrip text (what `serde_json`
-/// prints), which reproduces the upstream literal for any realistic cost
-/// value; strings are parsed verbatim. Null, missing, and unparseable
-/// values are treated as "no cost".
-fn json_decimal(v: &serde_json::Value) -> Option<Decimal> {
-    use std::str::FromStr;
-    match v {
-        serde_json::Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
-        serde_json::Value::String(s) => Decimal::from_str(s).ok(),
-        _ => None,
-    }
 }
 
 /// Pull a plain-text representation of an assistant turn from an
