@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, CopilotReader, GenericReader, SessionIdSource},
+    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, SessionIdSource},
     trackers::{BeadsTracker, GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
@@ -40,6 +40,12 @@ pub enum ReaderConfig {
         path: Option<String>,
     },
     Codex {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Amplifier context-intelligence event streams
+    /// (`<projects>/<proj>/sessions/<sess>/context-intelligence/events.jsonl`).
+    ContextIntelligence {
         #[serde(default)]
         path: Option<String>,
     },
@@ -144,6 +150,13 @@ impl JilogConfig {
                             .map(expand_tilde)
                             .unwrap_or_else(|| expand_tilde("~/.codex/sessions"));
                         Box::new(CodexReader::new(dir))
+                    }
+                    ReaderConfig::ContextIntelligence { path } => {
+                        let dir = path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(|| expand_tilde("~/.amplifier/projects"));
+                        Box::new(ContextIntelligenceReader::new(dir))
                     }
                     ReaderConfig::Copilot { path } => {
                         let dir = path

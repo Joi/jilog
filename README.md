@@ -60,6 +60,10 @@ type = "amplifier"
 path = "~/.amplifier/projects"
 
 [[reader]]
+type = "context-intelligence"
+path = "~/.amplifier/projects"
+
+[[reader]]
 type = "codex"
 path = "~/.codex/sessions"
 
@@ -102,6 +106,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 |---|---|---|
 | `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | ✅ built-in |
 | `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ built-in |
+| `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ built-in |
 | `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | ✅ built-in |
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | ✅ built-in |
 | `generic` | Any JSONL matching the jilog signal schema | ✅ built-in |
