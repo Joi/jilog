@@ -283,7 +283,19 @@ mod tests {
             patterns: Vec::new(),
             p0_alerts,
             spend: None,
-            personas: std::collections::BTreeMap::new(),
+            personas: std::collections::BTreeMap::from([(
+                "jibot@The vibez".to_string(),
+                jilog_review::PersonaCounts {
+                    persona: "jibot".to_string(),
+                    channel: Some("The vibez".to_string()),
+                    sessions: 2,
+                    corrections: 1,
+                    errors: 0,
+                    workarounds: 0,
+                    deferrals: 0,
+                    patterns: 1,
+                },
+            )]),
             digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
             created_issues: vec![IssueRef {
                 id: "#42".to_string(),
@@ -359,7 +371,24 @@ mod tests {
                 "created_issues",
             ])
         );
-        assert_eq!(parsed["personas"], serde_json::json!({}));
+        // Populated personas entry: the exact serialized shape is a
+        // documented-stable surface — consumers parse the persona/channel
+        // FIELDS (the map key is display-only and may be disambiguated).
+        assert_eq!(
+            parsed["personas"],
+            serde_json::json!({
+                "jibot@The vibez": {
+                    "persona": "jibot",
+                    "channel": "The vibez",
+                    "sessions": 2,
+                    "corrections": 1,
+                    "errors": 0,
+                    "workarounds": 0,
+                    "deferrals": 0,
+                    "patterns": 1,
+                }
+            })
+        );
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["sessions_scanned"], 3);
         assert_eq!(

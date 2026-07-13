@@ -99,6 +99,28 @@ fn persona_key(persona: &Option<String>, channel: &Option<String>) -> Option<Str
     })
 }
 
+/// Convert the tuple-keyed rollup into the display-keyed map exposed on
+/// [`DigestReport`]. Distinct (persona, channel) pairs whose display keys
+/// collide (an `@` inside a persona/channel name) stay separate: later
+/// entries get a ` (2)`, ` (3)`, … suffix. The `persona`/`channel` fields
+/// inside each [`PersonaCounts`] remain the parseable truth.
+fn display_keyed_personas(
+    personas: BTreeMap<(String, Option<String>), PersonaCounts>,
+) -> BTreeMap<String, PersonaCounts> {
+    let mut display: BTreeMap<String, PersonaCounts> = BTreeMap::new();
+    for ((persona, channel), counts) in personas {
+        let base = persona_key(&Some(persona), &channel).expect("persona is always present");
+        let mut key = base.clone();
+        let mut n = 2;
+        while display.contains_key(&key) {
+            key = format!("{} ({})", base, n);
+            n += 1;
+        }
+        display.insert(key, counts);
+    }
+    display
+}
+
 /// Spend observed across the scanned sessions, aggregated from each
 /// reader's [`crate::reader::SessionStats`].
 ///
@@ -143,8 +165,10 @@ pub fn run_review(
     let mut spend = SpendSummary::default();
     // session_id → known session cost, for recurrence annotations.
     let mut session_costs: HashMap<String, Decimal> = HashMap::new();
-    // persona@channel → sessions + signal counts (fleet sessions only).
-    let mut personas: BTreeMap<String, PersonaCounts> = BTreeMap::new();
+    // (persona, channel) → sessions + signal counts (fleet sessions only).
+    // Keyed on the tuple so distinct pairs never fold together even when
+    // their display keys collide; display keys are derived at the end.
+    let mut personas: BTreeMap<(String, Option<String>), PersonaCounts> = BTreeMap::new();
 
     // Load processed-sessions dedup file if configured.
     let mut processed: Option<ProcessedSessions> = match &args.processed_file {
@@ -208,7 +232,7 @@ pub fn run_review(
 
             // Stamp fleet dimensions onto this session's signals and fold
             // counts into the persona rollup.
-            if let Some(key) = persona_key(&handle.persona, &handle.channel) {
+            if let Some(persona) = handle.persona.clone() {
                 for c in &mut corrections {
                     c.persona.clone_from(&handle.persona);
                     c.channel.clone_from(&handle.channel);
@@ -229,11 +253,13 @@ pub fn run_review(
                     p.persona.clone_from(&handle.persona);
                     p.channel.clone_from(&handle.channel);
                 }
-                let counts = personas.entry(key).or_insert_with(|| PersonaCounts {
-                    persona: handle.persona.clone().unwrap_or_default(),
-                    channel: handle.channel.clone(),
-                    ..Default::default()
-                });
+                let counts = personas
+                    .entry((persona.clone(), handle.channel.clone()))
+                    .or_insert_with(|| PersonaCounts {
+                        persona,
+                        channel: handle.channel.clone(),
+                        ..Default::default()
+                    });
                 counts.sessions += 1;
                 counts.corrections += corrections.len();
                 counts.errors += errors.len();
@@ -273,6 +299,7 @@ pub fn run_review(
 
     let p0_alerts = detect_p0_alerts(&all_errors);
     let spend = if spend.sessions_with_stats > 0 { Some(spend) } else { None };
+    let personas = display_keyed_personas(personas);
 
     // Week-over-week cost annotation: a signal whose title was ALREADY open
     // in the tracker before this run is a recurrence. Annotate it with the
@@ -1327,6 +1354,29 @@ mod tests {
         );
         assert_eq!(report.personas["jibot@vibez"].sessions, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_keyed_personas_disambiguates_colliding_keys() {
+        // persona "jibot" in channel "q&a@hq" vs persona "jibot@q&a" in
+        // channel "hq": same display key, distinct tuples — counts must not
+        // fold together and both keep their parseable fields.
+        let counts = |persona: &str, channel: &str, sessions: usize| PersonaCounts {
+            persona: persona.into(),
+            channel: Some(channel.into()),
+            sessions,
+            ..Default::default()
+        };
+        let tuples = BTreeMap::from([
+            (("jibot".to_string(), Some("q&a@hq".to_string())), counts("jibot", "q&a@hq", 1)),
+            (("jibot@q&a".to_string(), Some("hq".to_string())), counts("jibot@q&a", "hq", 3)),
+        ]);
+        let display = display_keyed_personas(tuples);
+        assert_eq!(display.len(), 2, "colliding display keys must stay separate");
+        assert_eq!(display["jibot@q&a@hq"].persona, "jibot");
+        assert_eq!(display["jibot@q&a@hq"].sessions, 1);
+        assert_eq!(display["jibot@q&a@hq (2)"].persona, "jibot@q&a");
+        assert_eq!(display["jibot@q&a@hq (2)"].sessions, 3);
     }
 
     #[test]

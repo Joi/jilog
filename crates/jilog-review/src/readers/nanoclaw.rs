@@ -418,6 +418,12 @@ impl Reader for NanoclawReader {
                         });
                         continue;
                     }
+                    // Runtime-injected meta lines are not user activity —
+                    // counting them would reset the iteration-runaway window
+                    // (mirrors the load() skip).
+                    if is_flagged(&value, "isMeta") {
+                        continue;
+                    }
                     // Tool echoes (tool_result blocks) are runtime-injected,
                     // not user activity; counting them would mask iteration
                     // runaway (every tool call would "reset" the window).
@@ -913,6 +919,11 @@ mod tests {
             msgs[0].content.as_ref().and_then(|c| c.as_str()),
             Some("a real user message")
         );
+        // Events view must agree: compaction + one real UserMessage, and no
+        // UserMessage for the isMeta line.
+        let events = reader.load_events(&handles[0]).unwrap().unwrap();
+        let kinds: Vec<SessionEventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![SessionEventKind::Compaction, SessionEventKind::UserMessage]);
         let _ = fs::remove_dir_all(&data);
     }
 
