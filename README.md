@@ -83,7 +83,8 @@ path = "~/.pi/agent/sessions"
 
 # Fleet chat bots (NanoClaw cells): persona + channel dimensions, health
 # patterns, and a per-cell trust-tier allowlist (exclude wins; a non-empty
-# include admits only matching agents — matched on agent id/persona/folder)
+# include admits only matching agents — matched on agent id/persona/folder;
+# with any filter set, agents the v2.db can't resolve are skipped: fail closed)
 [[reader]]
 type = "nanoclaw"
 path = "~/nanoclaw/data"

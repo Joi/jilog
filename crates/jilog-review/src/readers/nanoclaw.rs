@@ -17,9 +17,13 @@
 //! agent's id, persona, AND folder slug (BIF-adjacent groups can run under
 //! the `jibot` persona, so persona-level matching alone is not enough).
 //! `exclude` always wins; a non-empty `include` admits only matching agents.
-//! Agents missing from v2.db fall back to their directory name for all three
-//! match keys, so an allowlisted cell stays closed when the db is absent or
-//! unreadable (e.g. a torn mirror copy).
+//! The filters are enforced against RESOLVED metadata only: whenever any
+//! include/exclude list is configured, an agent with no v2.db row — or any
+//! agent when the db is absent/unreadable (e.g. a torn mirror copy) — is
+//! skipped entirely, because an exclude like `["bifbot"]` cannot be checked
+//! against a directory name like `ag-1781087414868-eqq735`. Filtered cells
+//! therefore fail closed. Without filters, unmapped agents fall back to
+//! their directory name as persona.
 //!
 //! User messages arrive wrapped in NanoClaw envelope XML
 //! (`<context .../>` + one or more `<message ...>text</message>`); `load`
@@ -176,6 +180,7 @@ impl Reader for NanoclawReader {
         }
 
         let agent_map = self.load_agent_map();
+        let filters_active = !self.include.is_empty() || !self.exclude.is_empty();
 
         let agent_dirs = std::fs::read_dir(&sessions_root)?;
         for agent_dir in agent_dirs.flatten() {
@@ -184,6 +189,19 @@ impl Reader for NanoclawReader {
             }
             let agent_id = agent_dir.file_name().to_string_lossy().to_string();
             let info = agent_map.get(&agent_id);
+
+            // Trust filters can only be enforced against resolved metadata:
+            // exclude = ["bifbot"] matches nothing about a directory named
+            // ag-1781087414868-eqq735, so an unmapped agent under a filtered
+            // config MUST fail closed, not fall back to dir names.
+            if info.is_none() && filters_active {
+                tracing::warn!(
+                    "nanoclaw: agent '{}' has no v2.db mapping and a trust filter is configured — skipping (fail closed)",
+                    agent_id
+                );
+                continue;
+            }
+
             let persona =
                 info.map(|i| i.persona.clone()).unwrap_or_else(|| agent_id.clone());
             let folder = info.map(|i| i.folder.clone()).unwrap_or_else(|| agent_id.clone());
@@ -732,7 +750,10 @@ mod tests {
         );
         let handles = discover_all(&reader);
         let ids: Vec<&str> = handles.iter().map(|h| h.session_id.as_str()).collect();
-        assert_eq!(ids, vec!["s-1", "s-4"], "bifbot (persona) and steering (folder) excluded");
+        // s-4's agent has no v2.db row: with a filter configured it is
+        // skipped too (fail closed) — its dir name proves nothing about
+        // whether it is BIF-adjacent.
+        assert_eq!(ids, vec!["s-1"], "bifbot (persona), steering (folder), unmapped (fail closed) all excluded");
         let _ = fs::remove_dir_all(&data);
     }
 
@@ -764,14 +785,32 @@ mod tests {
     fn nanoclaw_missing_db_defaults_personas_to_dir_names() {
         let data = write_cell("no-db");
         fs::remove_file(data.join("v2.db")).unwrap();
+        // No filters: sessions still flow, personas fall back to dir names.
         let reader = NanoclawReader::new(&data);
         let handles = discover_all(&reader);
-        assert_eq!(handles.len(), 4, "missing db must not drop sessions");
+        assert_eq!(handles.len(), 4, "missing db must not drop unfiltered sessions");
         assert!(handles.iter().all(|h| h.channel.is_none()));
-        // …and an explicit include list admits nothing it doesn't name.
+        // An explicit include list admits nothing it can't resolve.
         let reader = NanoclawReader::new(&data)
             .with_allowlist(vec!["jibot".to_string()], Vec::new());
         assert!(discover_all(&reader).is_empty());
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn nanoclaw_exclude_only_fails_closed_without_db() {
+        // THE trust-boundary case: exclude = ["bifbot"] with an unreadable
+        // db. Dir-name fallback would never match "bifbot", so the filter
+        // must refuse to read anything rather than fail open and leak the
+        // excluded agent's sessions.
+        let data = write_cell("no-db-exclude");
+        fs::remove_file(data.join("v2.db")).unwrap();
+        let reader = NanoclawReader::new(&data)
+            .with_allowlist(Vec::new(), vec!["bifbot".to_string()]);
+        assert!(
+            discover_all(&reader).is_empty(),
+            "exclude-only config must fail closed when the db is unreadable"
+        );
         let _ = fs::remove_dir_all(&data);
     }
 

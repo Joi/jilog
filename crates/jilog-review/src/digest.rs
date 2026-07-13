@@ -90,13 +90,30 @@ impl PersonaCounts {
 
 /// Display key for a fleet session: `persona@channel`, or bare persona when
 /// the channel is unknown. None for coding sessions (no persona). Display-
-/// only — see [`PersonaCounts`] for the parseable form.
+/// only — see [`PersonaCounts`] for the parseable form. Both parts are
+/// sanitized for Markdown code spans, since channel names are free-form
+/// group names (a backtick would close the span; a newline would break the
+/// bullet line and could inject digest structure).
 fn persona_key(persona: &Option<String>, channel: &Option<String>) -> Option<String> {
-    let persona = persona.as_deref()?;
+    let persona = sanitize_display(persona.as_deref()?);
     Some(match channel.as_deref() {
-        Some(channel) => format!("{}@{}", persona, channel),
-        None => persona.to_string(),
+        Some(channel) => format!("{}@{}", persona, sanitize_display(channel)),
+        None => persona,
     })
+}
+
+/// Make a free-form persona/channel fragment safe for a single-line
+/// Markdown code span: backticks become apostrophes, control characters
+/// (incl. newlines) become spaces. The raw values stay available on the
+/// signals and [`PersonaCounts`] fields.
+fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
 }
 
 /// Convert the tuple-keyed rollup into the display-keyed map exposed on
@@ -1354,6 +1371,43 @@ mod tests {
         );
         assert_eq!(report.personas["jibot@vibez"].sessions, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_dims_sanitize_hostile_channel_names() {
+        // Channel names are free-form group names: a backtick would close
+        // the code span, a newline would inject digest structure.
+        let correction = Correction {
+            session_id: "s1".into(),
+            context: "no, wrong channel entirely".into(),
+            persona: Some("jibot".into()),
+            channel: Some("vibez`\ninjected".into()),
+        };
+        let key = persona_key(&correction.persona, &correction.channel).unwrap();
+        assert_eq!(key, "jibot@vibez' injected");
+        let personas = BTreeMap::from([(
+            key,
+            PersonaCounts {
+                persona: "jibot".into(),
+                channel: correction.channel.clone(),
+                sessions: 1,
+                corrections: 1,
+                ..Default::default()
+            },
+        )]);
+        let body = render_digest(
+            "2026-07-13", &[correction], &[], &[], &[], &[], &HashMap::new(),
+            None, &HashMap::new(), &no_issues(), &personas,
+        );
+        assert!(
+            body.contains("- `jibot@vibez' injected` `s1` — "),
+            "sanitized bullet missing:\n{}", body
+        );
+        assert!(
+            body.contains("- `jibot@vibez' injected`: 1 corrections"),
+            "sanitized personas line missing:\n{}", body
+        );
+        assert!(!body.contains("vibez`"), "raw backtick leaked into digest:\n{}", body);
     }
 
     #[test]
