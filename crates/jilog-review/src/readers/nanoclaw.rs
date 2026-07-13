@@ -193,9 +193,11 @@ impl Reader for NanoclawReader {
                 continue;
             }
 
+            // Escape the interpolated dir: agent names could contain glob
+            // metacharacters, which would silently match nothing.
             let pattern = format!(
                 "{}/.claude-shared/projects/**/*.jsonl",
-                agent_dir.path().display()
+                glob::Pattern::escape(&agent_dir.path().display().to_string())
             );
             let entries = match glob::glob(&pattern) {
                 Ok(e) => e,
@@ -270,6 +272,14 @@ impl Reader for NanoclawReader {
             };
             match (line_type, msg.get("role").and_then(|v| v.as_str())) {
                 (Some("user"), Some("user")) => {
+                    // Compact summaries recap the pre-compaction conversation
+                    // (including already-detected corrections/workarounds/
+                    // errors); letting them through double-signals long
+                    // sessions. isMeta lines are runtime-injected, not user
+                    // activity.
+                    if is_flagged(&value, "isCompactSummary") || is_flagged(&value, "isMeta") {
+                        continue;
+                    }
                     let content = msg.get("content");
                     match content {
                         Some(serde_json::Value::String(s)) => {
@@ -346,6 +356,10 @@ impl Reader for NanoclawReader {
                             }
                         }
                     }
+                    // One API response can be written as several assistant
+                    // lines (one per content block, same message.id) — each
+                    // line carries only its own blocks, so all are kept for
+                    // message content; only usage/events need id-dedup.
                     out.push(Message {
                         role: Some("assistant".to_string()),
                         content: msg.get("content").cloned(),
@@ -364,6 +378,7 @@ impl Reader for NanoclawReader {
     ) -> Result<Option<Vec<SessionEvent>>, JilogReviewError> {
         let content = std::fs::read_to_string(&handle.path)?;
         let mut out = Vec::new();
+        let mut seen_responses: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -394,7 +409,7 @@ impl Reader for NanoclawReader {
                 Some("user") => {
                     // Compact-summary continuations are compactions, not
                     // user activity.
-                    if value.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true) {
+                    if is_flagged(&value, "isCompactSummary") {
                         out.push(SessionEvent {
                             kind: SessionEventKind::Compaction,
                             timestamp,
@@ -425,12 +440,22 @@ impl Reader for NanoclawReader {
                     }
                 }
                 Some("assistant") => {
-                    out.push(SessionEvent {
-                        kind: SessionEventKind::LlmResponse,
-                        timestamp,
-                        tool_name: None,
-                        detail: None,
-                    });
+                    // One API response, several JSONL lines (same
+                    // message.id, one per content block): one LlmResponse.
+                    // ToolCall blocks are per-line and never duplicated, so
+                    // they are emitted unconditionally.
+                    let is_new = match response_key(&value) {
+                        Some(key) => seen_responses.insert(key),
+                        None => true,
+                    };
+                    if is_new {
+                        out.push(SessionEvent {
+                            kind: SessionEventKind::LlmResponse,
+                            timestamp,
+                            tool_name: None,
+                            detail: None,
+                        });
+                    }
                     if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
                         for block in blocks {
                             if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
@@ -467,6 +492,7 @@ impl Reader for NanoclawReader {
         let mut saw_usage = false;
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut seen_responses: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for line in content.lines() {
             let value: serde_json::Value = match serde_json::from_str(line) {
@@ -480,6 +506,14 @@ impl Reader for NanoclawReader {
                 Some(u) if u.is_object() => u,
                 _ => continue,
             };
+            // A multi-block response is written as several assistant lines,
+            // each repeating the SAME message.id and usage object; summing
+            // per line would multiply the (large) cache-read numbers.
+            if let Some(key) = response_key(&value) {
+                if !seen_responses.insert(key) {
+                    continue;
+                }
+            }
             saw_usage = true;
             // All input-side tokens: Claude reports cache reads/writes
             // separately from uncached input.
@@ -502,6 +536,26 @@ impl Reader for NanoclawReader {
             model_costs: std::collections::BTreeMap::new(),
         }))
     }
+}
+
+/// True if a top-level boolean flag (e.g. `isCompactSummary`, `isMeta`) is
+/// set on the line.
+fn is_flagged(value: &serde_json::Value, key: &str) -> bool {
+    value.get(key).and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Identity of the API response an assistant line belongs to, for deduping
+/// split multi-block responses: `message.id`, else `requestId`, else the
+/// line `uuid`. None when the line carries no usable identity (callers then
+/// treat it as unique).
+fn response_key(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("requestId").and_then(|v| v.as_str()))
+        .or_else(|| value.get("uuid").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
 }
 
 /// Extract the human text from a NanoClaw envelope string.
@@ -795,6 +849,71 @@ mod tests {
         assert_eq!(unwrap_envelope("  plain prompt  "), "plain prompt");
         // Empty message body → falls back to nothing.
         assert_eq!(unwrap_envelope(r#"<message id="1"></message>"#), "");
+    }
+
+    #[test]
+    fn nanoclaw_split_multiblock_response_counts_usage_once() {
+        // One API response written as TWO assistant lines (same message.id,
+        // one content block each, identical usage) — the real Claude Code
+        // split shape. Usage must count once; LlmResponse must emit once;
+        // both lines' content is kept.
+        let data = test_dir("split");
+        write_v2db(&data);
+        let proj = data.join("v2-sessions/ag-1/.claude-shared/projects/-workspace-agent");
+        fs::create_dir_all(&proj).unwrap();
+        let body = r#"{"type":"assistant","uuid":"a1","timestamp":"2026-07-08T10:00:00.000Z","message":{"id":"msg_01","role":"assistant","content":[{"type":"text","text":"part one"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":5000,"output_tokens":30}},"sessionId":"s-s"}
+{"type":"assistant","uuid":"a2","timestamp":"2026-07-08T10:00:00.500Z","message":{"id":"msg_01","role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":5000,"output_tokens":30}},"sessionId":"s-s"}
+{"type":"assistant","uuid":"a3","timestamp":"2026-07-08T10:01:00.000Z","message":{"id":"msg_02","role":"assistant","content":[{"type":"text","text":"second response"}],"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4}},"sessionId":"s-s"}
+"#;
+        fs::write(proj.join("s-s.jsonl"), body).unwrap();
+        let reader = NanoclawReader::new(&data);
+        let handles = discover_all(&reader);
+        let h = handles.iter().find(|h| h.session_id == "s-s").unwrap();
+
+        let stats = reader.load_stats(h).unwrap().unwrap();
+        // msg_01 counted once: (10+20+5000) + msg_02 (1+2+3); out 30 + 4.
+        assert_eq!(stats.input_tokens, 5036);
+        assert_eq!(stats.output_tokens, 34);
+
+        let events = reader.load_events(h).unwrap().unwrap();
+        let responses = events
+            .iter()
+            .filter(|e| e.kind == SessionEventKind::LlmResponse)
+            .count();
+        assert_eq!(responses, 2, "one LlmResponse per API response, not per line");
+        let tool_calls = events
+            .iter()
+            .filter(|e| e.kind == SessionEventKind::ToolCall)
+            .count();
+        assert_eq!(tool_calls, 1, "tool_use block still emitted");
+
+        let msgs = reader.load(h).unwrap();
+        assert_eq!(msgs.len(), 3, "split lines keep their distinct content blocks");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn nanoclaw_load_skips_compact_summary_and_meta_lines() {
+        let data = test_dir("load-compact");
+        write_v2db(&data);
+        let proj = data.join("v2-sessions/ag-1/.claude-shared/projects/-workspace-agent");
+        fs::create_dir_all(&proj).unwrap();
+        // The compact summary quotes correction/workaround language from the
+        // pre-compaction conversation; it must not reach the detectors.
+        let body = r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-07-08T10:00:00.000Z","message":{"role":"user","content":"Summary: user said don't post there; assistant used a workaround for now."},"sessionId":"s-m"}
+{"type":"user","isMeta":true,"timestamp":"2026-07-08T10:00:01.000Z","message":{"role":"user","content":"runtime-injected meta line"},"sessionId":"s-m"}
+{"type":"user","uuid":"u1","timestamp":"2026-07-08T10:00:02.000Z","message":{"role":"user","content":"<message id=\"1\" from=\"mg\">a real user message</message>"},"sessionId":"s-m"}
+"#;
+        fs::write(proj.join("s-m.jsonl"), body).unwrap();
+        let reader = NanoclawReader::new(&data);
+        let handles = discover_all(&reader);
+        let msgs = reader.load(&handles[0]).unwrap();
+        assert_eq!(msgs.len(), 1, "only the real user message survives");
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|c| c.as_str()),
+            Some("a real user message")
+        );
+        let _ = fs::remove_dir_all(&data);
     }
 
     #[test]

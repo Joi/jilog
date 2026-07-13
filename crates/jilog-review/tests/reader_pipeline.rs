@@ -129,3 +129,80 @@ fn context_intelligence_events_fixture_produces_pattern_section() {
     assert!(body.contains("- **Tokens**: 1000 in / 100 out"), "digest:\n{}", body);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn nanoclaw_cell_fixture_produces_dims_and_pattern_section() {
+    use jilog_review::readers::NanoclawReader;
+
+    let root = test_dir("nanoclaw-patterns");
+
+    // Minimal v2.db: one jibot agent serving one WhatsApp group.
+    let conn = rusqlite::Connection::open(root.join("v2.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE agent_groups (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
+            agent_provider TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE messaging_groups (
+            id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL,
+            instance TEXT NOT NULL, name TEXT, is_group INTEGER DEFAULT 0,
+            unknown_sender_policy TEXT NOT NULL DEFAULT 'strict', created_at TEXT NOT NULL,
+            denied_at TEXT
+        );
+        CREATE TABLE messaging_group_agents (
+            id TEXT PRIMARY KEY, messaging_group_id TEXT NOT NULL,
+            agent_group_id TEXT NOT NULL, session_mode TEXT DEFAULT 'shared',
+            priority INTEGER DEFAULT 0, created_at TEXT NOT NULL
+        );
+        INSERT INTO agent_groups VALUES ('ag-v', 'jibot', 'vibez', NULL, '2026-05-06');
+        INSERT INTO messaging_groups VALUES
+            ('mg-v', 'whatsapp', '1@g.us', 'whatsapp', 'The vibez', 1, 'public', '2026-05-06', NULL);
+        INSERT INTO messaging_group_agents VALUES ('mga-v', 'mg-v', 'ag-v', 'shared', 0, '2026-05-06');
+        "#,
+    )
+    .unwrap();
+
+    // A stuck loop: the same tool called with identical arguments 4 times,
+    // plus a user turn with a chat correction.
+    let proj = root.join("v2-sessions/ag-v/.claude-shared/projects/-workspace-agent");
+    fs::create_dir_all(&proj).unwrap();
+    let mut lines = vec![
+        r#"{"type":"assistant","uuid":"a-pre","timestamp":"2026-07-01T08:59:00.000Z","message":{"id":"msg_pre","role":"assistant","content":[{"type":"text","text":"Posting the summary here."}]},"sessionId":"sess-cell"}"#.to_string(),
+        r#"{"type":"user","uuid":"u1","timestamp":"2026-07-01T09:00:00.000Z","message":{"role":"user","content":"<message id=\"1\" from=\"mg-v\">no jibot, don't answer in that channel</message>"},"sessionId":"sess-cell"}"#.to_string(),
+    ];
+    for i in 0..4 {
+        lines.push(format!(
+            r#"{{"type":"assistant","uuid":"a{i}","timestamp":"2026-07-01T09:{:02}:00.000Z","message":{{"id":"msg_{i}","role":"assistant","content":[{{"type":"text","text":"retrying"}},{{"type":"tool_use","id":"toolu_{i}","name":"bash","input":{{"command":"cargo build"}}}}],"usage":{{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}}}},"sessionId":"sess-cell"}}"#,
+            10 + i
+        ));
+    }
+    fs::write(proj.join("sess-cell.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let digest_dir = root.join("digests");
+    let body = run_pipeline(Box::new(NanoclawReader::new(&root)), &digest_dir);
+
+    // Health pattern detected from cell events, with the dims prefix.
+    assert!(body.contains("## Patterns"), "digest:\n{}", body);
+    assert!(
+        body.contains("- `jibot@The vibez` `sess-cell` kind=`stuck_loop`: `bash` x4 identical arguments 09:10-09:13"),
+        "digest:\n{}",
+        body
+    );
+    // Chat correction stamped and prefixed.
+    assert!(
+        body.contains("- `jibot@The vibez` `sess-cell` — "),
+        "digest:\n{}",
+        body
+    );
+    // Personas rollup section.
+    assert!(body.contains("## Personas"), "digest:\n{}", body);
+    assert!(
+        body.contains("- `jibot@The vibez`: 1 corrections, 0 errors, 0 workarounds, 0 deferrals, 1 patterns (1 session(s))"),
+        "digest:\n{}",
+        body
+    );
+    // Token-only spend (cells carry no cost field).
+    assert!(body.contains("- **Tokens**: 40 in / 20 out"), "digest:\n{}", body);
+    let _ = fs::remove_dir_all(&root);
+}

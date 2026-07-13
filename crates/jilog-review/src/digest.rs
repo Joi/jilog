@@ -62,8 +62,16 @@ pub struct DigestReport {
 }
 
 /// Sessions and signal counts for one persona@channel key.
+///
+/// The map key is display-only (channel names are free-form group names and
+/// may themselves contain `@`); consumers parsing the JSON rollup should
+/// read the `persona`/`channel` fields, not split the key.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PersonaCounts {
+    /// Which bot (the un-ambiguous form of the map key's left side).
+    pub persona: String,
+    /// Which group/surface; None when the agent has no registered channel.
+    pub channel: Option<String>,
     /// Sessions scanned under this key (including sessions with no signals,
     /// so digests can say a bot needed no corrections).
     pub sessions: usize,
@@ -80,8 +88,9 @@ impl PersonaCounts {
     }
 }
 
-/// Rollup key for a fleet session: `persona@channel`, or bare persona when
-/// the channel is unknown. None for coding sessions (no persona).
+/// Display key for a fleet session: `persona@channel`, or bare persona when
+/// the channel is unknown. None for coding sessions (no persona). Display-
+/// only — see [`PersonaCounts`] for the parseable form.
 fn persona_key(persona: &Option<String>, channel: &Option<String>) -> Option<String> {
     let persona = persona.as_deref()?;
     Some(match channel.as_deref() {
@@ -220,7 +229,11 @@ pub fn run_review(
                     p.persona.clone_from(&handle.persona);
                     p.channel.clone_from(&handle.channel);
                 }
-                let counts = personas.entry(key).or_default();
+                let counts = personas.entry(key).or_insert_with(|| PersonaCounts {
+                    persona: handle.persona.clone().unwrap_or_default(),
+                    channel: handle.channel.clone(),
+                    ..Default::default()
+                });
                 counts.sessions += 1;
                 counts.corrections += corrections.len();
                 counts.errors += errors.len();
@@ -664,10 +677,6 @@ pub fn write_digest(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build the `(→ backend#N)` annotation suffix for a digest bullet line.
-///
-/// Returns an empty string if `signal_key` is not in `issue_index` (so the
-/// bullet is byte-identical to the pre-annotation format for that line).
 /// Fleet-dimension bullet prefix: `` `persona@channel` `` (with trailing
 /// space) when the signal carries a persona, empty otherwise — so
 /// coding-session lines stay byte-identical to the pre-dims format.
@@ -678,6 +687,10 @@ fn dims_prefix(persona: &Option<String>, channel: &Option<String>) -> String {
     }
 }
 
+/// Build the `(→ backend#N)` annotation suffix for a digest bullet line.
+///
+/// Returns an empty string if `signal_key` is not in `issue_index` (so the
+/// bullet is byte-identical to the pre-annotation format for that line).
 fn issue_annotation(issue_index: &HashMap<String, IssueRef>, signal_key: &str) -> String {
     match issue_index.get(signal_key) {
         Some(issue) => {

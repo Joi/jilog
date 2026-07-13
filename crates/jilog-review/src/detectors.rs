@@ -94,14 +94,12 @@ const CHAT_CORRECTION_PATTERNS: &[&str] = &[
     r"(?i)^no[,.! ]",
     r"(?i)\bdon'?t\b",
     r"(?i)\bdo not\b",
-    r"(?i)\bstop\b",
+    r"(?i)\bplease stop\b",
+    r"(?i)\bstop (doing|replying|posting|answering|sending|using|adding)\b",
     r"(?i)\bwrong\b",
     r"(?i)\bincorrect\b",
     r"(?i)\bnot (that|what|like that|right|the right)\b",
     r"(?i)\bshould(n'?t| not| never)\b",
-    r"(?i)\bnever\b",
-    r"(?i)\binstead\b",
-    r"(?i)\bactually[, ]",
     r"(?i)\bthat'?s not\b",
 ];
 
@@ -159,7 +157,8 @@ fn detect_corrections_impl(messages: &[Message], session_id: &str, chat: bool) -
         if content_str.trim().len() < MIN_CORRECTION_LENGTH {
             continue;
         }
-        if chat && !chat_correction_regex().is_match(&content_str) {
+        // Trimmed so the `^`-anchored markers see the real first word.
+        if chat && !chat_correction_regex().is_match(content_str.trim()) {
             continue;
         }
 
@@ -624,6 +623,35 @@ mod tests {
             assert_eq!(out.len(), 1, "expected chat correction for: {text}");
             assert_eq!(out[0].context, text);
         }
+    }
+
+    #[test]
+    fn chat_corrections_ignore_conversational_marker_lookalikes() {
+        // Broad-marker false positives: ordinary chat that merely contains
+        // stop/never/instead/actually must not fire.
+        let cases = [
+            "let's stop by the cafe after the session",
+            "I've never been to that part of town",
+            "let's meet on Zoom instead of in person",
+            "actually, that sounds great to me",
+        ];
+        for text in cases {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            assert!(
+                detect_corrections_chat(&msgs, "s1").is_empty(),
+                "false-positive chat correction for: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_corrections_anchor_matches_after_leading_whitespace() {
+        let msgs = vec![
+            assistant("a"),
+            user("  no, that message was for the other group"),
+            assistant("b"),
+        ];
+        assert_eq!(detect_corrections_chat(&msgs, "s1").len(), 1);
     }
 
     #[test]
