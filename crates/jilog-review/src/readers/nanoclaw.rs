@@ -97,9 +97,9 @@ impl NanoclawReader {
     /// Load the agent-id → persona/folder/channel map from v2.db.
     ///
     /// Any failure (missing file, torn mirror copy, schema drift) degrades to
-    /// an empty map with a warning: sessions then carry their agent dir name
-    /// as persona, and a non-empty `include` list admits nothing it doesn't
-    /// name explicitly.
+    /// an empty map with a warning; `discover` then skips ALL agents when any
+    /// include/exclude filter is configured (fail closed), and otherwise
+    /// falls back to agent dir names as personas.
     fn load_agent_map(&self) -> HashMap<String, AgentInfo> {
         match self.query_agent_map() {
             Ok(map) => map,
