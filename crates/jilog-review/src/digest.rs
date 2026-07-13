@@ -9,7 +9,8 @@ use rust_decimal::Decimal;
 
 use crate::detectors::MAX_ERROR_MESSAGE_LENGTH;
 use crate::detectors::{
-    detect_corrections, detect_deferrals, detect_errors, detect_p0_alerts, detect_workarounds,
+    detect_corrections, detect_corrections_chat, detect_deferrals, detect_errors,
+    detect_p0_alerts, detect_workarounds,
 };
 use crate::error::JilogReviewError;
 use crate::health::detect_health_patterns;
@@ -51,9 +52,42 @@ pub struct DigestReport {
     /// Aggregated spend across sessions that reported stats; None when no
     /// scanned session carried usage data.
     pub spend: Option<SpendSummary>,
+    /// Per-persona/channel rollup for fleet sessions (handles that carried a
+    /// persona). Keyed `persona@channel` (or bare persona when the channel is
+    /// unknown). Empty when only coding sessions were scanned.
+    pub personas: BTreeMap<String, PersonaCounts>,
     pub digest_path: PathBuf,
     pub created_issues: Vec<IssueRef>,
     pub sessions_scanned: usize,
+}
+
+/// Sessions and signal counts for one persona@channel key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PersonaCounts {
+    /// Sessions scanned under this key (including sessions with no signals,
+    /// so digests can say a bot needed no corrections).
+    pub sessions: usize,
+    pub corrections: usize,
+    pub errors: usize,
+    pub workarounds: usize,
+    pub deferrals: usize,
+    pub patterns: usize,
+}
+
+impl PersonaCounts {
+    fn signal_total(&self) -> usize {
+        self.corrections + self.errors + self.workarounds + self.deferrals + self.patterns
+    }
+}
+
+/// Rollup key for a fleet session: `persona@channel`, or bare persona when
+/// the channel is unknown. None for coding sessions (no persona).
+fn persona_key(persona: &Option<String>, channel: &Option<String>) -> Option<String> {
+    let persona = persona.as_deref()?;
+    Some(match channel.as_deref() {
+        Some(channel) => format!("{}@{}", persona, channel),
+        None => persona.to_string(),
+    })
 }
 
 /// Spend observed across the scanned sessions, aggregated from each
@@ -100,6 +134,8 @@ pub fn run_review(
     let mut spend = SpendSummary::default();
     // session_id → known session cost, for recurrence annotations.
     let mut session_costs: HashMap<String, Decimal> = HashMap::new();
+    // persona@channel → sessions + signal counts (fleet sessions only).
+    let mut personas: BTreeMap<String, PersonaCounts> = BTreeMap::new();
 
     // Load processed-sessions dedup file if configured.
     let mut processed: Option<ProcessedSessions> = match &args.processed_file {
@@ -149,11 +185,55 @@ pub fn run_review(
                 continue; // nothing to analyze
             }
 
-            all_corrections.extend(detect_corrections(&messages, &handle.session_id));
-            all_errors.extend(detect_errors(&messages, &handle.session_id));
-            all_workarounds.extend(detect_workarounds(&messages, &handle.session_id));
-            all_deferrals.extend(detect_deferrals(&messages, &handle.session_id));
-            all_patterns.extend(detect_health_patterns(&events, &handle.session_id));
+            // Chat sessions (persona present) use the chat-tuned correction
+            // detector; coding sessions keep the original heuristic.
+            let mut corrections = if handle.persona.is_some() {
+                detect_corrections_chat(&messages, &handle.session_id)
+            } else {
+                detect_corrections(&messages, &handle.session_id)
+            };
+            let mut errors = detect_errors(&messages, &handle.session_id);
+            let mut workarounds = detect_workarounds(&messages, &handle.session_id);
+            let mut deferrals = detect_deferrals(&messages, &handle.session_id);
+            let mut patterns = detect_health_patterns(&events, &handle.session_id);
+
+            // Stamp fleet dimensions onto this session's signals and fold
+            // counts into the persona rollup.
+            if let Some(key) = persona_key(&handle.persona, &handle.channel) {
+                for c in &mut corrections {
+                    c.persona.clone_from(&handle.persona);
+                    c.channel.clone_from(&handle.channel);
+                }
+                for e in &mut errors {
+                    e.persona.clone_from(&handle.persona);
+                    e.channel.clone_from(&handle.channel);
+                }
+                for w in &mut workarounds {
+                    w.persona.clone_from(&handle.persona);
+                    w.channel.clone_from(&handle.channel);
+                }
+                for d in &mut deferrals {
+                    d.persona.clone_from(&handle.persona);
+                    d.channel.clone_from(&handle.channel);
+                }
+                for p in &mut patterns {
+                    p.persona.clone_from(&handle.persona);
+                    p.channel.clone_from(&handle.channel);
+                }
+                let counts = personas.entry(key).or_default();
+                counts.sessions += 1;
+                counts.corrections += corrections.len();
+                counts.errors += errors.len();
+                counts.workarounds += workarounds.len();
+                counts.deferrals += deferrals.len();
+                counts.patterns += patterns.len();
+            }
+
+            all_corrections.extend(corrections);
+            all_errors.extend(errors);
+            all_workarounds.extend(workarounds);
+            all_deferrals.extend(deferrals);
+            all_patterns.extend(patterns);
 
             // Optional usage/spend stats; Ok(None) means the source format
             // carries no usage data.
@@ -284,6 +364,7 @@ pub fn run_review(
             &recurrence_costs,
             &args.digest_dir,
             &issue_index,
+            &personas,
         )?;
     }
 
@@ -303,6 +384,7 @@ pub fn run_review(
         patterns: all_patterns,
         p0_alerts,
         spend,
+        personas,
         digest_path,
         created_issues,
         sessions_scanned,
@@ -334,6 +416,7 @@ pub fn render_digest(
     spend: Option<&SpendSummary>,
     recurrence_costs: &HashMap<String, String>,
     issue_index: &HashMap<String, IssueRef>,
+    personas: &BTreeMap<String, PersonaCounts>,
 ) -> String {
     let signals =
         corrections.len() + errors.len() + workarounds.len() + deferrals.len() + patterns.len();
@@ -383,7 +466,8 @@ pub fn render_digest(
                 &signal_title(&Signal::Correction(c.clone())),
             );
             buf.push_str(&format!(
-                "- `{}` — {}{}\n",
+                "- {}`{}` — {}{}\n",
+                dims_prefix(&c.persona, &c.channel),
                 c.session_id,
                 python_repr(&c.context),
                 annotation
@@ -405,8 +489,12 @@ pub fn render_digest(
                 &signal_title(&Signal::Error(e.clone())),
             );
             buf.push_str(&format!(
-                "- `{}` / `{}`: {}{}\n",
-                e.session_id, e.tool_name, msg, annotation
+                "- {}`{}` / `{}`: {}{}\n",
+                dims_prefix(&e.persona, &e.channel),
+                e.session_id,
+                e.tool_name,
+                msg,
+                annotation
             ));
         }
         buf.push('\n');
@@ -424,7 +512,8 @@ pub fn render_digest(
                 &signal_title(&Signal::Workaround(w.clone())),
             );
             buf.push_str(&format!(
-                "- `{}` pattern=`{}`: {}{}\n",
+                "- {}`{}` pattern=`{}`: {}{}\n",
+                dims_prefix(&w.persona, &w.channel),
                 w.session_id,
                 w.pattern,
                 python_repr(&w.context),
@@ -440,7 +529,12 @@ pub fn render_digest(
         buf.push_str("_No deferrals detected._\n\n");
     } else {
         for d in deferrals {
-            buf.push_str(&format!("- `{}` pattern=`{}`\n", d.session_id, d.item));
+            buf.push_str(&format!(
+                "- {}`{}` pattern=`{}`\n",
+                dims_prefix(&d.persona, &d.channel),
+                d.session_id,
+                d.item
+            ));
         }
         buf.push('\n');
     }
@@ -457,9 +551,39 @@ pub fn render_digest(
                 &signal_title(&Signal::Pattern(p.clone())),
             );
             buf.push_str(&format!(
-                "- `{}` kind=`{}`: {}{}\n",
-                p.session_id, p.pattern_kind, p.evidence, annotation
+                "- {}`{}` kind=`{}`: {}{}\n",
+                dims_prefix(&p.persona, &p.channel),
+                p.session_id,
+                p.pattern_kind,
+                p.evidence,
+                annotation
             ));
+        }
+        buf.push('\n');
+    }
+
+    // Personas — rendered only when fleet sessions (persona-carrying
+    // handles) were scanned. Coding-only digests are unchanged.
+    if !personas.is_empty() {
+        buf.push_str("## Personas\n\n");
+        for (key, counts) in personas {
+            if counts.signal_total() == 0 {
+                buf.push_str(&format!(
+                    "- `{}`: no signals ({} session(s))\n",
+                    key, counts.sessions
+                ));
+            } else {
+                buf.push_str(&format!(
+                    "- `{}`: {} corrections, {} errors, {} workarounds, {} deferrals, {} patterns ({} session(s))\n",
+                    key,
+                    counts.corrections,
+                    counts.errors,
+                    counts.workarounds,
+                    counts.deferrals,
+                    counts.patterns,
+                    counts.sessions
+                ));
+            }
         }
         buf.push('\n');
     }
@@ -524,12 +648,13 @@ pub fn write_digest(
     recurrence_costs: &HashMap<String, String>,
     digest_dir: &Path,
     issue_index: &HashMap<String, IssueRef>,
+    personas: &BTreeMap<String, PersonaCounts>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = digest_dir.join(format!("learning-digest-{}.md", date));
     let body = render_digest(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
-        spend, recurrence_costs, issue_index,
+        spend, recurrence_costs, issue_index, personas,
     );
     std::fs::write(&path, body)?;
     Ok(path)
@@ -543,6 +668,16 @@ pub fn write_digest(
 ///
 /// Returns an empty string if `signal_key` is not in `issue_index` (so the
 /// bullet is byte-identical to the pre-annotation format for that line).
+/// Fleet-dimension bullet prefix: `` `persona@channel` `` (with trailing
+/// space) when the signal carries a persona, empty otherwise — so
+/// coding-session lines stay byte-identical to the pre-dims format.
+fn dims_prefix(persona: &Option<String>, channel: &Option<String>) -> String {
+    match persona_key(persona, channel) {
+        Some(key) => format!("`{}` ", key),
+        None => String::new(),
+    }
+}
+
 fn issue_annotation(issue_index: &HashMap<String, IssueRef>, signal_key: &str) -> String {
     match issue_index.get(signal_key) {
         Some(issue) => {
@@ -682,8 +817,8 @@ mod tests {
 
     #[test]
     fn digest_frontmatter_has_counts() {
-        let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into(), ..Default::default() }];
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
@@ -694,7 +829,7 @@ mod tests {
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
@@ -711,7 +846,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &p0, None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &p0, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -721,8 +856,9 @@ mod tests {
         let corrections = vec![Correction {
             session_id: "abc".into(),
             context: "don't do that".into(),
+            ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -733,8 +869,9 @@ mod tests {
             session_id: "s1".into(),
             tool_name: "bash".into(),
             message: "x".repeat(600),
+            ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("[truncated]"));
     }
 
@@ -745,8 +882,9 @@ mod tests {
             description: "compaction storm: 4 compactions within 10 minutes".into(),
             pattern_kind: "compaction_storm".into(),
             evidence: "4 compactions 09:01-09:08".into(),
+            ..Default::default()
         }];
-        let body = render_digest("2026-07-05", &[], &[], &[], &[], &patterns, &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &patterns, &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("patterns: 1"));
         assert!(body.contains("## Patterns"));
@@ -760,6 +898,7 @@ mod tests {
             description: "stuck loop: `bash` called 5 times with identical arguments".into(),
             pattern_kind: "stuck_loop".into(),
             evidence: "`bash` x5 identical arguments 09:00-09:04".into(),
+            ..Default::default()
         };
         let signal = Signal::Pattern(pattern.clone());
         let issue_ref = IssueRef {
@@ -771,7 +910,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-07-05", &[], &[], &[], &[], &[pattern], &HashMap::new(), None, &HashMap::new(), &index);
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &[pattern], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new());
         assert!(body.contains("(→ kata#9)"), "annotation missing in:\n{}", body);
     }
 
@@ -780,8 +919,9 @@ mod tests {
         let deferrals = vec![DeferralSignal {
             session_id: "s1".into(),
             item: "next session".into(),
+            ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("- `s1` pattern=`next session`"));
     }
@@ -789,7 +929,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &dir, &no_issues()).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -889,7 +1029,7 @@ mod tests {
         };
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            Some(&spend), &HashMap::new(), &no_issues(),
+            Some(&spend), &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(body.contains("## Spend"));
         assert!(body.contains("- **Total**: $4.20 across 2 of 3 session(s) with usage data"));
@@ -905,7 +1045,7 @@ mod tests {
     fn digest_spend_section_absent_without_stats() {
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            None, &HashMap::new(), &no_issues(),
+            None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(!body.contains("## Spend"), "no stats → no Spend section:\n{}", body);
     }
@@ -922,7 +1062,7 @@ mod tests {
         };
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            Some(&spend), &HashMap::new(), &no_issues(),
+            Some(&spend), &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(body.contains("- **Total**: no cost data (2 session(s) with usage; unpriced models)"));
         assert!(!body.contains("### Spend by role"), "no costs → no role table");
@@ -947,6 +1087,8 @@ mod tests {
         session_id: String,
         messages: Vec<Message>,
         stats: Option<SessionStats>,
+        persona: Option<String>,
+        channel: Option<String>,
     }
 
     impl Reader for FixtureReader {
@@ -959,6 +1101,8 @@ mod tests {
                 path: PathBuf::from("/nonexistent/fixture.jsonl"),
                 modified: Utc::now(),
                 reader_name: "fixture".to_string(),
+                persona: self.persona.clone(),
+                channel: self.channel.clone(),
             }])
         }
         fn load(&self, _handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
@@ -1017,6 +1161,7 @@ mod tests {
         let correction = Correction {
             session_id: "sess-r_explore".into(),
             context: context.into(),
+            ..Default::default()
         };
         let already_open = signal_title(&Signal::Correction(correction));
 
@@ -1030,6 +1175,8 @@ mod tests {
                 role: Some("explore".into()),
                 model_costs: BTreeMap::new(),
             }),
+            persona: None,
+            channel: None,
         })];
         let tracker = OpenTitlesTracker { titles: vec![already_open] };
         let args = ReviewArgs {
@@ -1056,6 +1203,128 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // Fleet dimensions (persona/channel) — stamping, rollup, digest section
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_review_stamps_dims_and_renders_personas_section() {
+        let dir = test_dir("personas");
+        // Fleet session with a chat correction (corrective marker present).
+        let jibot = FixtureReader {
+            session_id: "sess-jibot".into(),
+            messages: correction_messages("no, use the gog cli for calendar"),
+            stats: None,
+            persona: Some("jibot".into()),
+            channel: Some("vibez".into()),
+        };
+        // Fleet session with no signals at all.
+        let bifbot = FixtureReader {
+            session_id: "sess-bifbot".into(),
+            messages: vec![Message {
+                role: Some("assistant".into()),
+                content: Some(serde_json::Value::String("All systems nominal.".into())),
+                name: None,
+            }],
+            stats: None,
+            persona: Some("bifbot".into()),
+            channel: Some("BIF Event Director Group".into()),
+        };
+        // Coding session — must stay dimension-free.
+        let coding = FixtureReader {
+            session_id: "sess-coding".into(),
+            messages: correction_messages("no, use the gog cli for calendar"),
+            stats: None,
+            persona: None,
+            channel: None,
+        };
+        let readers: Vec<Box<dyn Reader>> =
+            vec![Box::new(jibot), Box::new(bifbot), Box::new(coding)];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+
+        // Signals stamped with dims on the fleet session, None on coding.
+        assert_eq!(report.corrections.len(), 2);
+        let fleet = report.corrections.iter().find(|c| c.session_id == "sess-jibot").unwrap();
+        assert_eq!(fleet.persona.as_deref(), Some("jibot"));
+        assert_eq!(fleet.channel.as_deref(), Some("vibez"));
+        let code = report.corrections.iter().find(|c| c.session_id == "sess-coding").unwrap();
+        assert_eq!(code.persona, None);
+
+        // Rollup counts sessions even when a persona produced no signals.
+        assert_eq!(report.personas.len(), 2);
+        let jb = &report.personas["jibot@vibez"];
+        assert_eq!((jb.sessions, jb.corrections), (1, 1));
+        let bif = &report.personas["bifbot@BIF Event Director Group"];
+        assert_eq!((bif.sessions, bif.corrections), (1, 0));
+
+        let body = fs::read_to_string(&report.digest_path).unwrap();
+        assert!(body.contains("## Personas"), "personas section missing:\n{}", body);
+        assert!(
+            body.contains("- `jibot@vibez`: 1 corrections, 0 errors, 0 workarounds, 0 deferrals, 0 patterns (1 session(s))"),
+            "jibot rollup line missing:\n{}", body
+        );
+        assert!(
+            body.contains("- `bifbot@BIF Event Director Group`: no signals (1 session(s))"),
+            "zero-signal persona line missing:\n{}", body
+        );
+        // Fleet bullet carries the dims prefix; coding bullet is unchanged.
+        assert!(
+            body.contains("- `jibot@vibez` `sess-jibot` — "),
+            "fleet bullet prefix missing:\n{}", body
+        );
+        assert!(
+            body.contains("- `sess-coding` — "),
+            "coding bullet must stay prefix-free:\n{}", body
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_chat_sessions_use_chat_correction_detector() {
+        let dir = test_dir("chat-detector");
+        // Short polite reply: correction under the coding heuristic, NOT
+        // under the chat-tuned one.
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+            session_id: "sess-chat".into(),
+            messages: correction_messages("thanks, that looks really great"),
+            stats: None,
+            persona: Some("jibot".into()),
+            channel: Some("vibez".into()),
+        })];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            dry_run: true,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert!(
+            report.corrections.is_empty(),
+            "chat sessions must use the chat-tuned correction detector"
+        );
+        assert_eq!(report.personas["jibot@vibez"].sessions, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_personas_section_absent_for_coding_only_runs() {
+        let body = render_digest(
+            "2026-07-13", &[], &[], &[], &[], &[], &HashMap::new(),
+            None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
+        );
+        assert!(!body.contains("## Personas"), "no fleet sessions → no Personas section");
+    }
+
     #[test]
     fn run_review_no_recurrence_annotation_for_new_signals() {
         let dir = test_dir("recurrence-none");
@@ -1069,6 +1338,8 @@ mod tests {
                 role: None,
                 model_costs: BTreeMap::new(),
             }),
+            persona: None,
+            channel: None,
         })];
         // Tracker knows about some OTHER title only.
         let tracker = OpenTitlesTracker { titles: vec!["[jilog/error] other: thing".into()] };
@@ -1097,6 +1368,7 @@ mod tests {
         let correction = Correction {
             session_id: "0e91a2b4".into(),
             context: "no, use the gog cli for calendar".into(),
+            ..Default::default()
         };
         let signal = Signal::Correction(correction.clone());
         let issue_ref = IssueRef {
@@ -1108,7 +1380,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index);
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new());
         // Annotation must appear at end of bullet line, before newline.
         assert!(
             body.contains("(→ kata#7)"),
@@ -1123,8 +1395,9 @@ mod tests {
         let correction = Correction {
             session_id: "abc".into(),
             context: "fix it".into(),
+            ..Default::default()
         };
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues());
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         // Line must end with content then newline — no trailing annotation.
         assert!(!body.contains("(→"), "unexpected annotation in:\n{}", body);
     }
@@ -1133,8 +1406,8 @@ mod tests {
     fn digest_annotation_byte_stable_for_unaffected_lines() {
         // A correction WITH an annotation and one WITHOUT — unaffected line
         // must be byte-identical to the no-annotation render.
-        let c_annotated = Correction { session_id: "ann".into(), context: "do this".into() };
-        let c_plain = Correction { session_id: "pla".into(), context: "plain line".into() };
+        let c_annotated = Correction { session_id: "ann".into(), context: "do this".into(), ..Default::default() };
+        let c_plain = Correction { session_id: "pla".into(), context: "plain line".into(), ..Default::default() };
 
         let signal_annotated = Signal::Correction(c_annotated.clone());
         let issue_ref = IssueRef {
@@ -1149,12 +1422,12 @@ mod tests {
         let body_with = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index,
+            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new(),
         );
         let body_without = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(),
+            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
 
         // The plain line must be identical in both renders.

@@ -49,6 +49,7 @@ mod tests {
         let signal = Signal::Correction(Correction {
             session_id: "sess-1".into(),
             context: "please fix this".into(),
+            ..Default::default()
         });
         let issue = tracker.create(&signal).unwrap();
         assert_eq!(issue.backend, "none");

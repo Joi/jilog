@@ -116,6 +116,8 @@ impl Reader for AmplifierReader {
                     path: entry,
                     modified,
                     reader_name: self.name().to_string(),
+                    persona: None,
+                    channel: None,
                 });
             }
         }

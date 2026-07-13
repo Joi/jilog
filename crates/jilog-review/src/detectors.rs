@@ -84,6 +84,27 @@ const SUB_AGENT_PREFIX: &str = "0000000000000000";
 /// Threshold for the P0 alert: distinct root sessions per tool.
 const P0_DISTINCT_SESSION_THRESHOLD: usize = 3;
 
+/// Corrective-marker regexes for the chat-tuned correction detector.
+///
+/// In a group chat, a short user message after an assistant turn is usually
+/// just conversation (often not even addressed to the bot), so the coding
+/// heuristic's length window alone would flag most of the channel. Chat
+/// sessions additionally require explicit corrective language.
+const CHAT_CORRECTION_PATTERNS: &[&str] = &[
+    r"(?i)^no[,.! ]",
+    r"(?i)\bdon'?t\b",
+    r"(?i)\bdo not\b",
+    r"(?i)\bstop\b",
+    r"(?i)\bwrong\b",
+    r"(?i)\bincorrect\b",
+    r"(?i)\bnot (that|what|like that|right|the right)\b",
+    r"(?i)\bshould(n'?t| not| never)\b",
+    r"(?i)\bnever\b",
+    r"(?i)\binstead\b",
+    r"(?i)\bactually[, ]",
+    r"(?i)\bthat'?s not\b",
+];
+
 // ---------------------------------------------------------------------------
 // Heuristic 1: Correction detection
 // ---------------------------------------------------------------------------
@@ -91,6 +112,18 @@ const P0_DISTINCT_SESSION_THRESHOLD: usize = 3;
 /// Detect "correction" patterns: an assistant→user→assistant triple
 /// where the user message is short (15..=200 chars).
 pub fn detect_corrections(messages: &[Message], session_id: &str) -> Vec<Correction> {
+    detect_corrections_impl(messages, session_id, false)
+}
+
+/// Chat-tuned variant of [`detect_corrections`] for fleet/chat sessions
+/// (transcript handles with a persona): same triple + length window, but the
+/// user message must also match a corrective-language pattern
+/// ([`CHAT_CORRECTION_PATTERNS`]).
+pub fn detect_corrections_chat(messages: &[Message], session_id: &str) -> Vec<Correction> {
+    detect_corrections_impl(messages, session_id, true)
+}
+
+fn detect_corrections_impl(messages: &[Message], session_id: &str, chat: bool) -> Vec<Correction> {
     if messages.len() < 3 {
         return Vec::new();
     }
@@ -126,13 +159,25 @@ pub fn detect_corrections(messages: &[Message], session_id: &str) -> Vec<Correct
         if content_str.trim().len() < MIN_CORRECTION_LENGTH {
             continue;
         }
+        if chat && !chat_correction_regex().is_match(&content_str) {
+            continue;
+        }
 
         out.push(Correction {
             session_id: session_id.to_string(),
             context: content_str,
+            ..Default::default()
         });
     }
     out
+}
+
+/// Compile the chat corrective-marker regex set once.
+fn chat_correction_regex() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        RegexSet::new(CHAT_CORRECTION_PATTERNS).expect("chat correction patterns must compile")
+    })
 }
 
 /// Mirror of Python's `str(value)` coercion for the corrections heuristic.
@@ -191,6 +236,7 @@ pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal>
             session_id: session_id.to_string(),
             tool_name,
             message,
+            ..Default::default()
         });
     }
     out
@@ -267,6 +313,7 @@ pub fn detect_workarounds(messages: &[Message], session_id: &str) -> Vec<Workaro
             session_id: session_id.to_string(),
             pattern: label.to_string(),
             context: crate::util::truncate_chars(&text, 200),
+            ..Default::default()
         });
     }
     out
@@ -333,6 +380,7 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
         out.push(DeferralSignal {
             session_id: session_id.to_string(),
             item: label.to_string(),
+            ..Default::default()
         });
     }
     out
@@ -543,6 +591,53 @@ mod tests {
         assert_eq!(out.len(), 2, "only the two real user turns are corrections");
         assert_eq!(out[0].context, "read the deck and make sure the edits land");
         assert_eq!(out[1].context, "yes - clean it up please");
+    }
+
+    // ---------- chat-tuned corrections ----------
+
+    #[test]
+    fn chat_corrections_require_corrective_language() {
+        // Ordinary short group-chat replies must NOT count as corrections in
+        // chat sessions, even though they'd pass the coding length window.
+        let msgs = vec![
+            assistant("Here is the summary you asked for."),
+            user("thanks, that looks really great"),
+            assistant("Happy to help."),
+        ];
+        assert!(detect_corrections_chat(&msgs, "s1").is_empty());
+        // The same window IS a correction under the coding heuristic.
+        assert_eq!(detect_corrections(&msgs, "s1").len(), 1);
+    }
+
+    #[test]
+    fn chat_corrections_detect_corrective_markers() {
+        let cases = [
+            "no jibot, don't answer in that channel",
+            "stop replying to every message",
+            "that's not what the group decided",
+            "wrong group — that was for the steering committee",
+            "you should never post invoices here",
+        ];
+        for text in cases {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            let out = detect_corrections_chat(&msgs, "s1");
+            assert_eq!(out.len(), 1, "expected chat correction for: {text}");
+            assert_eq!(out[0].context, text);
+        }
+    }
+
+    #[test]
+    fn chat_corrections_keep_length_window_and_tool_result_filter() {
+        // Too short even with a marker.
+        let msgs = vec![assistant("a"), user("no, stop"), assistant("b")];
+        assert!(detect_corrections_chat(&msgs, "s1").is_empty());
+        // Tool echoes stay excluded.
+        let msgs = vec![
+            assistant("a"),
+            tool_result_user("<tool_use_error>don't do that, wrong file</tool_use_error>", true),
+            assistant("b"),
+        ];
+        assert!(detect_corrections_chat(&msgs, "s1").is_empty());
     }
 
     // ---------- errors ----------
@@ -765,9 +860,9 @@ mod tests {
     #[test]
     fn p0_alerts_threshold_three_distinct() {
         let errors = vec![
-            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "x".into() },
-            ErrorSignal { session_id: "b".into(), tool_name: "bash".into(), message: "y".into() },
-            ErrorSignal { session_id: "c".into(), tool_name: "bash".into(), message: "z".into() },
+            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "x".into(), ..Default::default() },
+            ErrorSignal { session_id: "b".into(), tool_name: "bash".into(), message: "y".into(), ..Default::default() },
+            ErrorSignal { session_id: "c".into(), tool_name: "bash".into(), message: "z".into(), ..Default::default() },
         ];
         let p0 = detect_p0_alerts(&errors);
         assert_eq!(p0.len(), 1);
@@ -777,8 +872,8 @@ mod tests {
     #[test]
     fn p0_alerts_two_distinct_skipped() {
         let errors = vec![
-            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "x".into() },
-            ErrorSignal { session_id: "b".into(), tool_name: "bash".into(), message: "y".into() },
+            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "x".into(), ..Default::default() },
+            ErrorSignal { session_id: "b".into(), tool_name: "bash".into(), message: "y".into(), ..Default::default() },
         ];
         assert!(detect_p0_alerts(&errors).is_empty());
     }
@@ -786,9 +881,9 @@ mod tests {
     #[test]
     fn p0_alerts_same_session_repeated_doesnt_count_twice() {
         let errors = vec![
-            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "1".into() },
-            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "2".into() },
-            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "3".into() },
+            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "1".into(), ..Default::default() },
+            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "2".into(), ..Default::default() },
+            ErrorSignal { session_id: "a".into(), tool_name: "bash".into(), message: "3".into(), ..Default::default() },
         ];
         // Only 1 distinct session → below threshold
         assert!(detect_p0_alerts(&errors).is_empty());
@@ -797,9 +892,9 @@ mod tests {
     #[test]
     fn p0_alerts_subagent_sessions_excluded() {
         let errors = vec![
-            ErrorSignal { session_id: "00000000000000001".into(), tool_name: "bash".into(), message: "x".into() },
-            ErrorSignal { session_id: "00000000000000002".into(), tool_name: "bash".into(), message: "y".into() },
-            ErrorSignal { session_id: "00000000000000003".into(), tool_name: "bash".into(), message: "z".into() },
+            ErrorSignal { session_id: "00000000000000001".into(), tool_name: "bash".into(), message: "x".into(), ..Default::default() },
+            ErrorSignal { session_id: "00000000000000002".into(), tool_name: "bash".into(), message: "y".into(), ..Default::default() },
+            ErrorSignal { session_id: "00000000000000003".into(), tool_name: "bash".into(), message: "z".into(), ..Default::default() },
         ];
         assert!(
             detect_p0_alerts(&errors).is_empty(),

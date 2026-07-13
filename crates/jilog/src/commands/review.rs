@@ -204,6 +204,20 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         }),
     };
 
+    // Fleet persona rollup: `persona@channel` → sessions + per-kind signal
+    // counts. Empty object when only coding sessions were scanned, so
+    // existing consumers see one new stable key and nothing else changes.
+    let personas = report
+        .personas
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+
     serde_json::json!({
         "schema_version": 1,
         "sessions_scanned": report.sessions_scanned,
@@ -213,6 +227,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         "deferrals": report.deferrals.len(),
         "patterns": report.patterns.len(),
         "p0_alerts": serde_json::Value::Object(p0_alerts),
+        "personas": serde_json::Value::Object(personas),
         "spend": spend,
         "digest_path": digest_path,
         "created_issues": serde_json::Value::Array(created_issues),
@@ -268,6 +283,7 @@ mod tests {
             patterns: Vec::new(),
             p0_alerts,
             spend: None,
+            personas: std::collections::BTreeMap::new(),
             digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
             created_issues: vec![IssueRef {
                 id: "#42".to_string(),
@@ -337,11 +353,13 @@ mod tests {
                 "deferrals",
                 "patterns",
                 "p0_alerts",
+                "personas",
                 "spend",
                 "digest_path",
                 "created_issues",
             ])
         );
+        assert_eq!(parsed["personas"], serde_json::json!({}));
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["sessions_scanned"], 3);
         assert_eq!(

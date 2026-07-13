@@ -105,6 +105,14 @@ pub struct TranscriptHandle {
     pub modified: DateTime<Utc>,
     /// The reader that produced this handle (e.g. "amplifier", "claude-code").
     pub reader_name: String,
+    /// Which bot produced this session (e.g. "jibot", "bifbot"). None for
+    /// coding-harness sessions. When set, the session is treated as a chat
+    /// conversation: signals are stamped with persona/channel and the
+    /// chat-tuned correction detector is used.
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (e.g. a WhatsApp group name).
+    /// None when unknown or not applicable.
+    pub channel: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

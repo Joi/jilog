@@ -431,6 +431,7 @@ mod tests {
         let signal = Signal::Correction(Correction {
             session_id: "test".into(),
             context: "some correction context here".into(),
+            ..Default::default()
         });
 
         match tracker.list_open() {
@@ -513,10 +514,12 @@ mod tests {
             session_id: "s".into(),
             tool_name: "bash".into(),
             message: "exit 1".into(),
+            ..Default::default()
         });
         let correction = Signal::Correction(Correction {
             session_id: "s".into(),
             context: "stop that".into(),
+            ..Default::default()
         });
         let pattern = Signal::Pattern(PatternSignal {
             session_id: "s".into(),
@@ -527,10 +530,12 @@ mod tests {
             session_id: "s".into(),
             pattern: "for now".into(),
             context: "this is a hack".into(),
+            ..Default::default()
         });
         let deferral = Signal::Deferral(DeferralSignal {
             session_id: "s".into(),
             item: "do this later".into(),
+            ..Default::default()
         });
 
         assert_eq!(signal_priority(&error), 1, "Error must be priority 1");
@@ -549,6 +554,7 @@ mod tests {
         let signal = Signal::Correction(Correction {
             session_id: "sess-abc".into(),
             context: "no, use the gog cli for calendar".into(),
+            ..Default::default()
         });
         let body = build_body(&signal, "2026-05-11");
         assert!(body.contains("2026-05-11"), "body must contain date");
@@ -566,6 +572,7 @@ mod tests {
             session_id: "sess-def".into(),
             tool_name: "bash".into(),
             message: "command not found: fzf".into(),
+            ..Default::default()
         });
         let body = build_body(&signal, "2026-05-11");
         assert!(body.contains("Tool: bash"), "body must have 'Tool: bash'");
@@ -579,6 +586,7 @@ mod tests {
             session_id: "sess-ghi".into(),
             pattern: "for now".into(),
             context: "temporarily using osascript".into(),
+            ..Default::default()
         });
         let body = build_body(&signal, "2026-05-11");
         assert!(body.contains("Pattern: for now"), "body must have 'Pattern: for now'");
@@ -603,6 +611,7 @@ mod tests {
         let signal = Signal::Deferral(DeferralSignal {
             session_id: "sess-mno".into(),
             item: "set up the CI pipeline".into(),
+            ..Default::default()
         });
         let body = build_body(&signal, "2026-05-11");
         assert!(body.contains("set up the CI pipeline"), "body must have item");

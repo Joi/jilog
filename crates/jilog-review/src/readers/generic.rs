@@ -95,6 +95,8 @@ impl Reader for GenericReader {
                 path: entry,
                 modified,
                 reader_name: self.name.clone(),
+                persona: None,
+                channel: None,
             });
         }
 

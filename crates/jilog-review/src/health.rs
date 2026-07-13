@@ -85,6 +85,7 @@ pub fn detect_compaction_storm(
         ),
         pattern_kind: "compaction_storm".to_string(),
         evidence: format!("{} compactions {}", count, format_range(start, end)),
+        ..Default::default()
     })
 }
 
@@ -106,6 +107,7 @@ pub fn detect_resume_storm(events: &[SessionEvent], session_id: &str) -> Option<
         ),
         pattern_kind: "resume_storm".to_string(),
         evidence: format!("{} resumes {}", count, format_range(start, end)),
+        ..Default::default()
     })
 }
 
@@ -191,6 +193,7 @@ pub fn detect_stuck_loops(events: &[SessionEvent], session_id: &str) -> Vec<Patt
                     run_len,
                     format_range(calls[run_start].timestamp, calls[i - 1].timestamp)
                 ),
+                ..Default::default()
             });
         }
         run_start = i;
@@ -258,6 +261,7 @@ pub fn detect_iteration_runaway(
             count,
             format_range(start, end)
         ),
+        ..Default::default()
     })
 }
 

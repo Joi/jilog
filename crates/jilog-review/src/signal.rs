@@ -40,29 +40,49 @@ impl Signal {
 
 /// An assistant→user→assistant triple where the user message is short
 /// (15..=200 chars), suggesting a correction.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Correction {
     pub session_id: String,
     /// The short user message following an assistant turn.
     pub context: String,
+    /// Which bot ran the session (fleet sessions only; see
+    /// [`crate::reader::TranscriptHandle::persona`]). Stamped by
+    /// [`crate::digest::run_review`], absent for coding sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// A `role: tool` message with `success: false` in its JSON content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorSignal {
     pub session_id: String,
     pub tool_name: String,
     pub message: String,
+    /// Which bot ran the session (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// Assistant text matching a workaround language pattern.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Workaround {
     pub session_id: String,
     /// Human-readable pattern label (e.g. "for now", "TODO", "hack").
     pub pattern: String,
     /// First 200 chars of the matching assistant text.
     pub context: String,
+    /// Which bot ran the session (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// A detected session-health pattern (compaction storm, stuck loop, resume
@@ -82,11 +102,23 @@ pub struct PatternSignal {
     /// Compact factual backing, e.g. "4 compactions 09:01-09:08".
     #[serde(default)]
     pub evidence: String,
+    /// Which bot ran the session (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// Assistant text postponing work to a later session.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeferralSignal {
     pub session_id: String,
     pub item: String,
+    /// Which bot ran the session (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    /// Which group/surface the session serves (fleet sessions only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
