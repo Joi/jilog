@@ -24,7 +24,7 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
-**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them (a NanoClaw reader is planned). `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
+**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them — including NanoClaw cell bots, whose signals carry persona + channel dimensions. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
 
 ### Why not LangSmith / Langfuse?
 
@@ -81,6 +81,14 @@ path = "~/.amplifier/projects"
 type = "pi"
 path = "~/.pi/agent/sessions"
 
+# Fleet chat bots (NanoClaw cells): persona + channel dimensions, health
+# patterns, and a per-cell trust-tier allowlist (exclude wins; a non-empty
+# include admits only matching agents — matched on agent id/persona/folder)
+[[reader]]
+type = "nanoclaw"
+path = "~/nanoclaw/data"
+exclude = ["bifbot"]
+
 # A tracker turns recurring signals into issues (kata, github, none)
 [tracker]
 type = "github"
@@ -117,7 +125,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
 | `pi` | `~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl` ([pi.dev](https://pi.dev) coding agent, session format v3; user + assistant + toolResult messages, per-call usage/cost → spend section) | ✅ | ✅ built-in |
 | `generic` | Any JSONL matching the jilog signal schema | — | ✅ built-in |
-| `nanoclaw` | SSH into NanoClaw host, scan session logs | — | 🔜 planned |
+| `nanoclaw` | `<data>/v2-sessions/<agent-id>/.claude-shared/projects/**/*.jsonl` (NanoClaw cell agent sessions — Claude Code format plus queue-operation entries; persona + channel mapped from the cell's `v2.db`, trust-tier `include`/`exclude` allowlist; run on-cell or against a read-only mirror) | ✅ | ✅ built-in |
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
 
@@ -175,9 +183,15 @@ Six signal types are detected today.
 
 Each emitted signal carries the `session_id` it came from, so digest and tracker entries always link back to the conversation that produced them.
 
+### Persona and channel dimensions (fleet sessions)
+
+Readers for chat-bot fleets (nanoclaw) stamp each handle with a **persona** (which bot: `jibot`, `bifbot`, …) and a **channel** (which group/surface). Every signal from those sessions carries both, digest bullets are prefixed `` `persona@channel` ``, and a **Personas** section rolls up per-bot counts — including bots that produced *no* signals, so the digest can say one bot needed four corrections this week and another needed none. `review nightly --json` exposes the same rollup under a `personas` key. Coding-session output is unchanged.
+
+Chat sessions also swap the correction heuristic: in a group chat, a short user message after an assistant turn is usually just conversation, so the chat-tuned detector additionally requires corrective language (`no, …`, `don't`, `stop`, `wrong`, `should never`, …).
+
 ### Health-pattern detectors
 
-`Pattern` signals come from four pure-Rust detectors over the kernel-ish event stream of readers that implement `load_events` (amplifier, context-intelligence). Thresholds follow the amplifier context-intelligence signals-reference, tuned conservatively; the constants live in `crates/jilog-review/src/health.rs`.
+`Pattern` signals come from four pure-Rust detectors over the kernel-ish event stream of readers that implement `load_events` (amplifier, context-intelligence, pi, nanoclaw). Thresholds follow the amplifier context-intelligence signals-reference, tuned conservatively; the constants live in `crates/jilog-review/src/health.rs`.
 
 | `pattern_kind`      | Fires when                                                        |
 |---------------------|-------------------------------------------------------------------|

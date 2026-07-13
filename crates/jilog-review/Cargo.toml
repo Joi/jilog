@@ -16,6 +16,7 @@ regex = { workspace = true }
 glob = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

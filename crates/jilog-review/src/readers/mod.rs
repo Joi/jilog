@@ -6,6 +6,7 @@ pub mod codex;
 pub mod context_intelligence;
 pub mod copilot;
 pub mod generic;
+pub mod nanoclaw;
 pub mod pi;
 
 pub use amplifier::AmplifierReader;
@@ -14,4 +15,5 @@ pub use codex::CodexReader;
 pub use context_intelligence::ContextIntelligenceReader;
 pub use copilot::CopilotReader;
 pub use generic::{GenericReader, SessionIdSource};
+pub use nanoclaw::NanoclawReader;
 pub use pi::PiReader;

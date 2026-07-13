@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, PiReader, SessionIdSource},
+    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource},
     trackers::{GithubTracker, KataTracker, NoneTracker},
     util::expand_tilde,
 };
@@ -52,6 +52,22 @@ pub enum ReaderConfig {
     Copilot {
         #[serde(default)]
         path: Option<String>,
+    },
+    /// NanoClaw cell agent sessions
+    /// (`<path>/v2-sessions/<agent-id>/.claude-shared/projects/**/*.jsonl`,
+    /// persona/channel mapped via `<path>/v2.db`). `include`/`exclude` are
+    /// the per-cell trust-tier allowlist, matched against agent id, persona,
+    /// and folder; exclude wins.
+    Nanoclaw {
+        #[serde(default)]
+        path: Option<String>,
+        /// Routing db override; defaults to `<path>/v2.db`.
+        #[serde(default)]
+        db: Option<String>,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
     },
     /// pi coding agent (pi.dev) session files
     /// (`~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl`).
@@ -189,6 +205,18 @@ impl JilogConfig {
                             .unwrap_or_else(|| expand_tilde("~/.copilot/session-state"));
                         Box::new(CopilotReader::new(dir))
                     }
+                    ReaderConfig::Nanoclaw { path, db, include, exclude } => {
+                        let dir = path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(|| expand_tilde("~/nanoclaw/data"));
+                        let mut reader = NanoclawReader::new(dir)
+                            .with_allowlist(include.clone(), exclude.clone());
+                        if let Some(db) = db {
+                            reader = reader.with_db_path(expand_tilde(db));
+                        }
+                        Box::new(reader)
+                    }
                     ReaderConfig::Pi { path } => {
                         let dir = path
                             .as_deref()
@@ -262,6 +290,28 @@ mod tests {
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap();
         assert!(matches!(cfg.readers[0], ReaderConfig::Pi { path: None }));
         assert_eq!(cfg.into_readers()[0].name(), "pi");
+    }
+
+    #[test]
+    fn nanoclaw_reader_parses_allowlist() {
+        let cfg = JilogConfig::from_toml_str(
+            "[[reader]]\ntype = \"nanoclaw\"\npath = \"~/nanoclaw/data\"\ninclude = [\"jibot\", \"canary\"]\nexclude = [\"bifbot\", \"bif-2027-steering\"]\n",
+        )
+        .unwrap();
+        match &cfg.readers[0] {
+            ReaderConfig::Nanoclaw { include, exclude, db, .. } => {
+                assert_eq!(include, &["jibot", "canary"]);
+                assert_eq!(exclude, &["bifbot", "bif-2027-steering"]);
+                assert!(db.is_none());
+            }
+            other => panic!("expected nanoclaw reader, got {:?}", other),
+        }
+        assert_eq!(cfg.into_readers()[0].name(), "nanoclaw");
+
+        // Bare form: everything defaults.
+        let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"nanoclaw\"\n").unwrap();
+        assert!(matches!(cfg.readers[0], ReaderConfig::Nanoclaw { .. }));
+        assert_eq!(cfg.into_readers().len(), 1);
     }
 
     #[test]

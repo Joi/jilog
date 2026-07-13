@@ -520,6 +520,7 @@ dependencies = [
  "chrono",
  "glob",
  "regex",
+ "rusqlite",
  "rust_decimal",
  "serde",
  "serde_json",
