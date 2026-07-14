@@ -11,4 +11,19 @@ contract. The short version:
 - Close only verified work: `kata close <ref> --done --message "<scope + verification>" --commit <sha>`.
 - If work is incomplete, label `needs-review` and comment what remains rather than closing.
 - Never `kata delete` or `kata purge` without explicit user authorization.
+
+## kata work.* conventions (agent orchestration)
+
+When working a kata-tracked issue, keep its `work.*` metadata truthful
+(see docs/operations/agent-orchestration.md for the full recipe):
+
+- On claim/start: `kata meta set <ref> work.attention ok`; if the work has a
+  dedicated branch, stamp it once with `kata meta set <ref> work.branch <branch>`.
+- Signal live state: `kata meta set <ref> work.attention stuck|needs-human|ok`
+  plus a one-line `work.attention_msg` saying why. Raise `stuck` when you cannot
+  proceed, `needs-human` when you want review; clear back to `ok` when unblocked.
+- Never stop with the signal stale: close the issue, or leave the attention
+  pair reflecting the hand-off.
+- Coordinators read `work.*` on issues they delegated; only the working agent
+  writes them. `work.*` on closed issues is meaningless.
 <!-- END KATA -->
