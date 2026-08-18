@@ -1,4 +1,15 @@
 //! GenericReader — accepts a configured glob pattern + session-id strategy.
+//!
+//! Optional per-file header: if the FIRST line of a transcript is
+//! `{"_jilog": {"persona": "...", "channel": "..."}}`, the handle carries
+//! those dimensions (chat-tuned correction detector + Personas rollup),
+//! exactly like the nanoclaw reader stamps them from a cell's routing db.
+//! The header has no `role`, so `load()` skips it and older jilog versions
+//! ignore it. Exporters that write this format: cell-fleet
+//! `scripts/hermes-jilog-export.py` (Hermes profiles on jibotmac).
+
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -36,6 +47,37 @@ impl GenericReader {
             session_id_from,
         }
     }
+}
+
+/// Persona/channel from an optional `{"_jilog": {...}}` first line.
+/// Absent, unparseable, or non-header first lines yield `(None, None)`;
+/// this never fails discovery. Only the first line is read (bounded).
+pub fn read_header_dims(path: &Path) -> (Option<String>, Option<String>) {
+    const MAX_HEADER_BYTES: u64 = 64 * 1024;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, None),
+    };
+    let mut first = String::new();
+    if BufReader::new(file.take(MAX_HEADER_BYTES)).read_line(&mut first).is_err() {
+        return (None, None);
+    }
+    let v: serde_json::Value = match serde_json::from_str(first.trim()) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let meta = match v.get("_jilog") {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => return (None, None),
+    };
+    let field = |k: &str| {
+        meta.get(k)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (field("persona"), field("channel"))
 }
 
 impl Reader for GenericReader {
@@ -90,13 +132,15 @@ impl Reader for GenericReader {
                 continue;
             }
 
+            let (persona, channel) = read_header_dims(&entry);
+
             handles.push(TranscriptHandle {
                 session_id,
                 path: entry,
                 modified,
                 reader_name: self.name.clone(),
-                persona: None,
-                channel: None,
+                persona,
+                channel,
             });
         }
 
@@ -118,5 +162,76 @@ impl Reader for GenericReader {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("jilog-test-generic").join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn header_line_stamps_persona_and_channel_and_is_not_a_message() {
+        let dir = test_dir("header");
+        let f = dir.join("sess-1.2026-08-17.jsonl");
+        fs::write(
+            &f,
+            concat!(
+                "{\"_jilog\":{\"v\":1,\"source\":\"hermes\",\"persona\":\"hermes-line\",\"channel\":\"line\"}}\n",
+                "{\"role\":\"user\",\"content\":\"hi\",\"ts\":\"2026-08-17T00:00:01Z\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"hello\"}\n",
+            ),
+        )
+        .unwrap();
+        let reader = GenericReader::new(
+            "hermes",
+            format!("{}/*.jsonl", dir.display()),
+            SessionIdSource::FileStem,
+        );
+        let handles = reader.discover(Utc.timestamp_opt(0, 0).single().unwrap()).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].session_id, "sess-1.2026-08-17");
+        assert_eq!(handles[0].persona.as_deref(), Some("hermes-line"));
+        assert_eq!(handles[0].channel.as_deref(), Some("line"));
+        let msgs = reader.load(&handles[0]).unwrap();
+        assert_eq!(msgs.len(), 2, "header line must not be loaded as a message");
+        assert_eq!(msgs[0].role.as_deref(), Some("user"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_without_a_header_behave_as_before() {
+        let dir = test_dir("no-header");
+        fs::write(
+            dir.join("a.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hi\"}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
+        )
+        .unwrap();
+        // Garbage first line, empty file, header without dims: all (None, None).
+        fs::write(dir.join("b.jsonl"), "not json\n{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        fs::write(dir.join("c.jsonl"), "").unwrap();
+        fs::write(dir.join("d.jsonl"), "{\"_jilog\":{\"v\":1,\"persona\":\"  \"}}\n").unwrap();
+        let reader = GenericReader::new(
+            "byo",
+            format!("{}/*.jsonl", dir.display()),
+            SessionIdSource::FileStem,
+        );
+        let handles = reader.discover(Utc.timestamp_opt(0, 0).single().unwrap()).unwrap();
+        assert_eq!(handles.len(), 4);
+        for h in &handles {
+            assert!(h.persona.is_none(), "{}", h.session_id);
+            assert!(h.channel.is_none(), "{}", h.session_id);
+        }
+        assert_eq!(reader.load(&handles[0]).unwrap().len(), 2);
+        assert_eq!(reader.load(&handles[1]).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

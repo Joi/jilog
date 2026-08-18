@@ -331,7 +331,10 @@ impl JilogConfig {
                             GenericSessionIdSource::ParentDir => SessionIdSource::ParentDir,
                             GenericSessionIdSource::FileStem => SessionIdSource::FileStem,
                         };
-                        Box::new(GenericReader::new(name, path, source))
+                        // Glob pattern, but `~` still means the home dir
+                        // like every other reader's `path`.
+                        let pattern = expand_tilde(path).to_string_lossy().into_owned();
+                        Box::new(GenericReader::new(name, pattern, source))
                     }
                 }
             })
@@ -392,6 +395,30 @@ mod tests {
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap();
         assert!(matches!(cfg.readers[0], ReaderConfig::Pi { path: None }));
         assert_eq!(cfg.into_readers()[0].name(), "pi");
+    }
+
+    #[test]
+    fn generic_reader_expands_tilde_in_path() {
+        // The glob is resolved relative to the real $HOME (no env mutation:
+        // other tests run in parallel), in a per-process scratch dir.
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        let scratch = format!(".jilog-test-generic-{}", std::process::id());
+        let dir = std::path::Path::new(&home).join(&scratch);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s1.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "[[reader]]\ntype = \"generic\"\nname = \"hermes\"\npath = \"~/{}/*.jsonl\"\nsession_id_from = \"file_stem\"\n",
+            scratch
+        ))
+        .unwrap();
+        let readers = cfg.into_readers();
+        let handles = readers[0]
+            .discover({ use chrono::TimeZone; chrono::Utc.timestamp_opt(0, 0).single().unwrap() })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(handles.len(), 1, "~ must expand for the generic reader's glob");
+        assert_eq!(handles[0].session_id, "s1");
     }
 
     #[test]
