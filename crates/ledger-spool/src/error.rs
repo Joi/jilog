@@ -21,4 +21,15 @@ pub enum SpoolError {
         seq: u64,
         reason: String,
     },
+
+    #[error(
+        "invalid segment source {name:?}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$"
+    )]
+    InvalidSource { name: String },
+
+    #[error(
+        "spool filename {found:?} does not match segment identity {expected:?} \
+         (path-traversal / spoof guard)"
+    )]
+    IdentityMismatch { found: String, expected: String },
 }

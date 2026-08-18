@@ -117,6 +117,80 @@ pub enum TrackerConfig {
 pub struct ZoneConfig {
     pub id: String,
     pub ledger_path: String,
+    /// Whether this zone participates in spool replication (default
+    /// true). Set `spool = false` on read-only mirror zones — e.g. the
+    /// fleet store mounted as a `[[zone]]` on every machine — so
+    /// `spool emit` never re-emits an already-replicated store into an
+    /// orphan spool.
+    #[serde(default = "default_true")]
+    pub spool: bool,
+    /// Spool root for cross-machine replication (jilog#546w). Default:
+    /// a `spool/<zone-id>` sibling of `ledger_path` — inside the same
+    /// Syncthing-synced tree, so replication transport comes free.
+    #[serde(default)]
+    pub spool_path: Option<String>,
+    /// AUTHORITY ONLY: the fleet store `spool ingest` commits into. The
+    /// single host that sets this (jibotmac) is the fleet store's only
+    /// writer; every other machine leaves it unset and only emits.
+    #[serde(default)]
+    pub fleet_store_path: Option<String>,
+    /// Where this zone's SQLite index lives (jilog#546w round 2).
+    /// Default: `<ledger_path>/index.sqlite` for normal (spool = true)
+    /// zones — compatible with opsctl-maintained indexes — but
+    /// `~/.jilog/index/<zone-id>.sqlite` for `spool = false` mirror
+    /// zones, because their ledger directory is a SYNCED tree and a
+    /// SQLite file must never live inside one (a background sync of a
+    /// mid-transaction db ships corruption). Set this to override.
+    #[serde(default)]
+    pub index_path: Option<String>,
+}
+
+impl ZoneConfig {
+    /// Resolve the SQLite index location for this zone (see
+    /// `index_path` for the default rules).
+    pub fn index_db_path(&self) -> PathBuf {
+        if let Some(p) = &self.index_path {
+            return expand_tilde(p);
+        }
+        if self.spool {
+            expand_tilde(&self.ledger_path).join("index.sqlite")
+        } else {
+            expand_tilde(&format!("~/.jilog/index/{}.sqlite", self.id))
+        }
+    }
+}
+
+/// Serde default helper: `ZoneConfig::spool` defaults to true.
+fn default_true() -> bool {
+    true
+}
+
+/// Lexically normalize a path: drop `.` components and resolve `..`
+/// against the preceding component, WITHOUT touching the filesystem.
+/// Used by config validation, where the paths may not exist yet.
+/// (Symlinks are deliberately not resolved — lexical only.)
+fn normalize_lexical(p: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop the previous component; at the root (or with
+                // nothing left to pop) keep the `..` so the result
+                // stays an honest over-approximation.
+                let popped = matches!(
+                    out.components().next_back(),
+                    Some(Component::Normal(_))
+                ) && out.pop();
+                if !popped {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +213,34 @@ impl JilogConfig {
                 "tracker type \"beads\" was removed in jilog 0.2.0 (beads is deprecated); \
                  set [tracker] type to one of: \"kata\", \"github\", \"none\""
             );
+        }
+        // Invariant: an explicit index_path must never sit inside the
+        // zone's ledger tree. The ledger tree may be file-synced
+        // (Syncthing), and syncing a mid-transaction SQLite db ships
+        // corruption to every other machine. The check is LEXICAL on
+        // the tilde-expanded, `.`/`..`-normalized paths (no filesystem
+        // access at config-validation time); a symlink ancestor that
+        // re-enters the ledger tree is out of scope here — the runtime
+        // hazard note stands regardless. The spool=true DEFAULT index
+        // location is exempt for opsctl compatibility — it predates
+        // syncing.
+        for z in &cfg.zones {
+            if let Some(ip) = &z.index_path {
+                let idx = normalize_lexical(&expand_tilde(ip));
+                let ledger = normalize_lexical(&expand_tilde(&z.ledger_path));
+                if idx == ledger || idx.starts_with(&ledger) {
+                    anyhow::bail!(
+                        "zone {:?}: index_path {} is inside ledger_path {} — a SQLite \
+                         index must never live in the (possibly synced) ledger tree; \
+                         a background sync of a mid-transaction db ships corruption. \
+                         Point index_path at local disk, e.g. ~/.jilog/index/{}.sqlite",
+                        z.id,
+                        idx.display(),
+                        ledger.display(),
+                        z.id
+                    );
+                }
+            }
         }
         Ok(cfg)
     }
@@ -312,6 +414,91 @@ mod tests {
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"nanoclaw\"\n").unwrap();
         assert!(matches!(cfg.readers[0], ReaderConfig::Nanoclaw { .. }));
         assert_eq!(cfg.into_readers().len(), 1);
+    }
+
+    #[test]
+    fn zone_spool_flag_defaults_true() {
+        let cfg = JilogConfig::from_toml_str(
+            "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\n",
+        )
+        .unwrap();
+        assert!(cfg.zones[0].spool, "spool must default to true");
+
+        let cfg = JilogConfig::from_toml_str(
+            "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\nspool = false\n",
+        )
+        .unwrap();
+        assert!(!cfg.zones[0].spool);
+    }
+
+    #[test]
+    fn zone_index_path_inside_ledger_tree_is_rejected() {
+        // Directly inside the ledger tree: rejected — including paths
+        // that only reach it through `..` traversal.
+        for bad in [
+            "/tmp/l/index.sqlite",
+            "/tmp/l/sub/idx.sqlite",
+            "/tmp/l",
+            "/tmp/other/../l/index.sqlite",
+            "/tmp/l/./index.sqlite",
+        ] {
+            let err = JilogConfig::from_toml_str(&format!(
+                "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\nindex_path = \"{bad}\"\n"
+            ))
+            .expect_err("index_path inside ledger_path must be rejected")
+            .to_string();
+            assert!(err.contains("inside ledger_path"), "{bad}: {err}");
+            assert!(err.contains("corruption"), "{bad}: {err}");
+        }
+
+        // Outside the tree (including a sibling with a shared name
+        // prefix, and a `..` path that lands outside): allowed.
+        for good in [
+            "/tmp/l-index/z.sqlite",
+            "/var/idx/z.sqlite",
+            "/tmp/l/../l-index/z.sqlite",
+        ] {
+            JilogConfig::from_toml_str(&format!(
+                "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\nindex_path = \"{good}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{good} should be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn zone_index_path_resolution() {
+        // Normal zone: index lives beside the segments (opsctl-compatible).
+        let cfg = JilogConfig::from_toml_str(
+            "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.zones[0].index_db_path(),
+            std::path::PathBuf::from("/tmp/l/index.sqlite")
+        );
+
+        // Mirror zone (spool = false): index defaults OUT of the synced
+        // tree, into the local ~/.jilog/index/.
+        let cfg = JilogConfig::from_toml_str(
+            "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\nspool = false\n",
+        )
+        .unwrap();
+        let p = cfg.zones[0].index_db_path();
+        assert!(
+            p.ends_with(".jilog/index/z.sqlite"),
+            "mirror index must default outside the ledger tree: {}",
+            p.display()
+        );
+
+        // Explicit index_path always wins.
+        let cfg = JilogConfig::from_toml_str(
+            "[[zone]]\nid = \"z\"\nledger_path = \"/tmp/l\"\nspool = false\nindex_path = \"/var/idx/z.sqlite\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.zones[0].index_db_path(),
+            std::path::PathBuf::from("/var/idx/z.sqlite")
+        );
     }
 
     #[test]

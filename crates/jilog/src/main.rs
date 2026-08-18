@@ -4,6 +4,7 @@ mod config;
 mod commands {
     pub mod review;
     pub mod query;
+    pub mod spool;
 }
 
 use clap::{Parser, Subcommand};
@@ -32,6 +33,8 @@ enum Cmd {
     Review(ReviewArgs),
     /// Query the append-only event ledger.
     Query(QueryArgs),
+    /// Replicate ledger segments across the fleet (emit/ingest/status).
+    Spool(commands::spool::SpoolArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -56,5 +59,10 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Review(args) => commands::review::run(&cfg, args),
         Cmd::Query(args) => commands::query::run(&cfg, &args),
+        Cmd::Spool(args) => match args.cmd {
+            commands::spool::SpoolCmd::Emit(a) => commands::spool::run_emit(&cfg, a),
+            commands::spool::SpoolCmd::Ingest(a) => commands::spool::run_ingest(&cfg, a),
+            commands::spool::SpoolCmd::Status(a) => commands::spool::run_status(&cfg, a),
+        },
     }
 }

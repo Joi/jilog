@@ -17,7 +17,7 @@ pub mod zone;
 pub mod error;
 
 pub use event::{Event, EventClass, PayloadTier};
-pub use segment::Segment;
+pub use segment::{PublishOutcome, Segment};
 pub use store::SegmentStore;
 pub use zone::ZoneId;
 pub use error::LedgerError;

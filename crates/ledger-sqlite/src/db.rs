@@ -38,6 +38,18 @@ pub struct LedgerDb {
     conn: Connection,
 }
 
+/// Outcome of an incremental [`LedgerDb::refresh_from_store`] pass.
+#[derive(Debug, Default)]
+pub struct IndexRefreshReport {
+    /// Events newly indexed during this pass.
+    pub events_indexed: usize,
+    /// Segments newly indexed during this pass.
+    pub segments_indexed: usize,
+    /// Segments skipped as unreadable or corrupt: `(source, seq, error)`.
+    /// They stay un-indexed and are retried on the next refresh.
+    pub failed: Vec<(String, u64, String)>,
+}
+
 impl LedgerDb {
     /// Open (or create) a SQLite database at the given path.
     ///
@@ -263,6 +275,119 @@ impl LedgerDb {
         );
 
         Ok(total)
+    }
+
+    /// Incrementally index any store segments not yet ingested.
+    ///
+    /// Unlike `rebuild_from_store` (which drops everything first), this
+    /// only READS the segment files that are missing from the index —
+    /// already-indexed segments cost one SELECT each. Used by
+    /// `jilog spool ingest` and mirror-zone queries to keep synced
+    /// stores queryable through a LOCAL index.
+    ///
+    /// Every candidate segment is checksum-verified before indexing;
+    /// unreadable or corrupt segments are reported in
+    /// [`IndexRefreshReport::failed`] and SKIPPED — they neither poison
+    /// the index nor block later valid segments, and they are retried
+    /// on the next refresh (nothing marks them ingested).
+    pub fn refresh_from_store(
+        &mut self,
+        store: &SegmentStore,
+    ) -> Result<IndexRefreshReport, SqliteError> {
+        let mut report = IndexRefreshReport::default();
+        // Surface listing problems (unreadable dir entries, unparseable
+        // .json names) instead of inheriting list_segments' silent skip
+        // — a hidden segment is a hole in the index.
+        let (entries, listing_errors) = store.list_segments_with_errors()?;
+        for err in listing_errors {
+            report.failed.push(("(listing)".to_string(), 0, err));
+        }
+        for (source, seq, path) in entries {
+            // SQLite INTEGER is signed 64-bit: a seq above i64::MAX is
+            // not representable — reject before it ever reaches a SQL
+            // parameter (even the already-ingested lookup would fail).
+            if seq > i64::MAX as u64 {
+                report.failed.push((
+                    source,
+                    seq,
+                    format!(
+                        "source_seq exceeds i64::MAX ({}) — not representable in the \
+                         SQLite projection",
+                        i64::MAX
+                    ),
+                ));
+                continue;
+            }
+            if self.is_segment_ingested(&source, seq)? {
+                continue;
+            }
+            let segment = match Segment::read_from_file(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    report.failed.push((source, seq, format!("read error: {e}")));
+                    continue;
+                }
+            };
+            // The DESERIALIZED identity must be what the filename says:
+            // a mislabeled file must not be indexed under either name.
+            if segment.source != source || segment.source_seq != seq {
+                report.failed.push((
+                    source,
+                    seq,
+                    format!(
+                        "identity mismatch: file claims source={:?} seq={}",
+                        segment.source, segment.source_seq
+                    ),
+                ));
+                continue;
+            }
+            match segment.verify() {
+                Ok(true) => {}
+                Ok(false) => {
+                    report
+                        .failed
+                        .push((source, seq, "checksum mismatch".to_string()));
+                    continue;
+                }
+                Err(e) => {
+                    report
+                        .failed
+                        .push((source, seq, format!("verify error: {e}")));
+                    continue;
+                }
+            }
+            // Segment-level seq was range-checked above (identity match
+            // ties segment.source_seq to it); the EVENTS inside carry
+            // their own source_seq values that must also fit.
+            if segment.events.iter().any(|e| e.source_seq > i64::MAX as u64) {
+                report.failed.push((
+                    source,
+                    seq,
+                    format!(
+                        "an event's source_seq exceeds i64::MAX ({}) — not \
+                         representable in the SQLite projection",
+                        i64::MAX
+                    ),
+                ));
+                continue;
+            }
+            // ...and catch any remaining per-segment projection error
+            // (the transaction rolls back, nothing is marked ingested,
+            // so it is retried after repair) — one bad segment must not
+            // abort the refresh for the segments after it.
+            match self.ingest_segment(&segment) {
+                Ok(n) => {
+                    report.events_indexed += n;
+                    report.segments_indexed += 1;
+                }
+                Err(e) => {
+                    report
+                        .failed
+                        .push((source, seq, format!("projection error: {e}")));
+                }
+            }
+        }
+        Ok(report)
     }
 
     // -----------------------------------------------------------------------
@@ -649,6 +774,172 @@ mod tests {
 
         let correlated = db.events_by_correlation(&corr_id.to_string()).unwrap();
         assert_eq!(correlated.len(), 2);
+    }
+
+    #[test]
+    fn test_refresh_skips_bad_segments_and_recovers() {
+        use ledger_core::{SegmentStore, ZoneId};
+
+        let dir = std::env::temp_dir().join("opsctl-test-sqlite-refresh-recover");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        let seg1 = sealed_segment("macazbd", 1, vec![
+            test_event("test", 1, EventClass::Health),
+        ]);
+        let seg2 = sealed_segment("macazbd", 2, vec![
+            test_event("test", 2, EventClass::Ingest),
+            test_event("test", 3, EventClass::Ingest),
+        ]);
+        let seg3 = sealed_segment("macazbd", 3, vec![
+            test_event("test", 4, EventClass::Approval),
+        ]);
+        store.write_segment(&seg1).unwrap();
+        store.write_segment(&seg2).unwrap();
+        store.write_segment(&seg3).unwrap();
+
+        // seg1: unreadable (not JSON). seg2: parseable but corrupt
+        // (checksum mismatch). seg3: valid, sorts AFTER both.
+        std::fs::write(dir.join("segments/macazbd-000001.json"), "not json {").unwrap();
+        let tampered = std::fs::read_to_string(dir.join("segments/macazbd-000002.json"))
+            .unwrap()
+            .replace(
+                &format!("\"checksum\": {}", seg2.checksum),
+                "\"checksum\": 99999",
+            );
+        std::fs::write(dir.join("segments/macazbd-000002.json"), tampered).unwrap();
+
+        let mut db = LedgerDb::open_in_memory().unwrap();
+        let report = db.refresh_from_store(&store).unwrap();
+
+        // Bad segments reported and skipped; the LATER valid one is
+        // still indexed (no abort-on-first-error).
+        assert_eq!(report.segments_indexed, 1, "seg3 must be indexed");
+        assert_eq!(report.events_indexed, 1);
+        assert_eq!(report.failed.len(), 2, "seg1 + seg2 reported: {:?}", report.failed);
+        assert!(report.failed.iter().any(|(_, seq, e)| *seq == 1 && e.contains("read error")));
+        assert!(report.failed.iter().any(|(_, seq, e)| *seq == 2 && e.contains("checksum mismatch")));
+        assert_eq!(db.event_count().unwrap(), 1, "corrupt segments must not be indexed");
+
+        // Recovery: repair both files, refresh again — they index now.
+        seg1.write_to_file(dir.join("segments/macazbd-000001.json")).unwrap();
+        seg2.write_to_file(dir.join("segments/macazbd-000002.json")).unwrap();
+        let report = db.refresh_from_store(&store).unwrap();
+        assert_eq!(report.segments_indexed, 2);
+        assert_eq!(report.events_indexed, 3);
+        assert!(report.failed.is_empty(), "repaired: {:?}", report.failed);
+        assert_eq!(db.event_count().unwrap(), 4);
+        assert_eq!(db.segment_count().unwrap(), 3);
+
+        // Idempotent: nothing new on a third pass.
+        let report = db.refresh_from_store(&store).unwrap();
+        assert_eq!(report.segments_indexed, 0);
+        assert!(report.failed.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_surfaces_listing_errors() {
+        use ledger_core::{SegmentStore, ZoneId};
+
+        let dir = std::env::temp_dir().join("opsctl-test-sqlite-refresh-listing");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        let good = sealed_segment("macazbd", 1, vec![
+            test_event("test", 1, EventClass::Health),
+        ]);
+        store.write_segment(&good).unwrap();
+        // A .json file whose name doesn't parse as {source}-{seq}.json.
+        std::fs::write(dir.join("segments/garbage.json"), "{}").unwrap();
+
+        let mut db = LedgerDb::open_in_memory().unwrap();
+        let report = db.refresh_from_store(&store).unwrap();
+
+        assert_eq!(report.segments_indexed, 1, "the good segment still indexes");
+        assert_eq!(report.failed.len(), 1, "listing error must be reported: {:?}", report.failed);
+        assert!(
+            report.failed[0].2.contains("garbage.json"),
+            "unexpected error: {:?}",
+            report.failed[0]
+        );
+        assert_eq!(db.event_count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_rejects_mislabeled_file() {
+        use ledger_core::{SegmentStore, ZoneId};
+
+        let dir = std::env::temp_dir().join("opsctl-test-sqlite-refresh-mislabel");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        // One honest segment...
+        let good = sealed_segment("macazbd", 1, vec![
+            test_event("test", 1, EventClass::Health),
+        ]);
+        store.write_segment(&good).unwrap();
+        // ...and a valid segment whose FILE NAME lies about its identity.
+        let liar = sealed_segment("jibotmac", 7, vec![
+            test_event("test", 2, EventClass::Ingest),
+        ]);
+        liar.write_to_file(dir.join("segments/macazbd-000002.json")).unwrap();
+
+        let mut db = LedgerDb::open_in_memory().unwrap();
+        let report = db.refresh_from_store(&store).unwrap();
+
+        assert_eq!(report.segments_indexed, 1, "only the honest segment indexes");
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            report.failed[0].2.contains("identity mismatch"),
+            "unexpected error: {:?}",
+            report.failed[0]
+        );
+        assert_eq!(db.event_count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_skips_out_of_range_seq_and_continues() {
+        use ledger_core::{SegmentStore, ZoneId};
+
+        let dir = std::env::temp_dir().join("opsctl-test-sqlite-refresh-range");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        // Segment seq beyond SQLite's signed INTEGER.
+        let huge = sealed_segment("macazbd", u64::MAX, vec![
+            test_event("test", 1, EventClass::Health),
+        ]);
+        store.write_segment(&huge).unwrap();
+        // An EVENT seq beyond range inside an otherwise fine segment.
+        let mut bad_event = test_event("test", 2, EventClass::Ingest);
+        bad_event.source_seq = u64::MAX;
+        let bad_inner = sealed_segment("macazbd", 1, vec![bad_event]);
+        store.write_segment(&bad_inner).unwrap();
+        // A fully valid segment that sorts after the huge one.
+        let good = sealed_segment("macazbd", 2, vec![
+            test_event("test", 3, EventClass::Approval),
+        ]);
+        store.write_segment(&good).unwrap();
+
+        let mut db = LedgerDb::open_in_memory().unwrap();
+        let report = db.refresh_from_store(&store).unwrap();
+
+        assert_eq!(report.segments_indexed, 1, "only the fully valid segment indexes");
+        assert_eq!(report.events_indexed, 1);
+        assert_eq!(report.failed.len(), 2, "both out-of-range segments reported: {:?}", report.failed);
+        assert!(report
+            .failed
+            .iter()
+            .all(|(_, _, e)| e.contains("i64::MAX") || e.contains("projection error")));
+        assert_eq!(db.event_count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

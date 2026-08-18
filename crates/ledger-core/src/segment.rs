@@ -146,11 +146,140 @@ impl Segment {
     // File I/O
     // -----------------------------------------------------------------------
 
-    /// Write this segment to a JSON file.
+    /// Resolve to an absolute path (so parent-chain derivation works
+    /// even for bare relative paths), create the parent directories,
+    /// and best-effort fsync the created chain (leaf parent + its
+    /// parent) so the new directories themselves survive a crash.
+    fn prepare_target(path: &Path) -> Result<std::path::PathBuf, LedgerError> {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+            // Best-effort durability for the directory CHAIN just
+            // ensured: fsync the leaf parent and its parent. Failure is
+            // logged, not fatal — the file content + final publish
+            // fsyncs below carry the hard guarantee.
+            Self::fsync_dir_best_effort(parent);
+            if let Some(grand) = parent.parent() {
+                Self::fsync_dir_best_effort(grand);
+            }
+        }
+        Ok(abs)
+    }
+
+    /// Best-effort directory fsync (unix); logs on failure.
+    fn fsync_dir_best_effort(dir: &Path) {
+        #[cfg(unix)]
+        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed to fsync directory");
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+    }
+
+    /// Create a brand-new file, retrying with fresh candidate names
+    /// (from `namegen`, called with the attempt number) whenever a
+    /// candidate already exists. `create_new` is load-bearing: an
+    /// existing file at a candidate name — e.g. a crash-left tmp that
+    /// is already hard-linked to a PUBLISHED destination — must never
+    /// be reopened or truncated; it gets skipped, untouched.
+    fn create_new_with_retry(
+        namegen: &mut dyn FnMut(u32) -> std::path::PathBuf,
+        attempts: u32,
+    ) -> Result<(std::path::PathBuf, fs::File), LedgerError> {
+        for attempt in 0..attempts {
+            let candidate = namegen(attempt);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => return Ok((candidate, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(LedgerError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("could not create a unique tmp file after {attempts} attempts"),
+        )))
+    }
+
+    /// Serialize this segment and write it to a uniquely-named
+    /// `<path>.<pid>.<counter>.<nanos>.tmp` sibling, fsynced. Returns
+    /// the tmp path; the caller must link/rename it into place (and
+    /// clean it up on failure).
+    fn write_tmp_synced(&self, path: &Path) -> Result<std::path::PathBuf, LedgerError> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Serialize to pretty JSON for human readability.
+        // In production you might use compact JSON for size.
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+
+        // Unique, unpredictable same-directory tmp sibling: `foo.json`
+        // -> `foo.json.<pid>.<counter>.<nanos>.tmp`. A full-name suffix
+        // (NOT extension replacement) keeps it out of `.json` filters;
+        // pid + a process-wide counter + a clock-nanos component keep
+        // the name from ever being deterministic, and create_new (in
+        // create_new_with_retry) guarantees a leftover file at any
+        // colliding name is skipped, never truncated.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let (tmp, mut file) = Self::create_new_with_retry(
+            &mut |_attempt| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let mut tmp_name = path.as_os_str().to_os_string();
+                tmp_name.push(format!(
+                    ".{}.{}.{}.tmp",
+                    std::process::id(),
+                    TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+                    nanos
+                ));
+                std::path::PathBuf::from(tmp_name)
+            },
+            16,
+        )?;
+
+        let write_synced = (|| -> std::io::Result<()> {
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(e) = write_synced {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(tmp)
+    }
+
+    /// Write this segment to a JSON file, atomically and durably, with
+    /// REPLACE semantics (an existing file at `path` is overwritten).
+    /// Publication paths that must never clobber concurrent writers —
+    /// spool `incoming/`, store commits, `processed/` moves — use
+    /// [`Segment::publish_new`] instead; this method is for repair /
+    /// rewrite flows where replacing is the point.
     ///
-    /// The file is written atomically-ish: we serialize to a string,
-    /// then write the whole thing. For true atomic writes (important
-    /// on crash), a later phase can add write-to-temp + rename.
+    /// # Durability guarantee (unix)
+    ///
+    /// - the path is resolved to absolute first, so parent derivation
+    ///   works for bare relative paths;
+    /// - after `create_dir_all`, the parent and grandparent directories
+    ///   are fsynced best-effort (failure logged, not fatal);
+    /// - the bytes are written to a uniquely-named `<path>.<pid>.<n>.tmp`
+    ///   sibling and fsynced BEFORE the rename (hard error on failure);
+    /// - `fs::rename` makes publication atomic: readers see the old
+    ///   state or the complete new file, never a truncation;
+    /// - the parent directory is fsynced after the rename (hard error
+    ///   on failure), making the directory entry durable.
+    ///
+    /// Consumers must ignore `*.tmp` files (the spool ingester's `.json`
+    /// extension filter already does).
     ///
     /// # Rust note: `AsRef<Path>`
     ///
@@ -159,20 +288,91 @@ impl Segment {
     /// It's how Rust's standard library achieves the same ergonomics
     /// as Python's `os.path` accepting both strings and Path objects.
     pub fn write_to_file(&self, path: impl AsRef<Path>) -> Result<(), LedgerError> {
-        let path = path.as_ref();
-
-        // Create parent directories if they don't exist (mkdir -p).
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let path = Self::prepare_target(path.as_ref())?;
+        let tmp = self.write_tmp_synced(&path)?;
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
         }
-
-        // Serialize to pretty JSON for human readability.
-        // In production you might use compact JSON for size.
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-
-        fs::write(path, json)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            // Directory fsync: File::open on a dir + sync_all is the
+            // portable-unix way to persist the new directory entry.
+            fs::File::open(parent).and_then(|d| d.sync_all())?;
+        }
         Ok(())
+    }
+
+    /// Publish this segment to `path` atomically, durably, and WITHOUT
+    /// clobbering: if `path` already exists — even one created in the
+    /// races that a bidirectionally-synced directory makes real — the
+    /// existing file is never replaced.
+    ///
+    /// Mechanism: write the fsynced unique tmp sibling, then
+    /// `fs::hard_link(tmp, path)` — which, unlike rename, FAILS with
+    /// `AlreadyExists` instead of replacing — and remove the tmp. On
+    /// `AlreadyExists` the existing file is read and content-compared:
+    /// identical -> `Ok(PublishOutcome::AlreadyIdentical)` (idempotent
+    /// skip), different -> an `IntegrityFailure` error, with BOTH files
+    /// left intact for the operator. Durability is as documented on
+    /// [`Segment::write_to_file`] (same tmp-fsync + parent-dir fsync).
+    pub fn publish_new(&self, path: impl AsRef<Path>) -> Result<PublishOutcome, LedgerError> {
+        let path = Self::prepare_target(path.as_ref())?;
+        let tmp = self.write_tmp_synced(&path)?;
+        match fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                // The tmp is now an ALIAS of the published file; a
+                // failure to remove it must surface (a surviving alias
+                // could be mistaken for a scratch file later), it is
+                // not ignorable cleanup.
+                let cleanup = fs::remove_file(&tmp);
+                #[cfg(unix)]
+                if let Some(parent) = path.parent() {
+                    fs::File::open(parent).and_then(|d| d.sync_all())?;
+                }
+                if let Err(e) = cleanup {
+                    return Err(LedgerError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "segment published to {} but its tmp alias {} could not be \
+                             removed: {e} — remove the alias manually",
+                            path.display(),
+                            tmp.display()
+                        ),
+                    )));
+                }
+                Ok(PublishOutcome::Published)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp);
+                let existing = Segment::read_from_file(&path)?;
+                if existing.content_matches(self) {
+                    Ok(PublishOutcome::AlreadyIdentical)
+                } else {
+                    Err(LedgerError::IntegrityFailure(format!(
+                        "no-clobber publish: {} already exists with DIFFERENT \
+                         content — not overwriting",
+                        path.display()
+                    )))
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Deep content equality with another segment: identity (source,
+    /// seq), stored checksum, creation timestamp, AND the full event
+    /// list — every serialized field. Spool duplicate/conflict
+    /// detection uses this instead of trusting the 32-bit CRC alone.
+    pub fn content_matches(&self, other: &Segment) -> bool {
+        self.source == other.source
+            && self.source_seq == other.source_seq
+            && self.checksum == other.checksum
+            && self.created_at == other.created_at
+            && self.events == other.events
     }
 
     /// Read a segment from a JSON file.
@@ -203,6 +403,16 @@ impl Segment {
     pub fn filename(&self) -> String {
         format!("{}-{:06}.json", self.source, self.source_seq)
     }
+}
+
+/// Outcome of a [`Segment::publish_new`] no-clobber publication.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The segment was written; the destination did not exist before.
+    Published,
+    /// The destination already held a content-identical copy; nothing
+    /// was written (idempotent skip).
+    AlreadyIdentical,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +536,203 @@ mod tests {
         assert!(loaded.verify().unwrap());
 
         // Clean up.
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Count `*.tmp` files in a directory.
+    fn tmp_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+            .count()
+    }
+
+    #[test]
+    fn test_write_rename_failure_cleans_tmp() {
+        let dir = std::env::temp_dir().join("opsctl-test-segment-rename-fail");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut seg = Segment::new("macazbd", 1);
+        seg.append(test_event("public-ops", 1));
+        seg.seal().unwrap();
+
+        // Force the RENAME (not the tmp write) to fail: the target path
+        // is an existing directory, so the tmp file is created and
+        // synced, and only the final rename errors.
+        let path = dir.join(seg.filename());
+        fs::create_dir_all(path.join("occupied")).unwrap();
+
+        let err = seg.write_to_file(&path);
+        assert!(err.is_err(), "rename onto a directory must fail");
+        assert_eq!(
+            tmp_count(&dir),
+            0,
+            "failed rename must clean up its tmp file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_concurrent_writers_one_winner_no_stray_tmp() {
+        let dir = std::env::temp_dir().join("opsctl-test-segment-concurrent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two segments with the same identity but different content,
+        // racing on the same target path from many alternating writes.
+        // Unique tmp names mean neither writer ever scribbles on the
+        // other's tmp; the final file is always one COMPLETE segment.
+        let mut a = Segment::new("macazbd", 1);
+        a.append(test_event("public-ops", 1));
+        a.seal().unwrap();
+        let mut b = Segment::new("macazbd", 1);
+        b.append(test_event("public-ops", 2));
+        b.append(test_event("public-ops", 3));
+        b.seal().unwrap();
+
+        let path = dir.join(a.filename());
+        std::thread::scope(|s| {
+            let (path_a, path_b) = (path.clone(), path.clone());
+            let (sa, sb) = (a.clone(), b.clone());
+            let ta = s.spawn(move || {
+                for _ in 0..50 {
+                    sa.write_to_file(&path_a).unwrap();
+                }
+            });
+            let tb = s.spawn(move || {
+                for _ in 0..50 {
+                    sb.write_to_file(&path_b).unwrap();
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+        });
+
+        // Exactly one winner file, valid and equal to one of the inputs.
+        let loaded = Segment::read_from_file(&path).unwrap();
+        assert!(loaded.verify().unwrap(), "winner must be a complete, valid segment");
+        assert!(
+            loaded.content_matches(&a) || loaded.content_matches(&b),
+            "winner must be one of the two written segments, not a mix"
+        );
+        assert_eq!(tmp_count(&dir), 0, "no stray tmp files after the race");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "exactly one file remains"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_new_with_retry_never_touches_planted_file() {
+        let dir = std::env::temp_dir().join("opsctl-test-segment-createnew");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Plant a file at the FIRST candidate name — simulating a
+        // crash-left tmp that may already be hard-linked to a published
+        // destination. create_new semantics must skip it (retry with the
+        // next name), never reopen or truncate it.
+        let planted = dir.join("collide.0.tmp");
+        fs::write(&planted, "precious planted bytes").unwrap();
+
+        let mut generated = Vec::new();
+        let (chosen, file) = Segment::create_new_with_retry(
+            &mut |attempt| {
+                let p = dir.join(format!("collide.{attempt}.tmp"));
+                generated.push(p.clone());
+                p
+            },
+            16,
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(chosen, dir.join("collide.1.tmp"), "collision must retry with a fresh name");
+        assert_eq!(generated.len(), 2, "exactly one retry");
+        assert_eq!(
+            fs::read_to_string(&planted).unwrap(),
+            "precious planted bytes",
+            "planted file must be untouched (no truncate, no reopen)"
+        );
+
+        // Bounded: all candidates taken -> error, planted files intact.
+        let err = Segment::create_new_with_retry(&mut |_| planted.clone(), 3).unwrap_err();
+        assert!(
+            err.to_string().contains("3 attempts"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read_to_string(&planted).unwrap(), "precious planted bytes");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_content_matches_detects_differing_events() {
+        let mut a = Segment::new("macazbd", 1);
+        a.append(test_event("public-ops", 1));
+        a.seal().unwrap();
+        let b = a.clone();
+        assert!(a.content_matches(&b));
+
+        // Same identity, same FORGED checksum, different events.
+        let mut c = Segment::new("macazbd", 1);
+        c.append(test_event("public-ops", 2));
+        c.seal().unwrap();
+        c.checksum = a.checksum;
+        assert!(!a.content_matches(&c), "event content must be compared, not just CRC");
+    }
+
+    #[test]
+    fn test_content_matches_detects_differing_created_at() {
+        let mut a = Segment::new("macazbd", 1);
+        a.append(test_event("public-ops", 1));
+        a.seal().unwrap();
+
+        // EVERYTHING identical except created_at.
+        let mut b = a.clone();
+        b.created_at = b.created_at + chrono::Duration::seconds(1);
+        assert!(
+            !a.content_matches(&b),
+            "created_at is part of segment content and must be compared"
+        );
+    }
+
+    #[test]
+    fn test_publish_new_no_clobber() {
+        let dir = std::env::temp_dir().join("opsctl-test-segment-publish");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut a = Segment::new("macazbd", 1);
+        a.append(test_event("public-ops", 1));
+        a.seal().unwrap();
+        let mut b = Segment::new("macazbd", 1);
+        b.append(test_event("public-ops", 2));
+        b.seal().unwrap();
+
+        let path = dir.join(a.filename());
+
+        // Fresh publish.
+        assert_eq!(a.publish_new(&path).unwrap(), PublishOutcome::Published);
+        // Identical re-publish: idempotent skip.
+        assert_eq!(a.publish_new(&path).unwrap(), PublishOutcome::AlreadyIdentical);
+        // Different content at the same path: error, existing file intact.
+        let err = b.publish_new(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("DIFFERENT content"),
+            "unexpected error: {err}"
+        );
+        let on_disk = Segment::read_from_file(&path).unwrap();
+        assert!(on_disk.content_matches(&a), "conflict must not clobber the existing file");
+        assert_eq!(tmp_count(&dir), 0, "no tmp leftovers after any outcome");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

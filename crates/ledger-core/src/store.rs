@@ -124,9 +124,10 @@ impl SegmentStore {
             });
         }
 
-        // Check for sequence gaps.
+        // Check for sequence gaps. (Saturating: a source already at
+        // u64::MAX must not overflow the gap arithmetic.)
         let latest = self.latest_seq(&segment.source)?;
-        let expected = latest + 1;
+        let expected = latest.saturating_add(1);
         if segment.source_seq != expected {
             // Log warning but don't reject -- the caller might be
             // backfilling or the gap might be intentional.
@@ -139,7 +140,20 @@ impl SegmentStore {
         }
 
         self.ensure_dirs()?;
-        segment.write_to_file(&path)?;
+        // No-clobber publish: hard-link semantics mean a concurrent
+        // create in the check-to-write window (real when the store sits
+        // in a synced tree) fails or dedups instead of replacing.
+        match segment.publish_new(&path)? {
+            crate::segment::PublishOutcome::Published => {}
+            crate::segment::PublishOutcome::AlreadyIdentical => {
+                // Raced with an identical concurrent write; report the
+                // same way the pre-check would have.
+                return Err(LedgerError::DuplicateSegment {
+                    src: segment.source.clone(),
+                    seq: segment.source_seq,
+                });
+            }
+        }
 
         tracing::info!(
             zone = %self.zone,
@@ -178,35 +192,64 @@ impl SegmentStore {
     ///
     /// Without `.collect()`, nothing happens -- iterators are lazy.
     pub fn list_segments(&self) -> Result<Vec<(String, u64, PathBuf)>, LedgerError> {
+        Ok(self.list_segments_with_errors()?.0)
+    }
+
+    /// Like [`SegmentStore::list_segments`], but SURFACES per-entry
+    /// problems instead of silently skipping them: unreadable directory
+    /// entries and `.json` files whose names don't parse as
+    /// `{source}-{seq}.json` are returned as human-readable error
+    /// strings alongside the good entries. Non-`.json` files (tmp
+    /// siblings, editor droppings) are ignored as before. Callers that
+    /// must not lose segments (spool emit) use this and treat a
+    /// non-empty error list as a failure.
+    #[allow(clippy::type_complexity)]
+    pub fn list_segments_with_errors(
+        &self,
+    ) -> Result<(Vec<(String, u64, PathBuf)>, Vec<String>), LedgerError> {
         let dir = self.segments_dir();
         if !dir.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        let mut entries: Vec<(String, u64, PathBuf)> = fs::read_dir(&dir)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-
-                // Only .json files.
-                if path.extension()?.to_str()? != "json" {
-                    return None;
+        let mut entries: Vec<(String, u64, PathBuf)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(format!("unreadable directory entry in {}: {e}", dir.display()));
+                    continue;
                 }
-
-                // Parse filename: "{source}-{seq:06}.json"
-                let stem = path.file_stem()?.to_str()?;
-                let dash_pos = stem.rfind('-')?;
-                let source = stem[..dash_pos].to_string();
-                let seq: u64 = stem[dash_pos + 1..].parse().ok()?;
-
-                Some((source, seq, path))
-            })
-            .collect();
+            };
+            let path = entry.path();
+            // Only .json files; everything else is deliberately ignored.
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            // Parse filename: "{source}-{seq:06}.json"
+            let parsed = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| {
+                    let dash_pos = stem.rfind('-')?;
+                    let source = stem[..dash_pos].to_string();
+                    let seq: u64 = stem[dash_pos + 1..].parse().ok()?;
+                    Some((source, seq))
+                });
+            match parsed {
+                Some((source, seq)) => entries.push((source, seq, path)),
+                None => errors.push(format!(
+                    "segment filename does not parse as {{source}}-{{seq}}.json: {}",
+                    path.display()
+                )),
+            }
+        }
 
         // Sort by source, then by sequence number.
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        Ok(entries)
+        Ok((entries, errors))
     }
 
     /// Read ALL segments, in order. Useful for rebuilding projections.
@@ -616,6 +659,27 @@ mod tests {
         assert_eq!(entries[1].1, 1);
         assert_eq!(entries[2].0, "macazbd");
         assert_eq!(entries[2].1, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_segments_with_errors_surfaces_bad_names() {
+        let dir = test_dir("store-list-errors");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        // A .json file whose name doesn't parse as {source}-{seq}.json.
+        fs::write(dir.join("segments/garbage.json"), "{}").unwrap();
+        // Non-.json files are ignored, not errors.
+        fs::write(dir.join("segments/notes.txt"), "x").unwrap();
+
+        let (entries, errors) = store.list_segments_with_errors().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(errors.len(), 1, "bad name must be surfaced: {errors:?}");
+        assert!(errors[0].contains("garbage.json"), "{errors:?}");
+
+        // The lenient listing keeps its historical skip behavior.
+        assert_eq!(store.list_segments().unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

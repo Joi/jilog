@@ -44,7 +44,10 @@ pub enum PayloadTier {
 ///
 /// Events are immutable once written. They form an append-only log
 /// within a segment file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` supports deep content comparison of segments (spool
+/// duplicate/conflict detection) — checksums alone are only 32 bits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
     /// Globally unique event identifier (UUIDv7 for time-ordering).
     pub event_id: Uuid,

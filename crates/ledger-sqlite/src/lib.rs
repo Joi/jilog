@@ -31,5 +31,5 @@
 mod db;
 pub mod error;
 
-pub use db::LedgerDb;
+pub use db::{IndexRefreshReport, LedgerDb};
 pub use error::SqliteError;

@@ -24,7 +24,7 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
-**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them — including NanoClaw cell bots, whose signals carry persona + channel dimensions. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle.
+**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them — including NanoClaw cell bots, whose signals carry persona + channel dimensions. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle: every machine runs `jilog spool emit` (own-host segments into a synced spool directory), one always-on authority runs `jilog spool ingest` (validate, deduplicate, commit into the single-writer fleet store), and any file-sync tool you already run (Syncthing here) is the transport.
 
 ### Why not LangSmith / Langfuse?
 
@@ -49,9 +49,14 @@ Segment files are the authority. SQLite is a rebuildable index. Nothing generate
 **1. Install** — pinned release or moving main:
 
 ```bash
-cargo install --git https://github.com/Joi/jilog --tag v0.2.0 jilog   # pinned
+cargo install --git https://github.com/Joi/jilog --tag v0.5.0 jilog   # pinned
 cargo install --git https://github.com/Joi/jilog jilog                # moving main
 ```
+
+Fleet replication (`jilog spool`, below) ships in v0.5.0 — it requires
+v0.5.0 or later; earlier tags (v0.2.0–v0.4.0) do not have the `spool`
+command. (The v0.5.0 tag is created with the release this section ships
+in.)
 
 **2. Configure one reader.** Create `~/.jilog.toml` pointing at whichever agent you already run — one reader is enough to start (add more later; see the readers table below):
 
@@ -359,7 +364,47 @@ The point of the nightly review is not that any single one of these is interesti
 ```bash
 jilog review nightly [--json]       # Nightly learning digest + issue filing
 jilog query [--since N] [--json]    # Filter ledger events
+jilog spool emit                    # Producer: this host's new segments -> spool
+jilog spool ingest                  # Authority: spool -> deduped fleet store
+jilog spool status                  # Spool counts + emit cursors per zone
 ```
+
+### Fleet replication (`jilog spool`)
+
+One logical ledger across many machines, no server. Every host emits its
+own segments into a spool directory that your existing file sync
+(Syncthing) already replicates; a single always-on authority ingests —
+validate, dedup, commit — into a fleet store only it writes. Configure
+the spool per zone; only the authority sets `fleet_store_path`:
+
+```toml
+[[zone]]
+id = "public-ops"
+ledger_path = "~/switchboard/ops/ledgers/public-ops"
+# spool_path defaults to <ledger parent>/spool/<zone-id>
+# AUTHORITY MACHINE ONLY:
+fleet_store_path = "~/switchboard/ops/ledgers/public-ops-fleet"
+
+[[zone]]
+id = "public-ops-fleet"
+ledger_path = "~/switchboard/ops/ledgers/public-ops-fleet"
+spool = false
+# index defaults to ~/.jilog/index/public-ops-fleet.sqlite (local disk,
+# NEVER inside the synced tree); override with index_path = "..."
+```
+
+Add the fleet store as a read-only `[[zone]]` on every machine and
+`jilog query --zone public-ops-fleet` sees the merged, deduplicated
+history anywhere. The `spool = false` flag is required on that mirror
+zone: without it, every host's `spool emit` would re-emit the synced
+fleet mirror into an orphan spool of its own. It also moves the zone's
+SQLite index to a LOCAL default (`~/.jilog/index/<zone-id>.sqlite`) —
+a SQLite file must never live inside a synced tree, where a background
+sync of a mid-transaction db ships corruption. Each consumer builds its
+own local index: `jilog query` refreshes it lazily on mirror zones, and
+on the authority `spool ingest` refreshes it right after committing.
+Emit is cursor-tracked and triple-idempotent (cursor, spool
+content-compare, store dedup) — losing state is slow, never wrong.
 
 Planned (the ledger crates already support them; CLI wiring pending): `supervise` (wrap tasks with ledger events + retry), `review sessions`, `issues list`, `issues pending`, `rebuild`, `status`.
 
@@ -390,7 +435,7 @@ Ten core event classes. All stored as append-only segment files; nothing is dele
 |---|---|
 | `ledger-core` | Event types, segment format, CRC32 integrity, zone store |
 | `ledger-sqlite` | Rebuildable SQLite projection, event queries |
-| `ledger-spool` | Cross-machine transport with dedup and integrity checks |
+| `ledger-spool` | Cross-machine transport with dedup and integrity checks (wired via `jilog spool emit`/`ingest`) |
 | `jilog-review` | Nightly review engine: `Reader` + `Tracker` traits, signal detectors, digest renderer |
 | `jilog` | CLI binary: review, query (supervise/issues/status planned) |
 

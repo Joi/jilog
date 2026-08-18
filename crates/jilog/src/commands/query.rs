@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use ledger_core::{Event, EventClass};
+use ledger_core::{Event, EventClass, SegmentStore, ZoneId};
 use ledger_sqlite::LedgerDb;
 
 use crate::config::JilogConfig;
@@ -61,39 +61,73 @@ pub fn run(cfg: &JilogConfig, args: &QueryArgs) -> anyhow::Result<()> {
         .transpose()
         .with_context(|| format!("invalid --class value: {:?}", args.class))?;
 
-    // Determine which ledger paths to query.
-    let ledger_paths: Vec<(String, std::path::PathBuf)> = if let Some(ref direct) = args.ledger_path {
-        vec![("direct".to_string(), direct.clone())]
-    } else {
-        let zones: Vec<&crate::config::ZoneConfig> = match &args.zone {
-            Some(z) => cfg.zones.iter().filter(|zc| &zc.id == z).collect(),
-            None => cfg.zones.iter().collect(),
+    // Determine which ledgers to query: (zone id, ledger path, index db
+    // path, auto-refresh?). Mirror zones (spool = false) keep their
+    // index OUTSIDE the synced ledger tree (see ZoneConfig::index_path)
+    // and jilog itself maintains it — each consumer refreshes its own
+    // local index lazily here, since no other process will.
+    let targets: Vec<(String, std::path::PathBuf, std::path::PathBuf, bool)> =
+        if let Some(ref direct) = args.ledger_path {
+            vec![(
+                "direct".to_string(),
+                direct.clone(),
+                direct.join("index.sqlite"),
+                false,
+            )]
+        } else {
+            let zones: Vec<&crate::config::ZoneConfig> = match &args.zone {
+                Some(z) => cfg.zones.iter().filter(|zc| &zc.id == z).collect(),
+                None => cfg.zones.iter().collect(),
+            };
+            if zones.is_empty() && args.zone.is_some() {
+                anyhow::bail!(
+                    "no zones matched (--zone {:?}, configured: {:?})",
+                    args.zone,
+                    cfg.zones.iter().map(|z| &z.id).collect::<Vec<_>>(),
+                );
+            }
+            zones
+                .iter()
+                .map(|zc| {
+                    (
+                        zc.id.clone(),
+                        expand_tilde(&zc.ledger_path),
+                        zc.index_db_path(),
+                        !zc.spool,
+                    )
+                })
+                .collect()
         };
-        if zones.is_empty() && args.zone.is_some() {
-            anyhow::bail!(
-                "no zones matched (--zone {:?}, configured: {:?})",
-                args.zone,
-                cfg.zones.iter().map(|z| &z.id).collect::<Vec<_>>(),
-            );
-        }
-        zones
-            .iter()
-            .map(|zc| (zc.id.clone(), expand_tilde(&zc.ledger_path)))
-            .collect()
-    };
 
-    if ledger_paths.is_empty() {
+    if targets.is_empty() {
         anyhow::bail!("no ledger paths found (configure a [[zone]] or use --ledger-path)");
     }
 
     let mut all_results: Vec<(String, Vec<Event>)> = Vec::new();
 
-    for (zone_id, ledger_path) in ledger_paths {
-        let db_path = ledger_path.join("index.sqlite");
-        if !db_path.exists() {
-            continue;
-        }
-        let db = LedgerDb::open(&db_path)?;
+    for (zone_id, ledger_path, db_path, auto_refresh) in targets {
+        let db = if auto_refresh {
+            // Build/refresh this consumer's local index of the synced
+            // store before querying it.
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create index dir {}", parent.display()))?;
+            }
+            let mut db = LedgerDb::open(&db_path)
+                .with_context(|| format!("open index {}", db_path.display()))?;
+            let report = db
+                .refresh_from_store(&SegmentStore::new(ZoneId::new(&zone_id), &ledger_path))
+                .with_context(|| format!("refresh index for zone {zone_id}"))?;
+            for (src, seq, err) in &report.failed {
+                eprintln!("query [{zone_id}]: skipping corrupt segment {src}-{seq:06}: {err}");
+            }
+            db
+        } else {
+            if !db_path.exists() {
+                continue;
+            }
+            LedgerDb::open(&db_path)?
+        };
         let events = query_events(
             &db,
             cutoff,
@@ -484,6 +518,72 @@ mod tests {
             100,
         ).unwrap();
         assert_eq!(results.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_run_auto_builds_mirror_zone_local_index() {
+        use crate::config::{JilogConfig, ZoneConfig};
+
+        let dir = test_dir("mirror_auto_index");
+        // A synced fleet store with segments but NO index anywhere.
+        let fleet = dir.join("fleet");
+        let store = SegmentStore::new(ZoneId::new("fleet-zone"), &fleet);
+        let mut seg = Segment::new("hostA", 1);
+        seg.append(Event {
+            event_id: Uuid::now_v7(),
+            zone: "fleet-zone".to_string(),
+            source: "hostA".to_string(),
+            source_seq: 1,
+            timestamp: Utc::now(),
+            correlation_id: None,
+            causation_id: None,
+            actor_ref: None,
+            object_ref: Some("subsystem:opsctl".to_string()),
+            event_class: EventClass::Health,
+            payload_tier: PayloadTier::MetadataOnly,
+            payload: None,
+        });
+        seg.seal().unwrap();
+        store.write_segment(&seg).unwrap();
+
+        let index_path = dir.join("local-index/fleet.sqlite");
+        let cfg = JilogConfig {
+            zones: vec![ZoneConfig {
+                id: "fleet-zone".into(),
+                ledger_path: fleet.display().to_string(),
+                spool: false,
+                spool_path: None,
+                fleet_store_path: None,
+                index_path: Some(index_path.display().to_string()),
+            }],
+            ..Default::default()
+        };
+
+        // A consumer query must lazily build its LOCAL index and see
+        // the events — and never write sqlite into the synced tree.
+        run(
+            &cfg,
+            &QueryArgs {
+                since: "7d".into(),
+                subsystem: vec![],
+                class: None,
+                zone: None,
+                ledger_path: None,
+                limit: 100,
+                format: "json".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(index_path.exists(), "local index must be created by query");
+        let db = LedgerDb::open(&index_path).unwrap();
+        assert_eq!(db.event_count().unwrap(), 1);
+        assert!(
+            !fleet.join("index.sqlite").exists(),
+            "no sqlite inside the synced fleet tree"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
