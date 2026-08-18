@@ -399,12 +399,25 @@ mod tests {
 
     #[test]
     fn generic_reader_expands_tilde_in_path() {
-        // The glob is resolved relative to the real $HOME (no env mutation:
-        // other tests run in parallel), in a per-process scratch dir.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Hermetic: a scratch dir under the real $HOME whose name is unique
+        // per (pid, nanos, counter), created with create_dir (NOT _all) so it
+        // MUST NOT pre-exist — we only ever remove a dir we just created, so a
+        // PID collision can't delete someone else's directory.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let home = std::env::var("HOME").expect("HOME set in tests");
-        let scratch = format!(".jilog-test-generic-{}", std::process::id());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let scratch = format!(
+            ".jilog-test-generic-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let dir = std::path::Path::new(&home).join(&scratch);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).expect("unique scratch dir must not pre-exist");
         std::fs::write(dir.join("s1.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
 
         let cfg = JilogConfig::from_toml_str(&format!(
