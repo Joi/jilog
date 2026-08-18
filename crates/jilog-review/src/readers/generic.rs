@@ -169,18 +169,13 @@ impl Reader for GenericReader {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("jilog-test-generic").join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn header_line_stamps_persona_and_channel_and_is_not_a_message() {
-        let dir = test_dir("header");
+        // Owned temp dir (tempfile) — no fixed shared path that a concurrent
+        // test process could delete out from under us.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let f = dir.join("sess-1.2026-08-17.jsonl");
         fs::write(
             &f,
@@ -204,12 +199,12 @@ mod tests {
         let msgs = reader.load(&handles[0]).unwrap();
         assert_eq!(msgs.len(), 2, "header line must not be loaded as a message");
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn files_without_a_header_behave_as_before() {
-        let dir = test_dir("no-header");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         fs::write(
             dir.join("a.jsonl"),
             "{\"role\":\"user\",\"content\":\"hi\"}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
@@ -232,6 +227,5 @@ mod tests {
         }
         assert_eq!(reader.load(&handles[0]).unwrap().len(), 2);
         assert_eq!(reader.load(&handles[1]).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 }
