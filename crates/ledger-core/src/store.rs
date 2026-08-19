@@ -100,6 +100,10 @@ impl SegmentStore {
     /// The segment MUST be sealed before writing. If checksum is 0,
     /// this returns an error.
     ///
+    /// Commits publish via [`Segment::publish_new`], so the store
+    /// directory must live on a filesystem with hard-link support (see
+    /// that method's "Filesystem requirement" note).
+    ///
     /// # Rust note: ownership vs borrowing
     ///
     /// This takes `&self` (immutable borrow of the store) and `&Segment`
@@ -203,6 +207,13 @@ impl SegmentStore {
     /// siblings, editor droppings) are ignored as before. Callers that
     /// must not lose segments (spool emit) use this and treat a
     /// non-empty error list as a failure.
+    ///
+    /// Syncthing conflict artifacts (`*.sync-conflict-*.json`) are
+    /// skipped with a warning rather than reported as errors: in a
+    /// synced tree one sync hiccup would otherwise make every caller
+    /// that treats listing errors as failures (spool emit/ingest) exit
+    /// nonzero forever. They stay on disk for the operator to inspect
+    /// and remove — same policy as the spool ingester's `incoming/`.
     #[allow(clippy::type_complexity)]
     pub fn list_segments_with_errors(
         &self,
@@ -225,6 +236,18 @@ impl SegmentStore {
             let path = entry.path();
             // Only .json files; everything else is deliberately ignored.
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            // Syncthing conflict artifacts can never parse as
+            // {source}-{seq}.json; treating them as errors would turn a
+            // single sync hiccup into a standing failure. Warn and skip.
+            let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if name.contains(".sync-conflict-") {
+                tracing::warn!(
+                    file = %path.display(),
+                    "ignoring Syncthing conflict artifact in segments/ — \
+                     inspect and remove it manually"
+                );
                 continue;
             }
             // Parse filename: "{source}-{seq:06}.json"
@@ -680,6 +703,27 @@ mod tests {
 
         // The lenient listing keeps its historical skip behavior.
         assert_eq!(store.list_segments().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_segments_skips_sync_conflict_artifacts() {
+        let dir = test_dir("store-list-sync-conflict");
+        let store = SegmentStore::new(ZoneId::new("test"), &dir);
+        store.write_segment(&sealed_segment("macazbd", 1, 1)).unwrap();
+        // A Syncthing conflict copy of a segment: valid .json extension,
+        // unparseable stem. Must be skipped, NOT reported as an error —
+        // callers treat listing errors as failures.
+        fs::write(
+            dir.join("segments/jibotmac-000002.sync-conflict-20260819-123456-ABCDEF.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let (entries, errors) = store.list_segments_with_errors().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(errors.is_empty(), "conflict artifact must not be an error: {errors:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -130,7 +130,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 | `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | — | ✅ built-in |
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
 | `pi` | `~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl` ([pi.dev](https://pi.dev) coding agent, session format v3; user + assistant + toolResult messages, per-call usage/cost → spend section) | ✅ | ✅ built-in |
-| `generic` | Any JSONL matching the jilog signal schema | — | ✅ built-in |
+| `generic` | Any JSONL of `{"role","content","name"}` lines at a configured glob (`path`, `~` ok) with `session_id_from = "parent_dir" \| "file_stem"`; an optional first line `{"_jilog": {"persona": …, "channel": …}}` stamps the fleet dimensions (Personas rollup + chat-tuned corrections) — how Hermes profiles on jibotmac reach jilog (cell-fleet `scripts/hermes-jilog-export.py`) | — | ✅ built-in |
 | `nanoclaw` | `<data>/v2-sessions/<agent-id>/.claude-shared/projects/**/*.jsonl` (NanoClaw cell agent sessions — Claude Code format plus queue-operation entries; persona + channel mapped from the cell's `v2.db`, trust-tier `include`/`exclude` allowlist; run on-cell or against a read-only mirror) | ✅ | ✅ built-in |
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
@@ -403,8 +403,10 @@ a SQLite file must never live inside a synced tree, where a background
 sync of a mid-transaction db ships corruption. Each consumer builds its
 own local index: `jilog query` refreshes it lazily on mirror zones, and
 on the authority `spool ingest` refreshes it right after committing.
-Emit is cursor-tracked and triple-idempotent (cursor, spool
-content-compare, store dedup) — losing state is slow, never wrong.
+Emit rescans every own-host segment on every run (O(segments), a read
+per segment) and is idempotent through two layers — spool
+content-compare and store dedup; the cursor is only a status high-water
+mark, so losing it costs nothing.
 
 Planned (the ledger crates already support them; CLI wiring pending): `supervise` (wrap tasks with ledger events + retry), `review sessions`, `issues list`, `issues pending`, `rebuild`, `status`.
 

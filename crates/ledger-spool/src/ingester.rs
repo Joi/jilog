@@ -118,6 +118,11 @@ impl SpoolIngester {
     ///
     /// Only `*.json` files are considered; in particular the `*.json.tmp`
     /// siblings left by an interrupted atomic write are ignored.
+    /// Syncthing conflict artifacts (`*.sync-conflict-*.json`) are also
+    /// skipped (with a warning): they can never pass the filename/identity
+    /// check, and treating them as failures would make every ingest run
+    /// exit nonzero forever after a single sync hiccup. They stay in
+    /// `incoming/` for the operator to inspect and remove.
     pub fn ingest(&self, store: &SegmentStore) -> Result<IngestReport, SpoolError> {
         let incoming = self.incoming_dir();
         let processed = self.processed_dir();
@@ -140,6 +145,19 @@ impl SpoolIngester {
                 Ok(entry) => {
                     let path = entry.path();
                     if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                        // Syncthing conflict artifacts would fail the
+                        // identity check on EVERY run — a permanent red
+                        // health check for what is an operator cleanup
+                        // item, not a segment. Warn and leave them.
+                        let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                        if name.contains(".sync-conflict-") {
+                            tracing::warn!(
+                                file = %name,
+                                "ignoring Syncthing conflict artifact in incoming/ — \
+                                 inspect and remove it manually"
+                            );
+                            continue;
+                        }
                         files.push(path);
                     }
                 }
@@ -614,6 +632,39 @@ mod tests {
     }
 
     #[test]
+    fn test_ingest_skips_syncthing_conflict_artifacts() {
+        let dir = test_dir("ingest-sync-conflict");
+        let spool_root = dir.join("spool");
+        let ledger_root = dir.join("ledger");
+
+        let writer = SpoolWriter::new(&spool_root);
+        writer.write(&sealed_segment("jibotmac", 1)).unwrap();
+        // A Syncthing conflict artifact: valid segment JSON, but its name
+        // can never match its identity — must be skipped, not failed.
+        let conflict = spool_root
+            .join("incoming/jibotmac-000002.sync-conflict-20260819-070859-ABCDEFG.json");
+        std::fs::write(
+            &conflict,
+            serde_json::to_string_pretty(&sealed_segment("jibotmac", 2)).unwrap(),
+        )
+        .unwrap();
+
+        let store = SegmentStore::new(ZoneId::new("test"), &ledger_root);
+        let report = SpoolIngester::new(&spool_root).ingest(&store).unwrap();
+
+        assert_eq!(report.committed.len(), 1, "the real segment still ingests");
+        assert_eq!(
+            report.failed.len(),
+            0,
+            "a sync-conflict artifact must not redden every run: {:?}",
+            report.failed
+        );
+        assert!(conflict.exists(), "artifact is left in incoming/ for the operator");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_ingest_preexisting_conflicting_processed_copy_fails() {
         let dir = test_dir("ingest-processed-conflict");
         let spool_root = dir.join("spool");
@@ -658,6 +709,13 @@ mod tests {
     #[test]
     fn test_ingest_failed_processed_rename_is_reported_failed() {
         use std::os::unix::fs::PermissionsExt;
+
+        // Read-only permissions cannot induce failures as root (root
+        // bypasses permission checks) — skip instead of failing spuriously.
+        if ledger_core::test_support::running_as_root() {
+            eprintln!("skipping: running as root");
+            return;
+        }
 
         let dir = test_dir("ingest-ro-processed");
         let spool_root = dir.join("spool");

@@ -9,7 +9,7 @@ use jilog_review::{
     Reader, Tracker,
     readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource},
     trackers::{GithubTracker, KataTracker, NoneTracker},
-    util::expand_tilde,
+    util::{expand_tilde, expand_tilde_glob},
 };
 
 // ---------------------------------------------------------------------------
@@ -331,7 +331,12 @@ impl JilogConfig {
                             GenericSessionIdSource::ParentDir => SessionIdSource::ParentDir,
                             GenericSessionIdSource::FileStem => SessionIdSource::FileStem,
                         };
-                        Box::new(GenericReader::new(name, path, source))
+                        // Glob pattern, but `~` still means the home dir
+                        // like every other reader's `path`. The expanded
+                        // home is ESCAPED: `path` is spliced into a glob,
+                        // so metacharacters in $HOME must match literally.
+                        let pattern = expand_tilde_glob(path);
+                        Box::new(GenericReader::new(name, pattern, source))
                     }
                 }
             })
@@ -392,6 +397,51 @@ mod tests {
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap();
         assert!(matches!(cfg.readers[0], ReaderConfig::Pi { path: None }));
         assert_eq!(cfg.into_readers()[0].name(), "pi");
+    }
+
+    #[test]
+    fn generic_reader_expands_tilde_in_path() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Hermetic: a scratch dir under the real $HOME whose name is unique
+        // per (pid, nanos, counter), created with create_dir (NOT _all) so it
+        // MUST NOT pre-exist — we only ever remove a dir we just created, so a
+        // PID collision can't delete someone else's directory.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let scratch = format!(
+            ".jilog-test-generic-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = std::path::Path::new(&home).join(&scratch);
+        std::fs::create_dir(&dir).expect("unique scratch dir must not pre-exist");
+        // RAII cleanup: the name is unique per run, so a panic below would
+        // otherwise leak an unreclaimable directory into the real home.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Scratch(dir.clone());
+        std::fs::write(dir.join("s1.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "[[reader]]\ntype = \"generic\"\nname = \"hermes\"\npath = \"~/{}/*.jsonl\"\nsession_id_from = \"file_stem\"\n",
+            scratch
+        ))
+        .unwrap();
+        let readers = cfg.into_readers();
+        let handles = readers[0]
+            .discover({ use chrono::TimeZone; chrono::Utc.timestamp_opt(0, 0).single().unwrap() })
+            .unwrap();
+        assert_eq!(handles.len(), 1, "~ must expand for the generic reader's glob");
+        assert_eq!(handles[0].session_id, "s1");
     }
 
     #[test]
