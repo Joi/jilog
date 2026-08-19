@@ -114,7 +114,16 @@ pub fn run(cfg: &JilogConfig, args: &QueryArgs) -> anyhow::Result<()> {
             // query unavailable — report it, keep querying the rest,
             // and exit nonzero at the end.
             match refresh_local_index(&zone_id, &ledger_path, &db_path) {
-                Ok(db) => db,
+                Ok((db, listing_holes)) => {
+                    if listing_holes {
+                        // Segments hidden from the listing = events
+                        // silently absent from results below. Query
+                        // what IS indexed, but exit nonzero — same
+                        // policy as `spool ingest`.
+                        failed_zones.push(zone_id.clone());
+                    }
+                    db
+                }
                 Err(e) => {
                     eprintln!("query [{zone_id}]: index refresh failed: {e:#} — zone skipped");
                     failed_zones.push(zone_id);
@@ -146,22 +155,28 @@ pub fn run(cfg: &JilogConfig, args: &QueryArgs) -> anyhow::Result<()> {
 
     if !failed_zones.is_empty() {
         anyhow::bail!(
-            "index refresh failed for zone(s) {} — their events are missing above (see stderr)",
+            "index refresh failed or was incomplete for zone(s) {} — some of their events \
+             are missing above (see stderr)",
             failed_zones.join(", ")
         );
     }
     Ok(())
 }
 
-/// Build/refresh a mirror zone's LOCAL index and return it opened.
+/// Build/refresh a mirror zone's LOCAL index and return it opened,
+/// plus whether the store listing had holes (unreadable entries or
+/// unparseable names — segments silently absent from results).
 /// Per-segment corruption is reported on stderr but does not fail the
 /// refresh (those segments are simply not indexed yet); only being
-/// unable to open, list, or write the index at all is an error.
+/// unable to open the index or read the segments directory at all is
+/// an error. Listing holes don't fail the refresh either — the caller
+/// still queries what IS indexed — but it marks the zone failed so the
+/// run exits nonzero, consistent with `spool ingest`.
 fn refresh_local_index(
     zone_id: &str,
     ledger_path: &std::path::Path,
     db_path: &std::path::Path,
-) -> Result<LedgerDb> {
+) -> Result<(LedgerDb, bool)> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create index dir {}", parent.display()))?;
@@ -177,7 +192,7 @@ fn refresh_local_index(
     for (src, seq, err) in &report.failed {
         eprintln!("query [{zone_id}]: skipping corrupt segment {src}-{seq:06}: {err}");
     }
-    Ok(db)
+    Ok((db, !report.listing_errors.is_empty()))
 }
 
 // ---------------------------------------------------------------------------

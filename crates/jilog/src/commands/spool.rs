@@ -677,19 +677,8 @@ mod tests {
     use ledger_core::{Event, EventClass, PayloadTier};
     use uuid::Uuid;
 
-    /// chmod-based failure injection is inert as root (root bypasses
-    /// permission checks), so those tests must skip instead of failing
-    /// spuriously in root-run CI containers.
     #[cfg(unix)]
-    fn running_as_root() -> bool {
-        std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim() == "0")
-            .unwrap_or(false)
-    }
+    use ledger_core::test_support::running_as_root;
 
     fn sealed_segment(source: &str, seq: u64, n_events: usize) -> Segment {
         let mut seg = Segment::new(source, seq);

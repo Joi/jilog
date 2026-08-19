@@ -712,14 +712,7 @@ mod tests {
 
         // Read-only permissions cannot induce failures as root (root
         // bypasses permission checks) — skip instead of failing spuriously.
-        let is_root = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim() == "0")
-            .unwrap_or(false);
-        if is_root {
+        if ledger_core::test_support::running_as_root() {
             eprintln!("skipping: running as root");
             return;
         }

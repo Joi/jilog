@@ -15,6 +15,8 @@ pub mod segment;
 pub mod store;
 pub mod zone;
 pub mod error;
+#[doc(hidden)]
+pub mod test_support;
 
 pub use event::{Event, EventClass, PayloadTier};
 pub use segment::{PublishOutcome, Segment};
