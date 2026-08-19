@@ -48,6 +48,11 @@ pub struct IndexRefreshReport {
     /// Segments skipped as unreadable or corrupt: `(source, seq, error)`.
     /// They stay un-indexed and are retried on the next refresh.
     pub failed: Vec<(String, u64, String)>,
+    /// Directory-listing problems (unreadable entries, unparseable .json
+    /// names): not attributable to any segment identity, so they are kept
+    /// apart from `failed` — callers must not render them with a
+    /// `{source}-{seq}` template.
+    pub listing_errors: Vec<String>,
 }
 
 impl LedgerDb {
@@ -289,7 +294,9 @@ impl LedgerDb {
     /// unreadable or corrupt segments are reported in
     /// [`IndexRefreshReport::failed`] and SKIPPED — they neither poison
     /// the index nor block later valid segments, and they are retried
-    /// on the next refresh (nothing marks them ingested).
+    /// on the next refresh (nothing marks them ingested). Directory
+    /// listing problems, which have no segment identity, are reported in
+    /// [`IndexRefreshReport::listing_errors`].
     pub fn refresh_from_store(
         &mut self,
         store: &SegmentStore,
@@ -299,9 +306,7 @@ impl LedgerDb {
         // .json names) instead of inheriting list_segments' silent skip
         // — a hidden segment is a hole in the index.
         let (entries, listing_errors) = store.list_segments_with_errors()?;
-        for err in listing_errors {
-            report.failed.push(("(listing)".to_string(), 0, err));
-        }
+        report.listing_errors = listing_errors;
         for (source, seq, path) in entries {
             // SQLite INTEGER is signed 64-bit: a seq above i64::MAX is
             // not representable — reject before it ever reaches a SQL
@@ -858,11 +863,17 @@ mod tests {
         let report = db.refresh_from_store(&store).unwrap();
 
         assert_eq!(report.segments_indexed, 1, "the good segment still indexes");
-        assert_eq!(report.failed.len(), 1, "listing error must be reported: {:?}", report.failed);
+        assert!(report.failed.is_empty(), "listing errors are not per-segment failures");
+        assert_eq!(
+            report.listing_errors.len(),
+            1,
+            "listing error must be reported: {:?}",
+            report.listing_errors
+        );
         assert!(
-            report.failed[0].2.contains("garbage.json"),
+            report.listing_errors[0].contains("garbage.json"),
             "unexpected error: {:?}",
-            report.failed[0]
+            report.listing_errors[0]
         );
         assert_eq!(db.event_count().unwrap(), 1);
 

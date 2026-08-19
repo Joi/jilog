@@ -19,6 +19,25 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Expand a leading `~/` in a GLOB PATTERN. Unlike [`expand_tilde`] the
+/// expanded home prefix is escaped for `glob::glob`, so a home directory
+/// containing glob metacharacters (`[`, `]`, `*`, `?`) matches literally
+/// instead of being interpreted (or erroring) mid-pattern. The rest of
+/// the pattern keeps its glob meaning.
+pub fn expand_tilde_glob(pattern: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) => expand_tilde_glob_in(pattern, &home),
+        Err(_) => pattern.to_string(),
+    }
+}
+
+fn expand_tilde_glob_in(pattern: &str, home: &str) -> String {
+    match pattern.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", glob::Pattern::escape(home), rest),
+        None => pattern.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // truncate_chars — port from opsctl/src/review_nightly.rs:407-412
 // ---------------------------------------------------------------------------
@@ -143,6 +162,22 @@ mod tests {
     fn expand_tilde_no_tilde() {
         let expanded = expand_tilde("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_glob_escapes_metacharacters_in_home() {
+        // A home dir with glob metacharacters must match itself literally
+        // while the pattern remainder keeps its glob meaning.
+        let expanded = expand_tilde_glob_in("~/x/*.jsonl", "/Users/we[i]rd*");
+        assert_eq!(
+            expanded,
+            format!("{}/x/*.jsonl", glob::Pattern::escape("/Users/we[i]rd*"))
+        );
+        let pat = glob::Pattern::new(&expanded).unwrap();
+        assert!(pat.matches("/Users/we[i]rd*/x/session.jsonl"));
+        assert!(!pat.matches("/Users/weird/x/session.jsonl"));
+        // Non-tilde patterns pass through untouched.
+        assert_eq!(expand_tilde_glob_in("/var/log/*.jsonl", "/home/x"), "/var/log/*.jsonl");
     }
 
     #[test]

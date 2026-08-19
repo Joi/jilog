@@ -403,8 +403,10 @@ a SQLite file must never live inside a synced tree, where a background
 sync of a mid-transaction db ships corruption. Each consumer builds its
 own local index: `jilog query` refreshes it lazily on mirror zones, and
 on the authority `spool ingest` refreshes it right after committing.
-Emit is cursor-tracked and triple-idempotent (cursor, spool
-content-compare, store dedup) — losing state is slow, never wrong.
+Emit rescans every own-host segment on every run (O(segments), a read
+per segment) and is idempotent through two layers — spool
+content-compare and store dedup; the cursor is only a status high-water
+mark, so losing it costs nothing.
 
 Planned (the ledger crates already support them; CLI wiring pending): `supervise` (wrap tasks with ledger events + retry), `review sessions`, `issues list`, `issues pending`, `rebuild`, `status`.
 

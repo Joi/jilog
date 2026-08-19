@@ -104,24 +104,23 @@ pub fn run(cfg: &JilogConfig, args: &QueryArgs) -> anyhow::Result<()> {
     }
 
     let mut all_results: Vec<(String, Vec<Event>)> = Vec::new();
+    let mut failed_zones: Vec<String> = Vec::new();
 
     for (zone_id, ledger_path, db_path, auto_refresh) in targets {
         let db = if auto_refresh {
             // Build/refresh this consumer's local index of the synced
-            // store before querying it.
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create index dir {}", parent.display()))?;
+            // store before querying it. Best-effort per zone: one
+            // broken consumer index must not make the whole all-zones
+            // query unavailable — report it, keep querying the rest,
+            // and exit nonzero at the end.
+            match refresh_local_index(&zone_id, &ledger_path, &db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("query [{zone_id}]: index refresh failed: {e:#} — zone skipped");
+                    failed_zones.push(zone_id);
+                    continue;
+                }
             }
-            let mut db = LedgerDb::open(&db_path)
-                .with_context(|| format!("open index {}", db_path.display()))?;
-            let report = db
-                .refresh_from_store(&SegmentStore::new(ZoneId::new(&zone_id), &ledger_path))
-                .with_context(|| format!("refresh index for zone {zone_id}"))?;
-            for (src, seq, err) in &report.failed {
-                eprintln!("query [{zone_id}]: skipping corrupt segment {src}-{seq:06}: {err}");
-            }
-            db
         } else {
             if !db_path.exists() {
                 continue;
@@ -145,7 +144,40 @@ pub fn run(cfg: &JilogConfig, args: &QueryArgs) -> anyhow::Result<()> {
         _ => emit_text(&all_results, &args.subsystem, &args.since),
     }
 
+    if !failed_zones.is_empty() {
+        anyhow::bail!(
+            "index refresh failed for zone(s) {} — their events are missing above (see stderr)",
+            failed_zones.join(", ")
+        );
+    }
     Ok(())
+}
+
+/// Build/refresh a mirror zone's LOCAL index and return it opened.
+/// Per-segment corruption is reported on stderr but does not fail the
+/// refresh (those segments are simply not indexed yet); only being
+/// unable to open, list, or write the index at all is an error.
+fn refresh_local_index(
+    zone_id: &str,
+    ledger_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<LedgerDb> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create index dir {}", parent.display()))?;
+    }
+    let mut db = LedgerDb::open(db_path)
+        .with_context(|| format!("open index {}", db_path.display()))?;
+    let report = db
+        .refresh_from_store(&SegmentStore::new(ZoneId::new(zone_id), ledger_path))
+        .with_context(|| format!("refresh index for zone {zone_id}"))?;
+    for err in &report.listing_errors {
+        eprintln!("query [{zone_id}]: could not list some segments: {err}");
+    }
+    for (src, seq, err) in &report.failed {
+        eprintln!("query [{zone_id}]: skipping corrupt segment {src}-{seq:06}: {err}");
+    }
+    Ok(db)
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +616,81 @@ mod tests {
             !fleet.join("index.sqlite").exists(),
             "no sqlite inside the synced fleet tree"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_run_broken_mirror_index_skips_zone_but_exits_nonzero() {
+        use crate::config::{JilogConfig, ZoneConfig};
+
+        let dir = test_dir("mirror_broken_index");
+        // A healthy mirror zone...
+        let fleet = dir.join("fleet");
+        let store = SegmentStore::new(ZoneId::new("good-zone"), &fleet);
+        let mut seg = Segment::new("hostA", 1);
+        seg.append(Event {
+            event_id: Uuid::now_v7(),
+            zone: "good-zone".to_string(),
+            source: "hostA".to_string(),
+            source_seq: 1,
+            timestamp: Utc::now(),
+            correlation_id: None,
+            causation_id: None,
+            actor_ref: None,
+            object_ref: Some("subsystem:opsctl".to_string()),
+            event_class: EventClass::Health,
+            payload_tier: PayloadTier::MetadataOnly,
+            payload: None,
+        });
+        seg.seal().unwrap();
+        store.write_segment(&seg).unwrap();
+        let good_index = dir.join("local-index/good.sqlite");
+
+        // ...and a mirror zone whose index can never be created: its
+        // index_path sits under a regular FILE, so create_dir_all fails
+        // regardless of uid.
+        std::fs::write(dir.join("blocker"), "not a directory").unwrap();
+        let bad_index = dir.join("blocker/bad.sqlite");
+
+        let zone = |id: &str, ledger: &std::path::Path, index: &std::path::Path| ZoneConfig {
+            id: id.into(),
+            ledger_path: ledger.display().to_string(),
+            spool: false,
+            spool_path: None,
+            fleet_store_path: None,
+            index_path: Some(index.display().to_string()),
+        };
+        let cfg = JilogConfig {
+            zones: vec![
+                zone("bad-zone", &dir.join("missing-ledger"), &bad_index),
+                zone("good-zone", &fleet, &good_index),
+            ],
+            ..Default::default()
+        };
+
+        let err = run(
+            &cfg,
+            &QueryArgs {
+                since: "7d".into(),
+                subsystem: vec![],
+                class: None,
+                zone: None,
+                ledger_path: None,
+                limit: 100,
+                format: "json".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bad-zone"),
+            "error must name the broken zone: {err}"
+        );
+        // The healthy zone was still queried (best-effort): its local
+        // index exists and holds the event.
+        assert!(good_index.exists(), "good zone must still refresh its index");
+        let db = LedgerDb::open(&good_index).unwrap();
+        assert_eq!(db.event_count().unwrap(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -316,6 +316,15 @@ impl Segment {
     /// skip), different -> an `IntegrityFailure` error, with BOTH files
     /// left intact for the operator. Durability is as documented on
     /// [`Segment::write_to_file`] (same tmp-fsync + parent-dir fsync).
+    ///
+    /// # Filesystem requirement: hard links
+    ///
+    /// The no-clobber guarantee comes from `hard_link`, so the target
+    /// filesystem MUST support hard links. exFAT/FAT volumes and some
+    /// SMB/NFS/FUSE mounts do not; there, every publish — including
+    /// plain `SegmentStore::write_segment` commits, which route through
+    /// here — fails with an error naming this requirement. Ledgers must
+    /// live on a hard-link-capable filesystem (APFS, HFS+, ext4, ...).
     pub fn publish_new(&self, path: impl AsRef<Path>) -> Result<PublishOutcome, LedgerError> {
         let path = Self::prepare_target(path.as_ref())?;
         let tmp = self.write_tmp_synced(&path)?;
@@ -358,7 +367,18 @@ impl Segment {
             }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
-                Err(e.into())
+                // A bare EPERM/ENOTSUP here is undiagnosable; name the
+                // hard-link requirement (exFAT/FAT and some network
+                // mounts lack it) instead of passing it through raw.
+                Err(LedgerError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "no-clobber publish of {} failed at hard_link: {e} — publishing \
+                         requires a filesystem with hard-link support (exFAT/FAT and \
+                         some SMB/NFS/FUSE mounts do not have it)",
+                        path.display()
+                    ),
+                )))
             }
         }
     }

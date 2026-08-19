@@ -5,7 +5,9 @@
 //!
 //! - `spool emit`   (every machine): copy THIS host's new sealed segments
 //!   from the local zone ledger into the spool's `incoming/` directory.
-//!   Cursor-tracked, idempotent, own-host-only.
+//!   Idempotent (spool content-compare + store dedup), own-host-only;
+//!   every run rescans ALL own-host segments (see "Emit correctness
+//!   model" below for the O(segments) cost).
 //! - `spool ingest` (authority machine only): validate, deduplicate, and
 //!   commit everything in `incoming/` into the authoritative FLEET store,
 //!   moving ingested segments to `processed/` (audit trail).
@@ -34,10 +36,12 @@
 //! # Rust concepts in this file
 //!
 //! - **Cursor files as plain JSON**: the emit cursor is one small local
-//!   file (`~/.jilog/spool-cursors/<zone>-<host>.json`). Losing it is
-//!   harmless: emit also skips segments already present in `incoming/`
-//!   or `processed/`, and the ingester deduplicates against the store —
-//!   three independent layers of idempotency instead of one clever one.
+//!   file (`~/.jilog/spool-cursors/<zone>/<host>.json`). It is a
+//!   recorded high-water mark for `spool status`, NOT an idempotency or
+//!   correctness mechanism: idempotency comes from the spool
+//!   content-compare plus the ingester's store dedup, and every run
+//!   rescans all own-host segments regardless of the cursor. Losing it
+//!   costs nothing but the marker.
 //! - **Shelling out for the hostname**: same choice opsctl made — the
 //!   `hostname -s` child process is simpler than a platform crate, and
 //!   the source names must MATCH opsctl's segment sources exactly.
@@ -135,11 +139,12 @@ pub struct StatusArgs {
 struct SpoolZone {
     id: String,
     ledger_path: PathBuf,
-    spool_root: PathBuf,
+    /// None for a read-only mirror zone (`ZoneConfig::spool` = false,
+    /// e.g. the synced fleet store): such a zone never has a spool of
+    /// its own, so no root is derived (and a root-level `ledger_path`
+    /// on it is not an error).
+    spool_root: Option<PathBuf>,
     fleet_store_path: Option<PathBuf>,
-    /// From `ZoneConfig::spool` — false marks a read-only mirror zone
-    /// (e.g. the synced fleet store) that emit/status must skip.
-    spool_enabled: bool,
 }
 
 fn resolve_zones(cfg: &JilogConfig, only: &Option<String>) -> Result<Vec<SpoolZone>> {
@@ -153,20 +158,23 @@ fn resolve_zones(cfg: &JilogConfig, only: &Option<String>) -> Result<Vec<SpoolZo
         let ledger_path = expand_tilde(&z.ledger_path);
         // Default spool location: a `spool/<zone-id>` sibling of the zone
         // ledger directory — inside the same synced tree, so the transport
-        // comes free.
-        let spool_root = match &z.spool_path {
-            Some(p) => expand_tilde(p),
-            None => ledger_path
-                .parent()
-                .map(|parent| parent.join("spool").join(&z.id))
-                .context("zone ledger_path has no parent directory")?,
+        // comes free. Mirror zones (spool = false) get none.
+        let spool_root = if z.spool {
+            Some(match &z.spool_path {
+                Some(p) => expand_tilde(p),
+                None => ledger_path
+                    .parent()
+                    .map(|parent| parent.join("spool").join(&z.id))
+                    .context("zone ledger_path has no parent directory")?,
+            })
+        } else {
+            None
         };
         out.push(SpoolZone {
             id: z.id.clone(),
             ledger_path,
             spool_root,
             fleet_store_path: z.fleet_store_path.as_deref().map(expand_tilde),
-            spool_enabled: z.spool,
         });
     }
     if out.is_empty() {
@@ -204,7 +212,11 @@ struct EmitCursor {
 }
 
 fn cursor_path(dir: &Path, zone: &str, source: &str) -> PathBuf {
-    dir.join(format!("{zone}-{source}.json"))
+    // `{dir}/{zone}/{source}.json` — a subdirectory per zone, NOT a flat
+    // "{zone}-{source}.json" name: source names may themselves contain
+    // `-`, so the flat form is ambiguous (("public-ops", "x") and
+    // ("public", "ops-x") would share a cursor file).
+    dir.join(zone).join(format!("{source}.json"))
 }
 
 fn load_cursor(path: &Path) -> EmitCursor {
@@ -249,15 +261,17 @@ pub fn run_emit(cfg: &JilogConfig, args: EmitArgs) -> Result<()> {
 
     let mut had_failures = false;
     for zone in resolve_zones(cfg, &args.zone)? {
-        if !zone.spool_enabled {
+        let Some(spool_root) = zone.spool_root.as_deref() else {
             // Read-only mirror zone (spool = false): never re-emit an
-            // already-replicated store into an orphan spool.
+            // already-replicated store into an orphan spool. Say so —
+            // a silent skip is indistinguishable from "nothing new".
+            println!("spool emit [{}]: spool disabled — skipped", zone.id);
             continue;
-        }
+        };
         let store = SegmentStore::new(ZoneId::new(&zone.id), &zone.ledger_path);
-        let writer = SpoolWriter::new(&zone.spool_root);
-        let incoming_dir = zone.spool_root.join("incoming");
-        let processed_dir = zone.spool_root.join("processed");
+        let writer = SpoolWriter::new(spool_root);
+        let incoming_dir = spool_root.join("incoming");
+        let processed_dir = spool_root.join("processed");
         let cpath = cursor_path(&cursor_dir, &zone.id, &source);
         let mut cursor = load_cursor(&cpath);
 
@@ -449,6 +463,16 @@ pub fn run_ingest(cfg: &JilogConfig, args: IngestArgs) -> Result<()> {
     let mut ran_any = false;
     let mut had_failures = false;
     for zone in resolve_zones(cfg, &args.zone)? {
+        let Some(spool_root) = zone.spool_root.as_deref() else {
+            // A mirror zone is CORRECT configuration on the authority
+            // (it is how the fleet store gets queried), so it must not
+            // trip the "producer host?" hint below.
+            println!(
+                "spool ingest [{}]: mirror zone (spool = false) — not an ingest target",
+                zone.id
+            );
+            continue;
+        };
         let Some(fleet_path) = &zone.fleet_store_path else {
             // Producers legitimately have no fleet_store_path; only the
             // authority configures one. Skipping silently would hide a
@@ -464,9 +488,9 @@ pub fn run_ingest(cfg: &JilogConfig, args: IngestArgs) -> Result<()> {
         store
             .ensure_dirs()
             .with_context(|| format!("create fleet store at {}", fleet_path.display()))?;
-        let report = SpoolIngester::new(&zone.spool_root)
+        let report = SpoolIngester::new(spool_root)
             .ingest(&store)
-            .with_context(|| format!("ingest spool {}", zone.spool_root.display()))?;
+            .with_context(|| format!("ingest spool {}", spool_root.display()))?;
         print!("spool ingest [{}]: ", zone.id);
         report.print_summary();
         if !report.failed.is_empty() {
@@ -500,6 +524,13 @@ pub fn run_ingest(cfg: &JilogConfig, args: IngestArgs) -> Result<()> {
                         refresh.events_indexed,
                         db_path.display()
                     );
+                }
+                for err in &refresh.listing_errors {
+                    eprintln!(
+                        "spool ingest [{}]: index refresh could not list some segments: {err}",
+                        zone.id
+                    );
+                    had_failures = true;
                 }
                 for (src, seq, err) in &refresh.failed {
                     eprintln!(
@@ -547,16 +578,16 @@ pub fn run_status(cfg: &JilogConfig, args: StatusArgs) -> Result<()> {
     // printing every zone.
     let mut unhealthy: Vec<String> = Vec::new();
     for zone in resolve_zones(cfg, &args.zone)? {
-        if !zone.spool_enabled {
+        let Some(spool_root) = zone.spool_root.as_deref() else {
             println!("spool status [{}]: spool disabled", zone.id);
             continue;
-        }
+        };
         // A missing directory is an honestly-empty spool ("0"); any other
         // read_dir error must not masquerade as zero, and per-entry
         // errors are counted rather than silently discarded. Returns the
         // display string plus whether the count is trustworthy.
         let count = |d: &str| -> (String, bool) {
-            match fs::read_dir(zone.spool_root.join(d)) {
+            match fs::read_dir(spool_root.join(d)) {
                 Ok(rd) => {
                     let mut n = 0usize;
                     let mut bad = 0usize;
@@ -645,6 +676,20 @@ mod tests {
     use chrono::Utc;
     use ledger_core::{Event, EventClass, PayloadTier};
     use uuid::Uuid;
+
+    /// chmod-based failure injection is inert as root (root bypasses
+    /// permission checks), so those tests must skip instead of failing
+    /// spuriously in root-run CI containers.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    }
 
     fn sealed_segment(source: &str, seq: u64, n_events: usize) -> Segment {
         let mut seg = Segment::new(source, seq);
@@ -1065,6 +1110,10 @@ mod tests {
     fn emit_write_failure_is_recorded_and_batch_continues() {
         use std::os::unix::fs::PermissionsExt;
 
+        if running_as_root() {
+            eprintln!("skipping: read-only permissions cannot induce failures as root");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_for(tmp.path(), None);
         let local = SegmentStore::new(ZoneId::new("test-zone"), tmp.path().join("ledger"));
@@ -1219,6 +1268,10 @@ mod tests {
     fn status_unreadable_spool_dir_exits_nonzero() {
         use std::os::unix::fs::PermissionsExt;
 
+        if running_as_root() {
+            eprintln!("skipping: 0o000 permissions cannot make a dir unreadable as root");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_for(tmp.path(), None);
         let incoming = tmp.path().join("spool/incoming");
@@ -1246,8 +1299,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_for(tmp.path(), None);
         let cursors = tmp.path().join("cursors");
-        fs::create_dir_all(&cursors).unwrap();
-        fs::write(cursor_path(&cursors, "test-zone", "hostA"), "not json {").unwrap();
+        let cpath = cursor_path(&cursors, "test-zone", "hostA");
+        fs::create_dir_all(cpath.parent().unwrap()).unwrap();
+        fs::write(&cpath, "not json {").unwrap();
 
         let err = run_status(
             &cfg,
@@ -1259,6 +1313,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("spool status found problems"), "{err}");
+    }
+
+    #[test]
+    fn cursor_path_is_unambiguous_for_dashed_names() {
+        // Zone ids are unvalidated and source names may contain '-': a
+        // flat "{zone}-{source}.json" name would collide these two pairs.
+        let dir = Path::new("/tmp/cursors");
+        assert_ne!(
+            cursor_path(dir, "public-ops", "x"),
+            cursor_path(dir, "public", "ops-x"),
+        );
     }
 
     #[test]

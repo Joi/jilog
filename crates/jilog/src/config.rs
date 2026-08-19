@@ -9,7 +9,7 @@ use jilog_review::{
     Reader, Tracker,
     readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource},
     trackers::{GithubTracker, KataTracker, NoneTracker},
-    util::expand_tilde,
+    util::{expand_tilde, expand_tilde_glob},
 };
 
 // ---------------------------------------------------------------------------
@@ -332,8 +332,10 @@ impl JilogConfig {
                             GenericSessionIdSource::FileStem => SessionIdSource::FileStem,
                         };
                         // Glob pattern, but `~` still means the home dir
-                        // like every other reader's `path`.
-                        let pattern = expand_tilde(path).to_string_lossy().into_owned();
+                        // like every other reader's `path`. The expanded
+                        // home is ESCAPED: `path` is spliced into a glob,
+                        // so metacharacters in $HOME must match literally.
+                        let pattern = expand_tilde_glob(path);
                         Box::new(GenericReader::new(name, pattern, source))
                     }
                 }
@@ -418,6 +420,15 @@ mod tests {
         );
         let dir = std::path::Path::new(&home).join(&scratch);
         std::fs::create_dir(&dir).expect("unique scratch dir must not pre-exist");
+        // RAII cleanup: the name is unique per run, so a panic below would
+        // otherwise leak an unreclaimable directory into the real home.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Scratch(dir.clone());
         std::fs::write(dir.join("s1.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
 
         let cfg = JilogConfig::from_toml_str(&format!(
@@ -429,7 +440,6 @@ mod tests {
         let handles = readers[0]
             .discover({ use chrono::TimeZone; chrono::Utc.timestamp_opt(0, 0).single().unwrap() })
             .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(handles.len(), 1, "~ must expand for the generic reader's glob");
         assert_eq!(handles[0].session_id, "s1");
     }

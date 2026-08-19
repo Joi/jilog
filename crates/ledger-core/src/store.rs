@@ -100,6 +100,10 @@ impl SegmentStore {
     /// The segment MUST be sealed before writing. If checksum is 0,
     /// this returns an error.
     ///
+    /// Commits publish via [`Segment::publish_new`], so the store
+    /// directory must live on a filesystem with hard-link support (see
+    /// that method's "Filesystem requirement" note).
+    ///
     /// # Rust note: ownership vs borrowing
     ///
     /// This takes `&self` (immutable borrow of the store) and `&Segment`
