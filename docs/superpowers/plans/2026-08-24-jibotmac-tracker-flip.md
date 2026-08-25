@@ -538,7 +538,11 @@ project = "jilog"
   the local label; digest/ledger cleanup per the committed README's
   rollback block (the `find -newer` deploy-snapshot form with its anchor
   guard — do NOT author a bare `trash` glob here; the README is
-  authoritative), plus `rm -f` of the canary plist if one survived.
+  authoritative), plus canary teardown per the README's rollback block
+  (tolerated `launchctl bootout` of `com.jibot.jilog-canary-6rzb`, `rm -f`
+  its plist, AND trash/remove `~/.jilog/canary-6rzb` — the README is
+  authoritative there too; an under-specified regeneration would leave the
+  label loaded and the fixture dir populated).
 - [ ] **Step 10: Local validation:**
   - `bash -n docs/ops/jibotmac-tracker-split/jilog-nightly-tracked.sh` — 0.
   - `plutil -lint docs/ops/jibotmac-tracker-split/*.plist
@@ -893,7 +897,13 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && rm -rf
   ~/.jilog/canary-6rzb'` — the RunAtLoad+token canary plist must NEVER
   survive a failed attempt (it would re-fire at next login), and the retry
-  of Step 2 starts from an EMPTY canary dir with a fresh RUNID. This is mandatory even for pre-bootstrap
+  of Step 2 starts from an EMPTY canary dir with a fresh RUNID. ALSO check
+  for kata-side residue before retrying: a post-bootstrap failure may have
+  already filed the old-RUNID canary issue; `kata --project jilog --json
+  list --status open`, and close any issue whose title contains `canary
+  6rzb run <oldRUNID>` (Step 4's `close --done --test` form) — the new
+  RUNID's precondition and verification cannot see it, and it would
+  otherwise sit open in fleet-visible kata forever. This is mandatory even for pre-bootstrap
   failures: a stale `canary-<oldRUNID>.jsonl` left in `fixture/` would make
   the eventual run file a SECOND issue under the old RUNID that nothing ever
   closes.

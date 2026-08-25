@@ -103,12 +103,15 @@ ssh jibotmac 'tail -3 ~/.jilog/logs/nightly-tracked.run.log; launchctl list | gr
 
 ```bash
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-nightly-tracked 2>/dev/null; true'
-ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-canary-6rzb 2>/dev/null; rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist; rm -rf ~/.jilog/canary-6rzb'
+ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-canary-6rzb 2>/dev/null; rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist; trash ~/.jilog/canary-6rzb 2>/dev/null || rm -rf ~/.jilog/canary-6rzb'
 ssh jibotmac 'rm -f ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/scripts/jilog-nightly-tracked.sh ~/.jilog-tracked.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/jilog.toml.orig ~/.jilog.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist ~/Library/LaunchAgents/'
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.amplifier.nightly-learning 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.amplifier.nightly-learning.plist'
-ssh jibotmac 'test -f ~/.jilog/backup-6rzb/launchctl-list-before.txt || { echo "ROLLBACK-ABORT: deploy-time anchor missing - do NOT delete digests unanchored; enumerate by hand"; exit 1; }; find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -newer ~/.jilog/backup-6rzb/launchctl-list-before.txt -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
+ssh jibotmac 'rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt; test -f ~/.jilog/backup-6rzb/launchctl-list-before.txt || { echo "ROLLBACK-ABORT: deploy-time anchor missing - do NOT delete digests unanchored; enumerate by hand"; exit 1; }; find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -newer ~/.jilog/backup-6rzb/launchctl-list-before.txt -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +'
+# The processed-ledger removal runs BEFORE the anchor guard on purpose: it
+# is always safe, and a missing anchor must not silently leave it behind
+# (a re-deploy would then treat every session as already processed).
 # NOTE: deletes ONLY digest files newer than the deploy-time snapshot
 # (~/.jilog/backup-6rzb/launchctl-list-before.txt, written before the first
 # tracked run) — i.e. only what THIS deployment produced. The directory is
