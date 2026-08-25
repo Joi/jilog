@@ -125,6 +125,11 @@ ssh jibotmac 'rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt; test -f ~
 # the fleet-standard shared dir and is never deleted; anything predating
 # the deploy is untouched. find (not a glob) on purpose: an unmatched glob
 # aborts the remote zsh login shell; find with zero matches is a no-op.
+# Failed canary attempts may leave ~/.jilog/canary-6rzb.failed-<ts> dirs
+# (deliberate operator-owned evidence: the plan's Task 5 failure path
+# renames instead of deleting when trash is unavailable). Inspect and
+# trash them by hand; straggler check:
+#   ssh jibotmac 'find ~/.jilog -maxdepth 1 -name "canary-6rzb.failed-*"'
 ```
 
 Disclosure is prevented, not rolled back: issues already filed to kata stay
