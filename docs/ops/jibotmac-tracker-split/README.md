@@ -40,19 +40,25 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
   retries. The kata output (stdout+stderr — `--json` errors land on stdout)
   is appended to the run log for diagnosis.
 - `2` — jilog ran clean, but its output contained a REAL `tracker.create
-  failed` / `tracker.list_open failed` (warn-only in jilog). The known
-  jilog#fx51 create-parse pattern (``missing field `number` `` — the issue IS
-  created server-side) is filtered out of this signal and only counted in
-  the run log, so exit 2 always means genuine tracker trouble.
+  failed` / `tracker.list_open failed` (warn-only in jilog), EXCLUDING the
+  known fx51 pattern — so exit 2 always means genuine tracker trouble.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
   process group was killed.
 - `4` — jilog itself exited nonzero (real rc in the run log). jilog's own
   exit codes are never passed through — its `1` (any anyhow error) and `2`
   (clap argument error) would collide with the wrapper's contract above.
-- `0` + run log ending `OK` is a healthy night (possibly with an fx51
-  known-defect count line).
+- `5` — ONLY the known jilog#fx51 create-parse pattern occurred
+  (``missing field `number` `` — the issues ARE created server-side, but the
+  digest lacks backlinks). Degraded-but-known: nonzero so the night never
+  reads as healthy, distinct from `2` so it never masquerades as real
+  tracker trouble. Goes away when fx51's fix + binary bump land.
+- `0` + run log ending `OK` is a genuinely clean night.
+- `143` — the wrapper was terminated (e.g. `launchctl bootout` mid-run); a
+  TERM/INT/HUP trap forwards the signal to the active kata/jilog process
+  group so children never outlive the label.
 
-The run log self-truncates to its last 5000 lines at each start.
+Malformed (non-integer) timeout overrides fall back to the defaults. The
+run log self-truncates to its last 5000 lines at each start.
 
 Run log: `~/.jilog/logs/nightly-tracked.run.log` (wrapper) plus launchd's
 `nightly-tracked.{stdout,stderr}.log`.
@@ -92,9 +98,11 @@ ssh jibotmac 'rm ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/jilog.toml.orig ~/.jilog.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist ~/Library/LaunchAgents/'
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.amplifier.nightly-learning 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.amplifier.nightly-learning.plist'
-ssh jibotmac 'trash ~/.amplifier/health/learning-digest-*.md ~/.jilog/telemetry/processed-sessions-tracked.txt 2>/dev/null || rm -f ~/.amplifier/health/learning-digest-*.md ~/.jilog/telemetry/processed-sessions-tracked.txt'
+ssh jibotmac 'find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
 # NOTE: only the digest FILES — ~/.amplifier/health is the fleet-standard
 # shared dir and is not owned by this change; never delete the directory.
+# find (not a glob) on purpose: an unmatched glob aborts the remote zsh
+# login shell before any command runs; find with zero matches is a no-op.
 ```
 
 Disclosure is prevented, not rolled back: issues already filed to kata stay

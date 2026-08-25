@@ -12,10 +12,11 @@
 #      output (tracing writes to STDOUT); if the captured output contains
 #      them, exit 2 so launchctl shows the failure.
 # Exit codes: 1 preflight failed or timed out (jilog NOT run) / 2 REAL
-# tracker errors in output (the known jilog#fx51 create-parse pattern is
-# filtered and only counted in the log) / 3 jilog timeout / 4 jilog itself
-# exited nonzero (its rc is in the run log; jilog's own 1/2 would collide
-# with the wrapper's contract, so it is never passed through).
+# tracker errors in output / 3 jilog timeout / 4 jilog itself exited
+# nonzero (its rc is in the run log; jilog's own 1/2 would collide with the
+# wrapper's contract, so it is never passed through) / 5 ONLY the known
+# jilog#fx51 create-parse pattern occurred (issues filed server-side,
+# digest lacks backlinks — degraded-but-known, distinct from real trouble).
 # Extra args (--create-issues once armed) pass through from the plist via
 # "$@". Env overrides exist for the canary + harness tests only.
 set -u
@@ -29,6 +30,31 @@ DIGEST_DIR="${JILOG_TRACKED_DIGEST_DIR:-/Users/jibot/.amplifier/health}"
 PROCESSED="${JILOG_TRACKED_PROCESSED_FILE:-/Users/jibot/.jilog/telemetry/processed-sessions-tracked.txt}"
 LOG_DIR="${JILOG_TRACKED_LOG_DIR:-/Users/jibot/.jilog/logs}"
 RUN_LOG="$LOG_DIR/nightly-tracked.run.log"
+
+# Malformed overrides must never disable the hard caps (bash 3.2's -ge on a
+# non-integer errors and returns false, which would loop forever).
+case "$TIMEOUT_SECS" in
+    ''|*[!0-9]*) TIMEOUT_SECS=1800 ;;
+esac
+case "$PREFLIGHT_TIMEOUT_SECS" in
+    ''|*[!0-9]*) PREFLIGHT_TIMEOUT_SECS=60 ;;
+esac
+
+# Forward termination to the active child process group: launchd's bootout
+# only signals THIS process group, and kata/jilog run in their own (that is
+# what makes the timeout kills safe), so without a trap they would outlive
+# the label and keep writing processed state.
+child_pgid=""
+cleanup_on_signal() {
+    if [ -n "$child_pgid" ]; then
+        kill -TERM -- "-$child_pgid" 2>/dev/null
+        sleep 2
+        kill -KILL -- "-$child_pgid" 2>/dev/null
+    fi
+    rm -f "${PRE_LOG:-}" "${JOB_LOG:-}" "$RUN_LOG.tmp"
+    exit 143
+}
+trap cleanup_on_signal TERM INT HUP
 
 mkdir -p "$LOG_DIR" "$DIGEST_DIR" "$(dirname "$PROCESSED")"
 
@@ -49,6 +75,7 @@ PRE_LOG="$(mktemp /tmp/jilog-preflight.XXXXXX)" || { echo "$(ts) mktemp failed; 
 set -m
 "$KATA_BIN" --project jilog --json list --status open >"$PRE_LOG" 2>&1 &
 kpid=$!
+child_pgid=$kpid
 set +m
 kwaited=0
 while kill -0 "$kpid" 2>/dev/null; do
@@ -70,6 +97,7 @@ if ! wait "$kpid"; then
     rm -f "$PRE_LOG"
     exit 1
 fi
+child_pgid=""
 rm -f "$PRE_LOG"
 
 # --- 2. Bounded run, own process group, combined stdout+stderr capture. ---
@@ -80,6 +108,7 @@ set -m
     --processed-file "$PROCESSED" \
     "$@" >"$JOB_LOG" 2>&1 &
 pid=$!
+child_pgid=$pid
 set +m
 
 waited=0
@@ -98,14 +127,16 @@ while kill -0 "$pid" 2>/dev/null; do
 done
 wait "$pid"
 rc=$?
+child_pgid=""
 
 # --- 3. Result handling. Order matters: a nonzero jilog exit is a wholesale
 # run failure (exit 4, real rc in the log — never passed through, jilog's
 # own 1/2 would collide with this wrapper's contract). The tracker-error
 # grep applies to completed runs, and the known jilog#fx51 create-response
 # parse failure (missing field `number` against kata >=0.15 JSON; the issue
-# IS created server-side) is filtered out of the fail-loud signal so exit 2
-# keeps meaning REAL tracker trouble; filtered occurrences are counted. ---
+# IS created server-side) is separated from the fail-loud signal so exit 2
+# keeps meaning REAL tracker trouble — but it still exits NONZERO (5): a
+# night running with the known defect is degraded, never "healthy". ---
 cat "$JOB_LOG" >>"$RUN_LOG"
 if [ "$rc" -ne 0 ]; then
     echo "$(ts) jilog exited $rc; wrapper exit 4" >>"$RUN_LOG"
@@ -118,9 +149,10 @@ if grep -E 'tracker\.create failed|tracker\.list_open failed' "$JOB_LOG" | grep 
     exit 2
 fi
 known=$(grep -Ec 'tracker\.create failed.*missing field `number`' "$JOB_LOG")
-if [ "$known" -gt 0 ]; then
-    echo "$(ts) known create-parse defect (jilog#fx51): $known create response(s) unparsed; issues filed server-side, digest lacks backlinks" >>"$RUN_LOG"
-fi
 rm -f "$JOB_LOG"
+if [ "$known" -gt 0 ]; then
+    echo "$(ts) known create-parse defect (jilog#fx51): $known create response(s) unparsed; issues filed server-side, digest lacks backlinks; exit 5" >>"$RUN_LOG"
+    exit 5
+fi
 echo "$(ts) OK" >>"$RUN_LOG"
 exit 0

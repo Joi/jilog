@@ -685,7 +685,14 @@ code (`rc=$?; test "$rc" -eq N`) instead of merely printing it, and prints
 PASS/FAIL. The executor runs each ssh through the Bash tool with a 300000 ms
 tool timeout, which bounds the whole test even if the wrapper itself is
 broken (its stub sleeps are 600 s precisely so a timeout failure is
-detectable rather than racing the harness bound).
+detectable rather than racing the harness bound). FAIL branches exit
+nonzero so automation cannot mistake a failed gate for a pass.
+POST-HARDENING ADDENDUM: the wrapper gained exit codes 4 (jilog rc
+nonzero), 5 (only the known fx51 pattern), and a TERM-forwarding trap after
+these gates first ran; the additional stub tests covering those paths (real
+create-error → 2, VERBATIM backticked fx51 line → 5, list_open warn → 2,
+rc-7 → 4) are recorded with their outputs in the run manifest's Task 5
+evidence block — re-run them after any wrapper change.
 
 - [ ] **Step 1: Timeout test (gate c) — PID-recording stub, asserted.**
 
@@ -711,7 +718,7 @@ chmod +x /tmp/stub-hang.sh && rm -f /tmp/stub-child.pid /tmp/stub-grandchild.pid
       if [ ! -f "$f" ]; then echo "FAIL: $f missing (stub never wrote it)"; ok=0;
       elif kill -0 "$(cat $f)" 2>/dev/null; then echo "FAIL: survivor $f pid=$(cat $f)"; ok=0;
       fi; done \
-  ; if [ "$ok" -eq 1 ]; then echo "GATE-C-PASS"; else echo "GATE-C-FAIL"; fi'
+  ; if [ "$ok" -eq 1 ]; then echo "GATE-C-PASS"; else echo "GATE-C-FAIL"; exit 1; fi'
 ```
 
   Expect `GATE-C-PASS` (exit 3 AND both pid files present AND both PIDs
@@ -726,7 +733,7 @@ ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\ne
      JILOG_TRACKED_DIGEST_DIR=/tmp/harness-2/digests \
      JILOG_TRACKED_PROCESSED_FILE=/tmp/harness-2/processed.txt \
      ~/scripts/jilog-nightly-tracked.sh; rc=$?; \
-  if [ "$rc" -eq 2 ]; then echo "GATE-C2-PASS"; else echo "GATE-C2-FAIL: exit=$rc want 2"; fi'
+  if [ "$rc" -eq 2 ]; then echo "GATE-C2-PASS"; else echo "GATE-C2-FAIL: exit=$rc want 2"; exit 1; fi'
 ```
 
   Expect `GATE-C2-PASS`.
@@ -743,7 +750,7 @@ ssh jibotmac 'printf "#!/bin/bash\ntouch /tmp/harness-3/stub-ran.sentinel\nexit 
      JILOG_TRACKED_DIGEST_DIR=/tmp/harness-3/digests \
      JILOG_TRACKED_PROCESSED_FILE=/tmp/harness-3/processed.txt \
      ~/scripts/jilog-nightly-tracked.sh; rc=$?; \
-  if [ "$rc" -eq 1 ] && [ ! -e /tmp/harness-3/stub-ran.sentinel ]; then echo "GATE-E-PASS"; else echo "GATE-E-FAIL: exit=$rc sentinel=$(test -e /tmp/harness-3/stub-ran.sentinel && echo present || echo absent)"; fi'
+  if [ "$rc" -eq 1 ] && [ ! -e /tmp/harness-3/stub-ran.sentinel ]; then echo "GATE-E-PASS"; else echo "GATE-E-FAIL: exit=$rc sentinel=$(test -e /tmp/harness-3/stub-ran.sentinel && echo present || echo absent)"; exit 1; fi'
 ```
 
   Expect `GATE-E-PASS` (preflight failed fast against the dead port; the
@@ -763,7 +770,7 @@ ssh jibotmac 'printf "#!/bin/bash\nsleep 600\n" > /tmp/stub-hang-kata.sh \
      JILOG_TRACKED_DIGEST_DIR=/tmp/harness-4/digests \
      JILOG_TRACKED_PROCESSED_FILE=/tmp/harness-4/processed.txt \
      ~/scripts/jilog-nightly-tracked.sh; rc=$?; sleep 1; \
-  if [ "$rc" -eq 1 ] && [ ! -e /tmp/harness-4/stub-ran.sentinel ] && ! pgrep -f stub-hang-kata >/dev/null; then echo "GATE-E2-PASS"; else echo "GATE-E2-FAIL: exit=$rc"; fi'
+  if [ "$rc" -eq 1 ] && [ ! -e /tmp/harness-4/stub-ran.sentinel ] && ! pgrep -f stub-hang-kata >/dev/null; then echo "GATE-E2-PASS"; else echo "GATE-E2-FAIL: exit=$rc"; exit 1; fi'
 ```
 
   Expect `GATE-E2-PASS` within ~10s (hanging kata killed, jilog never ran).
@@ -812,9 +819,12 @@ ssh jibotmac 'grep -c "/Users/jibot/.amplifier/health" ~/scripts/jilog-nightly-t
 
 ### Task 5: Create-path canary (gate c3) + arm Stage 2 (Chunk B)
 
-- [ ] **Step 1: JST time gate.** `ssh jibotmac date '+%H'` — if 00–08 (JST),
-  wait until ≥09:00 JST before Step 3 (UTC/Local digest-date divergence;
-  spec follow-ups section).
+- [ ] **Step 1: Time gate.** The real predicate is `date +%F` == `date -u
+  +%F` on jibotmac (the UTC digest filename and the Local issue-body
+  pointer must agree). EXECUTION CORRECTION: this step was written assuming
+  jibotmac local = JST; ground truth is UTC+6, so the divergence window is
+  00:00–05:59 local, and the predicate was verified directly instead of
+  waiting for a wall-clock hour (run manifest Notes).
 - [ ] **Step 2: Deploy canary (dirs FIRST — launchd needs the log dir to
   exist before bootstrap; RUNID makes the run unique).**
 
@@ -1098,8 +1108,9 @@ Not an Agency task; the pipeline itself executes it AFTER the chunk reviews:
 
 ## Verification commands (whole-result, pre-commit gate)
 
-Repo side: `cargo test --workspace` (must stay green — no code changed, this
-proves it), `bash -n` + `plutil -lint` over the artifact dir, REDACTED greps
+Repo side: `cargo test --workspace` (must stay green — the only crates/
+change is two machine-contract comments in digest.rs, this proves they
+break nothing), `bash -n` + `plutil -lint` over the artifact dir, REDACTED greps
 and the tomllib assertion from Task 1 Step 10. Machine side: gates (a)–(h)
 evidence recorded in the run manifest (Tasks 2–6).
 
