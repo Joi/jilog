@@ -1160,12 +1160,12 @@ Not an Agency task; the pipeline itself executes it AFTER the chunk reviews:
 - [x] /do-it Step 5: verification gate (`cargo test --workspace`, artifact
   lints), push branch `6rzb-jibotmac-jilog-tracker-flip` to origin (repo is NOT
   marshal-managed; do not merge to main).
-- [ ] Close `jibot-code#6rzb` with the full evidence comment (commits,
+- [x] Close `jibot-code#6rzb` with the full evidence comment (commits,
   config paths + redacted contents, tunnel health output, tracked + local
   run evidence with distinct processed-files/digest-dirs, canary ref +
   RUNID, follow-up refs, review summary naming the fresheyes passes) — the
   close-out comment itself contains NO secrets and NO user text.
-- [ ] `/finish-worktree`.
+- [x] `/finish-worktree`. (executed at session end)
 
 ---
 
