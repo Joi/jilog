@@ -47,10 +47,15 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
   `number` `` text — so exit 2 always means genuine tracker trouble.
   CAVEAT (jilog#fx51 comment): jilog only emits `tracker.list_open failed`
   when the `kata list` COMMAND fails; a successful command returning
-  drifted JSON is swallowed silently (`unwrap_or` empty list — recurrence
-  dedup quietly degrades with no warn for any wrapper to see). The exit-2
-  classification here is defensive for whatever jilog does print; the
-  silent-drift hole is jilog's to fix.
+  drifted JSON is swallowed upstream (`unwrap_or` empty list). Recurrence
+  ANNOTATION is lost silently — but the same empty list also blinds
+  `create()`'s dedup passes, so recurring signals get re-filed and kata's
+  idempotency layer rejects them: the observable symptom of list-JSON
+  drift is a burst of `tracker.create failed` lines WITHOUT ``missing
+  field `number` `` → exit 2. If you are debugging exactly that, check the
+  list path too. The upstream hole is tracked on jilog#fx51 as a
+  jilog-review code fix (`trackers/kata.rs` list/list_closed `unwrap_or`),
+  not a wrapper change.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
   process group was killed.
 - `4` — jilog itself exited nonzero (real rc in the run log). jilog's own

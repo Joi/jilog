@@ -713,14 +713,14 @@ ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\ne
   && printf "#!/bin/bash\necho \"WARN tracker.list_open failed (no recurrence annotations): kata list JSON parse: missing field \\\`number\\\` at line 1\"\nexit 0\n" > /tmp/s-lo51.sh \
   && printf "#!/bin/bash\nexit 7\n" > /tmp/s-rc7.sh \
   && printf "#!/bin/bash\necho x\nexit 0\n" > /tmp/s-ok.sh \
-  && chmod +x /tmp/s-*.sh && source ~/.zshrc.local \
+  && chmod +x /tmp/s-*.sh && source ~/.zshrc.local || { echo "HARNESS-FAIL: setup"; exit 1; } \
   ; fail=0 \
   ; for spec in warn:2 fx51:5 lo51:2 rc7:4 ok:0; do t=${spec%%:*}; want=${spec##*:}; \
       JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; rc=$?; \
       if [ "$rc" -ne "$want" ]; then echo "HARNESS-FAIL: $t exit $rc want $want"; fail=1; else echo "T-$t exit $rc OK"; fi; done \
-  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; rc=$?; \
-  if [ "$rc" -ne 0 ]; then echo "HARNESS-FAIL: badtimeout exit $rc want 0"; fail=1; else echo "T-badtimeout exit 0 OK"; fi \
-  ; rm -f /tmp/s-*.sh; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val \
+  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-val.err; rc=$?; \
+  if [ "$rc" -ne 0 ] || [ -s /tmp/h-val.err ]; then echo "HARNESS-FAIL: badtimeout exit $rc, stderr: $(cat /tmp/h-val.err)"; fail=1; else echo "T-badtimeout exit 0 OK"; fi \
+  ; rm -f /tmp/s-*.sh /tmp/h-val.err; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val \
   ; if [ "$fail" -eq 0 ]; then echo HARNESS-PASS; else echo HARNESS-FAILED; exit 1; fi'
 ssh jibotmac 'printf "#!/bin/bash\nsleep 600 &\necho \$! > /tmp/trap-child.pid\nwait\n" > /tmp/s-hang.sh && chmod +x /tmp/s-hang.sh && rm -f /tmp/trap-child.pid && source ~/.zshrc.local \
   && JILOG_TRACKED_JILOG_BIN=/tmp/s-hang.sh JILOG_TRACKED_TIMEOUT_SECS=600 JILOG_TRACKED_LOG_DIR=/tmp/h-trap JILOG_TRACKED_DIGEST_DIR=/tmp/h-trap/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-trap/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1 & wpid=$!; \
@@ -1148,10 +1148,10 @@ git commit -m "docs(6rzb): follow-up refs + final run-manifest evidence"
 
 Not an Agency task; the pipeline itself executes it AFTER the chunk reviews:
 
-- [ ] /do-it Step 4 two-stage review (Stage 1 subagent ∥ Stage 2 fresheyes,
+- [x] /do-it Step 4 two-stage review (Stage 1 subagent ∥ Stage 2 fresheyes,
   heavy loop) over the full branch diff `git diff main...HEAD`; fix or
   rebut every BLOCKER/SUBSTANTIVE; commit fixes.
-- [ ] /do-it Step 5: verification gate (`cargo test --workspace`, artifact
+- [x] /do-it Step 5: verification gate (`cargo test --workspace`, artifact
   lints), push branch `6rzb-jibotmac-jilog-tracker-flip` to origin (repo is NOT
   marshal-managed; do not merge to main).
 - [ ] Close `jibot-code#6rzb` with the full evidence comment (commits,
