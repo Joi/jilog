@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.jibot.jilog-canary-6rzb</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/jibot/scripts/jilog-nightly-tracked.sh</string>
+		<string>--create-issues</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/jibot</string>
+		<key>PATH</key>
+		<string>/Users/jibot/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>KATA_SERVER</key>
+		<string>http://127.0.0.1:7777</string>
+		<key>KATA_AUTHOR</key>
+		<string>joi-jibotmac</string>
+		<key>KATA_AUTH_TOKEN</key>
+		<string>REDACTED</string>
+		<key>KATA_TRUST_PRIVATE_NETWORK</key>
+		<string>1</string>
+		<key>JILOG_TRACKED_CONFIG</key>
+		<string>/Users/jibot/.jilog/canary-6rzb/jilog-canary.toml</string>
+		<key>JILOG_TRACKED_DIGEST_DIR</key>
+		<string>/Users/jibot/.jilog/canary-6rzb/digests</string>
+		<key>JILOG_TRACKED_PROCESSED_FILE</key>
+		<string>/Users/jibot/.jilog/canary-6rzb/processed.txt</string>
+		<key>JILOG_TRACKED_LOG_DIR</key>
+		<string>/Users/jibot/.jilog/canary-6rzb/logs</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/jibot/.jilog/canary-6rzb/logs/launchd.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/jibot/.jilog/canary-6rzb/logs/launchd.stderr.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+</dict>
+</plist>

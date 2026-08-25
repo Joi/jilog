@@ -1,0 +1,12 @@
+# Canary config for gate (c3) — jibot-code#6rzb. Files exactly ONE issue
+# (from the fixture transcript's single correction window) into kata project
+# jilog via the REAL tracker, from the launchd context. Removed after the
+# gate passes.
+
+[[reader]]
+type = "claude-code"
+path = "~/.jilog/canary-6rzb/fixture"
+
+[tracker]
+type = "kata"
+project = "jilog"

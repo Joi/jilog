@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.amplifier.nightly-learning - nightly jilog session review (jibotmac).
+  jilog v0.6.0 (github.com/Joi/jilog), binary copied from
+  macazbd (both arm64 darwin; no cargo on this host). Config: ~/.jilog.toml. LOCAL lane (hermes-only) since jibot-code#6rzb; tracked lane = com.jibot.jilog-nightly-tracked.
+  TEST:   launchctl kickstart gui/$(id -u)/com.amplifier.nightly-learning
+  LOGS:   tail -f ~/.jilog/logs/nightly-learning.{stdout,stderr}.log
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.amplifier.nightly-learning</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/jibot/.local/bin/jilog</string>
+		<string>review</string>
+		<string>nightly</string>
+		<string>--digest-dir</string>
+		<string>/Users/jibot/.jilog/digests</string>
+		<string>--processed-file</string>
+		<string>/Users/jibot/.jilog/telemetry/processed-sessions.txt</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/jibot</string>
+		<key>PATH</key>
+		<string>/Users/jibot/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>22</integer>
+		<key>Minute</key>
+		<integer>50</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/jibot/.jilog/logs/nightly-learning.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/jibot/.jilog/logs/nightly-learning.stderr.log</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>Nice</key>
+	<integer>10</integer>
+</dict>
+</plist>

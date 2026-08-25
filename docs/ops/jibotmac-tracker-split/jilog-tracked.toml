@@ -1,0 +1,15 @@
+# ~/.jilog-tracked.toml — jibotmac TRACKED nightly run (jibot-code#6rzb).
+# Non-Hermes readers ONLY. Hermes surfaces (LINE/Telegram/GIDC-email) must
+# never reach fleet-visible kata (Joi ruling 2026-08-24); they are scanned by
+# the LOCAL run (~/.jilog.toml, tracker = "none"). Launched by
+# com.jibot.jilog-nightly-tracked via ~/scripts/jilog-nightly-tracked.sh with
+# distinct --processed-file / --digest-dir (isolation requirement).
+# NO [[zone]] stanzas here: zones belong to the default config (spool-ingest).
+
+[[reader]]
+type = "claude-code"
+path = "~/.claude/projects"
+
+[tracker]
+type = "kata"
+project = "jilog"

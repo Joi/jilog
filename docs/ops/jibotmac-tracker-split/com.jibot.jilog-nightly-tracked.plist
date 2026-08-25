@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.jibot.jilog-nightly-tracked - TRACKED nightly jilog review (jibotmac).
+  jibot-code#6rzb. Runs the wrapper (preflight/timeout/fail-loud); the wrapper
+  runs jilog with the tracked config. This file is the FINAL ARMED state;
+  Stage-1 install strips the create-issues argument until the payload
+  preview + canary gates pass. Deployed mode 0600 (embeds KATA_AUTH_TOKEN;
+  REDACTED in the repo copy).
+  TEST:  launchctl kickstart gui/$(id -u)/com.jibot.jilog-nightly-tracked
+  LOGS:  ~/.jilog/logs/nightly-tracked.{run,stdout,stderr}.log
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.jibot.jilog-nightly-tracked</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/jibot/scripts/jilog-nightly-tracked.sh</string>
+		<string>--create-issues</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/jibot</string>
+		<key>PATH</key>
+		<string>/Users/jibot/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>KATA_SERVER</key>
+		<string>http://127.0.0.1:7777</string>
+		<key>KATA_AUTHOR</key>
+		<string>joi-jibotmac</string>
+		<key>KATA_AUTH_TOKEN</key>
+		<string>REDACTED</string>
+		<key>KATA_TRUST_PRIVATE_NETWORK</key>
+		<string>1</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>23</integer>
+		<key>Minute</key>
+		<integer>20</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/jibot/.jilog/logs/nightly-tracked.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/jibot/.jilog/logs/nightly-tracked.stderr.log</string>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>Nice</key>
+	<integer>10</integer>
+</dict>
+</plist>
