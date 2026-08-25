@@ -535,7 +535,10 @@ project = "jilog"
   `~/.jilog-tracked.toml`; `cp ~/.jilog/backup-6rzb/jilog.toml.orig
   ~/.jilog.toml`; `cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist
   ~/Library/LaunchAgents/`; `launchctl bootout … && launchctl bootstrap …`
-  the local label; `trash` tracked digests + processed-sessions-tracked.txt.
+  the local label; digest/ledger cleanup per the committed README's
+  rollback block (the `find -newer` deploy-snapshot form with its anchor
+  guard — do NOT author a bare `trash` glob here; the README is
+  authoritative), plus `rm -f` of the canary plist if one survived.
 - [ ] **Step 10: Local validation:**
   - `bash -n docs/ops/jibotmac-tracker-split/jilog-nightly-tracked.sh` — 0.
   - `plutil -lint docs/ops/jibotmac-tracker-split/*.plist
@@ -693,7 +696,9 @@ nonzero), 5 (only the known fx51 pattern), a TERM-forwarding trap, and
 timeout-override validation after these gates first ran. Re-run this
 executable block after ANY wrapper change (expected: `T-warn exit 2`,
 `T-fx51 exit 5`, `T-rc7 exit 4`, `T-ok exit 0`, `T-badtimeout exit 0`,
-then `wrapper-dead` + `TRAP-PASS: child dead`):
+`T-lo51 exit 2` (list_open parse drift is REAL trouble — regression of the
+create-line carve-out scoping is caught only by this stub), then
+`wrapper-dead` + `TRAP-PASS: child dead`):
 
 ```bash
 ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\nexit 0\n" > /tmp/s-warn.sh \
@@ -701,19 +706,24 @@ ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\ne
   && printf "#!/bin/bash\nexit 7\n" > /tmp/s-rc7.sh \
   && printf "#!/bin/bash\necho x\nexit 0\n" > /tmp/s-ok.sh \
   && chmod +x /tmp/s-*.sh && source ~/.zshrc.local \
-  && for t in warn fx51 rc7 ok; do JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-$t exit $?"; done \
+  && printf "#!/bin/bash\necho \"WARN tracker.list_open failed (no recurrence annotations): kata list JSON parse: missing field \\\`number\\\` at line 1\"\nexit 0\n" > /tmp/s-lo51.sh && chmod +x /tmp/s-lo51.sh \
+  && for t in warn fx51 lo51 rc7 ok; do JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-$t exit $?"; done \
   && JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-badtimeout exit $?" \
   ; rm -f /tmp/s-*.sh; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val'
 ssh jibotmac 'printf "#!/bin/bash\nsleep 600 &\necho \$! > /tmp/trap-child.pid\nwait\n" > /tmp/s-hang.sh && chmod +x /tmp/s-hang.sh && rm -f /tmp/trap-child.pid && source ~/.zshrc.local \
   && JILOG_TRACKED_JILOG_BIN=/tmp/s-hang.sh JILOG_TRACKED_TIMEOUT_SECS=600 JILOG_TRACKED_LOG_DIR=/tmp/h-trap JILOG_TRACKED_DIGEST_DIR=/tmp/h-trap/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-trap/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1 & wpid=$!; \
-  sleep 8; kill -TERM "$wpid"; sleep 10; \
+  w=0; until [ -f /tmp/trap-child.pid ] || [ "$w" -ge 90 ]; do sleep 2; w=$((w+2)); done; \
+  if [ ! -f /tmp/trap-child.pid ]; then echo "TRAP-FAIL: stub never started (preflight still running or failed)"; kill -TERM "$wpid" 2>/dev/null; else \
+  kill -TERM "$wpid"; sleep 10; \
   if kill -0 "$wpid" 2>/dev/null; then echo "TRAP-FAIL: wrapper alive"; else echo "wrapper-dead"; fi; \
-  if [ -f /tmp/trap-child.pid ] && kill -0 "$(cat /tmp/trap-child.pid)" 2>/dev/null; then echo "TRAP-FAIL: child survived"; else echo "TRAP-PASS: child dead"; fi; \
+  if kill -0 "$(cat /tmp/trap-child.pid)" 2>/dev/null; then echo "TRAP-FAIL: child survived"; else echo "TRAP-PASS: child dead"; fi; fi; \
   rm -f /tmp/s-hang.sh /tmp/trap-child.pid; rm -rf /tmp/h-trap'
 ```
 
 (The 10 s post-TERM settle matters: bash delivers traps only after the
-current poll `sleep 5` returns — a shorter settle races it and false-fails.)
+current poll `sleep 5` returns — a shorter settle races it and false-fails.
+The pid-file poll before the kill matters too: TERM landing during the real
+kata preflight would otherwise "pass" without exercising forwarding at all.)
 
 - [ ] **Step 1: Timeout test (gate c) — PID-recording stub, asserted.**
 
@@ -871,8 +881,10 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   Mac) contains NO issue mentioning `canary 6rzb run $RUNID`.
   **Failure path (any failure, before OR after the canary bootstrap):**
   attempt Step 5's bootout (tolerating "not loaded"), then `ssh jibotmac
-  'rm -rf ~/.jilog/canary-6rzb'` — the retry of Step 2 starts from an EMPTY
-  canary dir with a fresh RUNID. This is mandatory even for pre-bootstrap
+  'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && rm -rf
+  ~/.jilog/canary-6rzb'` — the RunAtLoad+token canary plist must NEVER
+  survive a failed attempt (it would re-fire at next login), and the retry
+  of Step 2 starts from an EMPTY canary dir with a fresh RUNID. This is mandatory even for pre-bootstrap
   failures: a stale `canary-<oldRUNID>.jsonl` left in `fixture/` would make
   the eventual run file a SECOND issue under the old RUNID that nothing ever
   closes.

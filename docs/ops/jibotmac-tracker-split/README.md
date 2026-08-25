@@ -41,8 +41,11 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
   retries. The kata output (stdout+stderr — `--json` errors land on stdout)
   is appended to the run log for diagnosis.
 - `2` — jilog ran clean, but its output contained a REAL `tracker.create
-  failed` / `tracker.list_open failed` (warn-only in jilog), EXCLUDING the
-  known fx51 pattern — so exit 2 always means genuine tracker trouble.
+  failed` / `tracker.list_open failed` (warn-only in jilog). The fx51
+  carve-out applies to the CREATE line only — a `tracker.list_open failed`
+  line exits 2 even when it carries the same ``missing field `number` ``
+  text (list-path JSON drift would be NEW trouble, not the known defect) —
+  so exit 2 always means genuine tracker trouble.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
   process group was killed.
 - `4` — jilog itself exited nonzero (real rc in the run log). jilog's own
@@ -94,12 +97,13 @@ ssh jibotmac 'tail -3 ~/.jilog/logs/nightly-tracked.run.log; launchctl list | gr
 ## Rollback (full, exact order)
 
 ```bash
-ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-nightly-tracked'
-ssh jibotmac 'rm ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/scripts/jilog-nightly-tracked.sh ~/.jilog-tracked.toml'
+ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-nightly-tracked 2>/dev/null; true'
+ssh jibotmac 'launchctl bootout gui/$(id -u)/com.jibot.jilog-canary-6rzb 2>/dev/null; rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist; rm -rf ~/.jilog/canary-6rzb'
+ssh jibotmac 'rm -f ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/scripts/jilog-nightly-tracked.sh ~/.jilog-tracked.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/jilog.toml.orig ~/.jilog.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist ~/Library/LaunchAgents/'
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.amplifier.nightly-learning 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.amplifier.nightly-learning.plist'
-ssh jibotmac 'find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -newer ~/.jilog/backup-6rzb/launchctl-list-before.txt -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
+ssh jibotmac 'test -f ~/.jilog/backup-6rzb/launchctl-list-before.txt || { echo "ROLLBACK-ABORT: deploy-time anchor missing - do NOT delete digests unanchored; enumerate by hand"; exit 1; }; find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -newer ~/.jilog/backup-6rzb/launchctl-list-before.txt -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
 # NOTE: deletes ONLY digest files newer than the deploy-time snapshot
 # (~/.jilog/backup-6rzb/launchctl-list-before.txt, written before the first
 # tracked run) — i.e. only what THIS deployment produced. The directory is

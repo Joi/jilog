@@ -391,8 +391,10 @@ All jibotmac changes over `ssh jibotmac`, one at a time, verify each step.
 - Machine-state rollback: `launchctl bootout` the tracked agent + delete its
   plist, wrapper, and `~/.jilog-tracked.toml`; restore `~/.jilog.toml` and
   the local-run plist from `~/.jilog/backup-6rzb/` snapshots
-  (bootout+bootstrap the local agent); `trash` the tracked digests in
-  `~/.amplifier/health` + `~/.jilog/telemetry/processed-sessions-tracked.txt`.
+  (bootout+bootstrap the local agent); remove the tracked digests +
+  `processed-sessions-tracked.txt` — exact form in the ops README's
+  rollback block (a `find -newer` deploy-snapshot anchor, so only files
+  this deployment produced are touched; the README is authoritative).
 
 ## Open questions
 
