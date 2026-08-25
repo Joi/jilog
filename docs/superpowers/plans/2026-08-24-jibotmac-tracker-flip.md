@@ -898,18 +898,22 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   **Failure path (any failure, before OR after the canary bootstrap):**
   attempt Step 5's bootout (tolerating "not loaded"), then `ssh jibotmac
   'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && {
+  test -d ~/.jilog/canary-6rzb || exit 0;
   trash ~/.jilog/canary-6rzb 2>/dev/null ||
   mv ~/.jilog/canary-6rzb ~/.jilog/canary-6rzb.failed-$(date -u +%Y%m%dT%H%M%SZ); }'`
   (the `mv` and its two operands stay on ONE line — a newline inside the
   single quotes reaches the remote shell literally, and any break between
-  operands would leave the rename inert; breaking after `||` is
-  shell-safe. Trash-first like Step 5 and the README, but where those are
-  clean-teardown paths that may fall back to `rm -rf`, THIS failure path
-  falls back to an evidence-preserving rename — over non-interactive ssh a
-  missing `trash` binary must not silently destroy the failure evidence;
+  operands would leave the rename inert; breaking after `||` or `;` is
+  shell-safe. The `test -d … || exit 0` guard keeps the path idempotent:
+  a pre-bootstrap failure can occur before the dir was ever created, and
+  "nothing to clean" must exit 0, not error. Trash-first like Step 5 and
+  the README, but where those are clean-teardown paths that may fall back
+  to `rm -rf`, THIS failure path falls back to an evidence-preserving
+  rename — over non-interactive ssh a missing `trash` binary must not
+  silently destroy the failure evidence, since on a FAILED attempt the
+  canary dir's run/launchd logs are the only evidence of what went wrong;
   the suffix is remote-evaluated and self-uniquifying, never a
-  hand-substituted placeholder inside a runnable command — on a FAILED attempt the canary dir's run/launchd logs are
-  the only evidence of what went wrong; matching Step 5 and the README) —
+  hand-substituted placeholder inside a runnable command) —
   the RunAtLoad+token canary plist must NEVER survive a failed attempt (it
   would re-fire at next login), and the retry of Step 2 starts from an
   EMPTY canary dir with a fresh RUNID. The plist+dir removal above is
