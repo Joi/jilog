@@ -42,10 +42,15 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
   is appended to the run log for diagnosis.
 - `2` — jilog ran clean, but its output contained a REAL `tracker.create
   failed` / `tracker.list_open failed` (warn-only in jilog). The fx51
-  carve-out applies to the CREATE line only — a `tracker.list_open failed`
-  line exits 2 even when it carries the same ``missing field `number` ``
-  text (list-path JSON drift would be NEW trouble, not the known defect) —
-  so exit 2 always means genuine tracker trouble.
+  carve-out applies to the CREATE line only — any `tracker.list_open
+  failed` line exits 2, even one carrying the same ``missing field
+  `number` `` text — so exit 2 always means genuine tracker trouble.
+  CAVEAT (jilog#fx51 comment): jilog only emits `tracker.list_open failed`
+  when the `kata list` COMMAND fails; a successful command returning
+  drifted JSON is swallowed silently (`unwrap_or` empty list — recurrence
+  dedup quietly degrades with no warn for any wrapper to see). The exit-2
+  classification here is defensive for whatever jilog does print; the
+  silent-drift hole is jilog's to fix.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
   process group was killed.
 - `4` — jilog itself exited nonzero (real rc in the run log). jilog's own

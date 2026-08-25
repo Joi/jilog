@@ -692,32 +692,41 @@ broken (its stub sleeps are 600 s precisely so a timeout failure is
 detectable rather than racing the harness bound). FAIL branches exit
 nonzero so automation cannot mistake a failed gate for a pass.
 POST-HARDENING ADDENDUM: the wrapper gained exit codes 4 (jilog rc
-nonzero), 5 (only the known fx51 pattern), a TERM-forwarding trap, and
-timeout-override validation after these gates first ran. Re-run this
-executable block after ANY wrapper change (expected: `T-warn exit 2`,
-`T-fx51 exit 5`, `T-rc7 exit 4`, `T-ok exit 0`, `T-badtimeout exit 0`,
-`T-lo51 exit 2` (list_open parse drift is REAL trouble — regression of the
-create-line carve-out scoping is caught only by this stub), then
-`wrapper-dead` + `TRAP-PASS: child dead`):
+nonzero), 5 (only the known fx51 CREATE pattern), a TERM-forwarding trap,
+and timeout-override validation after these gates first ran. Re-run this
+ASSERTING harness after ANY wrapper change — each command exits nonzero on
+any mismatch (never trust the echoes alone); expected terminal lines are
+`HARNESS-PASS` and `TRAP-HARNESS-PASS`. The `lo51` case is the only stub
+that catches a regression of the create-line carve-out scoping. (jilog
+emits `tracker.list_open failed` only on COMMAND failure — successful-but-
+drifted list JSON is silently swallowed upstream, see the jilog#fx51
+comment; these stubs test the wrapper's classification of what jilog CAN
+print, which is all a wrapper can do.)
 
 ```bash
 ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\nexit 0\n" > /tmp/s-warn.sh \
   && printf "#!/bin/bash\necho \"WARN tracker.create failed: tracker backend: kata create JSON parse: missing field \\\`number\\\` at line 1 column 762\"\nexit 0\n" > /tmp/s-fx51.sh \
+  && printf "#!/bin/bash\necho \"WARN tracker.list_open failed (no recurrence annotations): kata list JSON parse: missing field \\\`number\\\` at line 1\"\nexit 0\n" > /tmp/s-lo51.sh \
   && printf "#!/bin/bash\nexit 7\n" > /tmp/s-rc7.sh \
   && printf "#!/bin/bash\necho x\nexit 0\n" > /tmp/s-ok.sh \
   && chmod +x /tmp/s-*.sh && source ~/.zshrc.local \
-  && printf "#!/bin/bash\necho \"WARN tracker.list_open failed (no recurrence annotations): kata list JSON parse: missing field \\\`number\\\` at line 1\"\nexit 0\n" > /tmp/s-lo51.sh && chmod +x /tmp/s-lo51.sh \
-  && for t in warn fx51 lo51 rc7 ok; do JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-$t exit $?"; done \
-  && JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-badtimeout exit $?" \
-  ; rm -f /tmp/s-*.sh; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val'
+  ; fail=0 \
+  ; for spec in warn:2 fx51:5 lo51:2 rc7:4 ok:0; do t=${spec%%:*}; want=${spec##*:}; \
+      JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; rc=$?; \
+      if [ "$rc" -ne "$want" ]; then echo "HARNESS-FAIL: $t exit $rc want $want"; fail=1; else echo "T-$t exit $rc OK"; fi; done \
+  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; rc=$?; \
+  if [ "$rc" -ne 0 ]; then echo "HARNESS-FAIL: badtimeout exit $rc want 0"; fail=1; else echo "T-badtimeout exit 0 OK"; fi \
+  ; rm -f /tmp/s-*.sh; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val \
+  ; if [ "$fail" -eq 0 ]; then echo HARNESS-PASS; else echo HARNESS-FAILED; exit 1; fi'
 ssh jibotmac 'printf "#!/bin/bash\nsleep 600 &\necho \$! > /tmp/trap-child.pid\nwait\n" > /tmp/s-hang.sh && chmod +x /tmp/s-hang.sh && rm -f /tmp/trap-child.pid && source ~/.zshrc.local \
   && JILOG_TRACKED_JILOG_BIN=/tmp/s-hang.sh JILOG_TRACKED_TIMEOUT_SECS=600 JILOG_TRACKED_LOG_DIR=/tmp/h-trap JILOG_TRACKED_DIGEST_DIR=/tmp/h-trap/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-trap/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1 & wpid=$!; \
-  w=0; until [ -f /tmp/trap-child.pid ] || [ "$w" -ge 90 ]; do sleep 2; w=$((w+2)); done; \
-  if [ ! -f /tmp/trap-child.pid ]; then echo "TRAP-FAIL: stub never started (preflight still running or failed)"; kill -TERM "$wpid" 2>/dev/null; else \
+  fail=0; w=0; until [ -f /tmp/trap-child.pid ] || [ "$w" -ge 90 ]; do sleep 2; w=$((w+2)); done; \
+  if [ ! -f /tmp/trap-child.pid ]; then echo "TRAP-FAIL: stub never started (preflight still running or failed)"; kill -TERM "$wpid" 2>/dev/null; fail=1; else \
   kill -TERM "$wpid"; sleep 10; \
-  if kill -0 "$wpid" 2>/dev/null; then echo "TRAP-FAIL: wrapper alive"; else echo "wrapper-dead"; fi; \
-  if kill -0 "$(cat /tmp/trap-child.pid)" 2>/dev/null; then echo "TRAP-FAIL: child survived"; else echo "TRAP-PASS: child dead"; fi; fi; \
-  rm -f /tmp/s-hang.sh /tmp/trap-child.pid; rm -rf /tmp/h-trap'
+  if kill -0 "$wpid" 2>/dev/null; then echo "TRAP-FAIL: wrapper alive"; fail=1; fi; \
+  if kill -0 "$(cat /tmp/trap-child.pid)" 2>/dev/null; then echo "TRAP-FAIL: child survived"; fail=1; fi; fi; \
+  rm -f /tmp/s-hang.sh /tmp/trap-child.pid; rm -rf /tmp/h-trap; \
+  if [ "$fail" -eq 0 ]; then echo TRAP-HARNESS-PASS; else echo TRAP-HARNESS-FAILED; exit 1; fi'
 ```
 
 (The 10 s post-TERM settle matters: bash delivers traps only after the
