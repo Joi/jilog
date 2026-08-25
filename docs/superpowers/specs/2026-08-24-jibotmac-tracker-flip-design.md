@@ -196,11 +196,15 @@ All jibotmac changes over `ssh jibotmac`, one at a time, verify each step.
      stdout+stderr into one log file (`tracing_subscriber::fmt()`'s default
      writer is STDOUT — a stderr-only grep would never fire) and greps that
      log for `tracker.create failed` / `tracker.list_open failed` (the
-     pipeline's warn-only tracker errors); on match it exits 2 — the loss
-     window between preflight and a mid-run daemon death becomes VISIBLE
-     (nonzero last-exit) instead of silent. Signals from such a run are not
-     lost content-wise: the digest file retains them for manual/agent
-     re-filing; true retry semantics are the jilog follow-up.
+     pipeline's warn-only tracker errors); on match it exits nonzero — the
+     loss window between preflight and a mid-run daemon death becomes
+     VISIBLE instead of silent. Signals from such a run are not lost
+     content-wise: the digest file retains them for manual/agent re-filing;
+     true retry semantics are the jilog follow-up. [FINAL CONTRACT, refined
+     during code review: 2 = real tracker errors; 4 = jilog's own nonzero
+     rc; 5 = only the known jilog#fx51 create-parse pattern
+     (degraded-but-known); 143 = signal trap. The ops README's exit-code
+     table is authoritative.]
    - All paths absolute; `mkdir -p` of digest/log dirs as belt-and-braces
      (launchd needs the log dir to exist BEFORE bootstrap — that is an
      install-step gate, see cutover).
@@ -332,7 +336,10 @@ All jibotmac changes over `ssh jibotmac`, one at a time, verify each step.
       stands for the general case.) Include the UTC/Local date mismatch:
       the digest filename uses `Utc::now()` (review.rs) while the issue-body
       pointer uses `Local::now()` (kata.rs) — they diverge for runs between
-      00:00–08:59 JST; evidence kickstarts here run after 09:00 JST.
+      00:00 local until the dates realign. [Execution correction: this was
+      drafted assuming jibotmac local = JST (window 00:00–08:59); ground
+      truth is UTC+6, window 00:00–05:59. The binding predicate is
+      `date +%F` == `date -u +%F` on the host.]
     - jibot-code: Part 2 findings — amplifierd (WA-DM agent) persists
       sessions on macazbd:`~/.amplifier/projects`; covered by macazbd's
       config readers but its nightly-learning is active-mac-guard-gated and
@@ -366,7 +373,9 @@ All jibotmac changes over `ssh jibotmac`, one at a time, verify each step.
 - Blast radius: jibotmac jilog config + two jilog LaunchAgents + one wrapper
   script; kata project `jilog` receives new issues from the tracked run.
   Gateway/Hermes agents, spool zones, and cell-jibot untouched. Repo changes
-  are docs-only.
+  are docs-only. [Execution note: plus two comment-only lines in
+  crates/jilog-review/src/digest.rs marking the warn strings as a machine
+  contract for the jibotmac wrapper — no behavior change.]
 - Mass-filing prevention is layered: processed-state seeding (historical
   sessions pre-marked), the `--days 1` mtime window, and the mandatory
   pre-arming `--dry-run --json` volume check. (`--days 1` alone is NOT

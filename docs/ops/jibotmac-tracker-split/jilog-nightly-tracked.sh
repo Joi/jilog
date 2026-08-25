@@ -11,7 +11,8 @@
 #   3. fail-loud grep — jilog's tracker errors are warn-only on its COMBINED
 #      output (tracing writes to STDOUT); if the captured output contains
 #      them, exit 2 so launchctl shows the failure.
-# Exit codes: 1 preflight failed or timed out (jilog NOT run) / 2 REAL
+# Exit codes: 1 preflight failed or timed out, or a wrapper mktemp failure
+# (either way jilog did NOT run) / 2 REAL
 # tracker errors in output / 3 jilog timeout / 4 jilog itself exited
 # nonzero (its rc is in the run log; jilog's own 1/2 would collide with the
 # wrapper's contract, so it is never passed through) / 5 ONLY the known
@@ -46,6 +47,7 @@ esac
 # the label and keep writing processed state.
 child_pgid=""
 cleanup_on_signal() {
+    trap '' TERM INT HUP
     if [ -n "$child_pgid" ]; then
         kill -TERM -- "-$child_pgid" 2>/dev/null
         sleep 2
@@ -143,7 +145,7 @@ if [ "$rc" -ne 0 ]; then
     rm -f "$JOB_LOG"
     exit 4
 fi
-if grep -E 'tracker\.create failed|tracker\.list_open failed' "$JOB_LOG" | grep -Evq 'missing field `number`'; then
+if grep -E 'tracker\.create failed|tracker\.list_open failed' "$JOB_LOG" | grep -Evq 'tracker\.create failed.*missing field `number`'; then
     echo "$(ts) tracker errors in output; exit 2 (digest retains signals)" >>"$RUN_LOG"
     rm -f "$JOB_LOG"
     exit 2

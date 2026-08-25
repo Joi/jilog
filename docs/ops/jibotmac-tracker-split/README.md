@@ -36,7 +36,8 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
 ## Wrapper exit codes (`jilog-nightly-tracked.sh`)
 
 - `1` — kata preflight failed or timed out (`JILOG_TRACKED_PREFLIGHT_TIMEOUT_SECS`,
-  default 60 s). jilog did NOT run; no session marked processed; next night
+  default 60 s), or a wrapper `mktemp` failure (run-log line says which).
+  Either way jilog did NOT run; no session marked processed; next night
   retries. The kata output (stdout+stderr — `--json` errors land on stdout)
   is appended to the run log for diagnosis.
 - `2` — jilog ran clean, but its output contained a REAL `tracker.create
@@ -98,11 +99,13 @@ ssh jibotmac 'rm ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/jilog.toml.orig ~/.jilog.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist ~/Library/LaunchAgents/'
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.amplifier.nightly-learning 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.amplifier.nightly-learning.plist'
-ssh jibotmac 'find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
-# NOTE: only the digest FILES — ~/.amplifier/health is the fleet-standard
-# shared dir and is not owned by this change; never delete the directory.
-# find (not a glob) on purpose: an unmatched glob aborts the remote zsh
-# login shell before any command runs; find with zero matches is a no-op.
+ssh jibotmac 'find ~/.amplifier/health -maxdepth 1 -name "learning-digest-*.md" -newer ~/.jilog/backup-6rzb/launchctl-list-before.txt -exec sh -c "trash \"\$@\" 2>/dev/null || rm -f \"\$@\"" _ {} +; rm -f ~/.jilog/telemetry/processed-sessions-tracked.txt'
+# NOTE: deletes ONLY digest files newer than the deploy-time snapshot
+# (~/.jilog/backup-6rzb/launchctl-list-before.txt, written before the first
+# tracked run) — i.e. only what THIS deployment produced. The directory is
+# the fleet-standard shared dir and is never deleted; anything predating
+# the deploy is untouched. find (not a glob) on purpose: an unmatched glob
+# aborts the remote zsh login shell; find with zero matches is a no-op.
 ```
 
 Disclosure is prevented, not rolled back: issues already filed to kata stay

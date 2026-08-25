@@ -527,8 +527,9 @@ project = "jilog"
   (paths, schedules, isolation table), the privacy boundary + rebuttal
   pointer to the spec, Stage-1/Stage-2 arming and disarming of
   `--create-issues` (python plistlib append/remove + bootout/bootstrap),
-  wrapper exit codes (1 preflight / 2 tracker-errors / 3 timeout / else
-  jilog's), verification gates (a)–(h) with the exact commands from Tasks
+  wrapper exit codes (SUPERSEDED: the final deployed contract is
+  1/2/3/4/5/143 — the committed README's exit-code table is authoritative,
+  not this line), verification gates (a)–(h) with the exact commands from Tasks
   2–6, and rollback as exact commands: `launchctl bootout
   gui/$UID/com.jibot.jilog-nightly-tracked`; `rm` its plist + wrapper +
   `~/.jilog-tracked.toml`; `cp ~/.jilog/backup-6rzb/jilog.toml.orig
@@ -688,11 +689,31 @@ broken (its stub sleeps are 600 s precisely so a timeout failure is
 detectable rather than racing the harness bound). FAIL branches exit
 nonzero so automation cannot mistake a failed gate for a pass.
 POST-HARDENING ADDENDUM: the wrapper gained exit codes 4 (jilog rc
-nonzero), 5 (only the known fx51 pattern), and a TERM-forwarding trap after
-these gates first ran; the additional stub tests covering those paths (real
-create-error → 2, VERBATIM backticked fx51 line → 5, list_open warn → 2,
-rc-7 → 4) are recorded with their outputs in the run manifest's Task 5
-evidence block — re-run them after any wrapper change.
+nonzero), 5 (only the known fx51 pattern), a TERM-forwarding trap, and
+timeout-override validation after these gates first ran. Re-run this
+executable block after ANY wrapper change (expected: `T-warn exit 2`,
+`T-fx51 exit 5`, `T-rc7 exit 4`, `T-ok exit 0`, `T-badtimeout exit 0`,
+then `wrapper-dead` + `TRAP-PASS: child dead`):
+
+```bash
+ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\nexit 0\n" > /tmp/s-warn.sh \
+  && printf "#!/bin/bash\necho \"WARN tracker.create failed: tracker backend: kata create JSON parse: missing field \\\`number\\\` at line 1 column 762\"\nexit 0\n" > /tmp/s-fx51.sh \
+  && printf "#!/bin/bash\nexit 7\n" > /tmp/s-rc7.sh \
+  && printf "#!/bin/bash\necho x\nexit 0\n" > /tmp/s-ok.sh \
+  && chmod +x /tmp/s-*.sh && source ~/.zshrc.local \
+  && for t in warn fx51 rc7 ok; do JILOG_TRACKED_JILOG_BIN=/tmp/s-$t.sh JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-$t JILOG_TRACKED_DIGEST_DIR=/tmp/h-$t/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-$t/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-$t exit $?"; done \
+  && JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1; echo "T-badtimeout exit $?" \
+  ; rm -f /tmp/s-*.sh; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val'
+ssh jibotmac 'printf "#!/bin/bash\nsleep 600 &\necho \$! > /tmp/trap-child.pid\nwait\n" > /tmp/s-hang.sh && chmod +x /tmp/s-hang.sh && rm -f /tmp/trap-child.pid && source ~/.zshrc.local \
+  && JILOG_TRACKED_JILOG_BIN=/tmp/s-hang.sh JILOG_TRACKED_TIMEOUT_SECS=600 JILOG_TRACKED_LOG_DIR=/tmp/h-trap JILOG_TRACKED_DIGEST_DIR=/tmp/h-trap/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-trap/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1 & wpid=$!; \
+  sleep 8; kill -TERM "$wpid"; sleep 10; \
+  if kill -0 "$wpid" 2>/dev/null; then echo "TRAP-FAIL: wrapper alive"; else echo "wrapper-dead"; fi; \
+  if [ -f /tmp/trap-child.pid ] && kill -0 "$(cat /tmp/trap-child.pid)" 2>/dev/null; then echo "TRAP-FAIL: child survived"; else echo "TRAP-PASS: child dead"; fi; \
+  rm -f /tmp/s-hang.sh /tmp/trap-child.pid; rm -rf /tmp/h-trap'
+```
+
+(The 10 s post-TERM settle matters: bash delivers traps only after the
+current poll `sleep 5` returns — a shorter settle races it and false-fails.)
 
 - [ ] **Step 1: Timeout test (gate c) — PID-recording stub, asserted.**
 
@@ -883,7 +904,12 @@ plutil -lint ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist \
 ssh jibotmac 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && sleep 60 && cat ~/.jilog/canary-6rzb/logs/nightly-tracked.run.log'
 ```
 
-  RunAtLoad fires it once; run log ends `OK`.
+  RunAtLoad fires it once. EXPECTED ENDING under the current (fx51-standing)
+  state: the run log ends with the `known create-parse defect (jilog#fx51)
+  … exit 5` line and the label's last exit is 5 — the issue IS created;
+  verify via Step 4. Only after the fx51 fix + binary bump does a canary
+  end `OK` with exit 0. (The original execution predated the exit-5
+  contract: its run log ended with the raw warn + `exit 2` line.)
 - [ ] **Step 4: Verify + close the canary issue.** From this Mac
   (`RUNID=$(cat /tmp/canary-6rzb.runid)`): `kata --project jilog --json list
   --status open` → exactly one issue whose title contains `canary 6rzb run
