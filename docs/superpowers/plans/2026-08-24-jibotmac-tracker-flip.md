@@ -913,7 +913,12 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   silently destroy the failure evidence, since on a FAILED attempt the
   canary dir's run/launchd logs are the only evidence of what went wrong;
   the suffix is remote-evaluated and self-uniquifying, never a
-  hand-substituted placeholder inside a runnable command) —
+  hand-substituted placeholder inside a runnable command. A resulting
+  `~/.jilog/canary-6rzb.failed-<ts>` dir is DELIBERATE operator-owned
+  evidence: inspect it, then trash it by hand before close-out — check for
+  stragglers with `ls -d ~/.jilog/canary-6rzb* 2>/dev/null`; no automated
+  teardown touches it, and neither nightly lane's readers cover
+  `~/.jilog/canary-*`, so it cannot be re-scanned) —
   the RunAtLoad+token canary plist must NEVER survive a failed attempt (it
   would re-fire at next login), and the retry of Step 2 starts from an
   EMPTY canary dir with a fresh RUNID. The plist+dir removal above is
