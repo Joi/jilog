@@ -916,8 +916,8 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   hand-substituted placeholder inside a runnable command. A resulting
   `~/.jilog/canary-6rzb.failed-<ts>` dir is DELIBERATE operator-owned
   evidence: inspect it, then trash it by hand before close-out — check for
-  stragglers with `ssh jibotmac 'find ~/.jilog -maxdepth 1 -name
-  "canary-6rzb.failed-*"'` (find, not a glob, per the README's own idiom —
+  stragglers with `ssh jibotmac 'find ~/.jilog -maxdepth 1 -name "canary-6rzb.failed-*"'`
+  (find, not a glob, per the README's own idiom —
   zero matches is a clean no-op and the `.failed-` prefix excludes the
   live dir; the residue lives on jibotmac, so the check must be ssh'd);
   no automated teardown touches it, and neither nightly lane's readers
