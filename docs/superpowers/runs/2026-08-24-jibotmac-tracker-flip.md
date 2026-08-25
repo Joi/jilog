@@ -39,7 +39,7 @@ Pass 3 [plan]: 0B/3S/5C/0R · fixed 15/15 prior · velocity ↓ (15→8, escalat
   - Task 6: LOADER-OK + atomic swap + DEPLOYED-EQ-COMMITTED; asserts claude-code 0/hermes 1/none 1/zones 2; local plist reloaded, explicit isolation args in launchctl print; f1 sessions_scanned=14 (scratch ledger); f2 log 102→104, digest in ~/.jilog/digests, exit 0; g spool-ingest exit 0; h label-set diff = exactly `> com.jibot.jilog-nightly-tracked`, 12 gateway PIDs unchanged, TUNNEL-OK, KATA-OK.
   - Task 7: LOCAL-PLIST-SYNC; TRACKED-PLIST-SYNC (modulo token, armed in both). No drift to reconcile.
   - Isolation (gate b, verbatim): tracked = `--digest-dir /Users/jibot/.amplifier/health` + `--processed-file /Users/jibot/.jilog/telemetry/processed-sessions-tracked.txt` (wrapper defaults); local = `--digest-dir /Users/jibot/.jilog/digests` + `--processed-file /Users/jibot/.jilog/telemetry/processed-sessions.txt` (plist args). Pairwise distinct.
-- [ ] Chunk C (Task 8, follow-ups + final commit) — pending.
+- [x] Chunk C (Task 8, follow-ups + final commit): searched first (no existing coverage), filed FOUR follow-ups (plan said three; the canary discovery added one, justified): jilog#1dvk (warn-only tracker failures + processed-state advance), jilog#re4k (hardcoded digest path + UTC/Local date mismatch), jilog#fx51 (kata v0.15.1 create-response missing `number` — the canary discovery; includes the jibotmac exit-2 consequence + bump runbook pointer), jibot-code#41m3 (amplifierd sessions on macazbd unscanned while joimba is active — Part 2 close-out). This kata build has no link command; cross-refs are in the issue bodies.
 
 ## Notes
 - Dispatcher floored the start at medium; user instruction forbids downgrade to light.
