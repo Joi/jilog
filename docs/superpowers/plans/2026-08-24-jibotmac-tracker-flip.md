@@ -52,7 +52,7 @@ client, launchd, bash 3.2 (macOS default — no arrays/mapfile/GNU timeout).
 - One change at a time on jibotmac; verify each step before the next. Every
   machine-mutating step is RETRY-SAFE as written (guards on snapshots and
   seeds) — do not improvise variants.
-- Repo commits happen on branch `6rzb-jibotmac-tracker-flip` only.
+- Repo commits happen on branch `6rzb-jibotmac-jilog-tracker-flip` only.
 
 ## Captured current state (byte sources, fetched 2026-08-25 over ssh)
 
@@ -195,7 +195,14 @@ Machine (jibotmac):
 - Produces: the exact file contents Tasks 2–6 deploy verbatim (token
   injection and Stage-1 flag-strip excepted).
 
-- [ ] **Step 1: Write `jilog-nightly-tracked.sh`** with exactly this content:
+- [ ] **Step 1: Write `jilog-nightly-tracked.sh`.** BYTE SOURCE OF TRUTH:
+  the committed artifact `docs/ops/jibotmac-tracker-split/jilog-nightly-tracked.sh`
+  — deploy from THAT file, never from this block. The block below is the
+  originally-authored version and is retained for the review record only;
+  commit e3d0b0f hardened the artifact afterward (exit-4 mapping for
+  jilog's own rc, fx51 pattern filtered from exit 2, preflight
+  stdout+stderr capture, run-log truncation) without back-porting here.
+  Original content as first authored:
 
 ```bash
 #!/bin/bash
@@ -1078,7 +1085,7 @@ Not an Agency task; the pipeline itself executes it AFTER the chunk reviews:
   heavy loop) over the full branch diff `git diff main...HEAD`; fix or
   rebut every BLOCKER/SUBSTANTIVE; commit fixes.
 - [ ] /do-it Step 5: verification gate (`cargo test --workspace`, artifact
-  lints), push branch `6rzb-jibotmac-tracker-flip` to origin (repo is NOT
+  lints), push branch `6rzb-jibotmac-jilog-tracker-flip` to origin (repo is NOT
   marshal-managed; do not merge to main).
 - [ ] Close `jibot-code#6rzb` with the full evidence comment (commits,
   config paths + redacted contents, tunnel health output, tracked + local

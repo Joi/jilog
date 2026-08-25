@@ -35,7 +35,7 @@ mkdir -p "$LOG_DIR" "$DIGEST_DIR" "$(dirname "$PROCESSED")"
 # Cap the append-only run log; the error-loop case (when this log matters
 # most) would otherwise grow it by a full jilog output every night.
 if [ -f "$RUN_LOG" ]; then
-    tail -n 5000 "$RUN_LOG" > "$RUN_LOG.tmp" 2>/dev/null && mv "$RUN_LOG.tmp" "$RUN_LOG"
+    { tail -n 5000 "$RUN_LOG" > "$RUN_LOG.tmp" 2>/dev/null && mv "$RUN_LOG.tmp" "$RUN_LOG"; } || rm -f "$RUN_LOG.tmp"
 fi
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -45,7 +45,7 @@ ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # answers cannot wedge the label (the daemon-hang case, not just refusal).
 # kata --json reports failures on STDOUT, so capture both streams and append
 # them on the failure paths — a dead token must leave a diagnostic. ---
-PRE_LOG="$(mktemp /tmp/jilog-preflight.XXXXXX)" || exit 1
+PRE_LOG="$(mktemp /tmp/jilog-preflight.XXXXXX)" || { echo "$(ts) mktemp failed; jilog NOT run" >>"$RUN_LOG"; exit 1; }
 set -m
 "$KATA_BIN" --project jilog --json list --status open >"$PRE_LOG" 2>&1 &
 kpid=$!
@@ -73,7 +73,7 @@ fi
 rm -f "$PRE_LOG"
 
 # --- 2. Bounded run, own process group, combined stdout+stderr capture. ---
-JOB_LOG="$(mktemp /tmp/jilog-tracked.XXXXXX)" || exit 1
+JOB_LOG="$(mktemp /tmp/jilog-tracked.XXXXXX)" || { echo "$(ts) mktemp failed; jilog NOT run" >>"$RUN_LOG"; exit 1; }
 set -m
 "$JILOG_BIN" --config "$CONFIG" review nightly \
     --digest-dir "$DIGEST_DIR" \

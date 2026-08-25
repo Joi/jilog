@@ -21,6 +21,13 @@ The privacy boundary is STRUCTURAL: the tracked config carries no
 `hermes`/`generic` stanza, so LINE/Telegram/GIDC-email text never enters the
 kata-filing pipeline. Rationale and the reviewed rebuttal of a
 content-redaction alternative: spec section "Privacy boundary".
+**Standing invariant this depends on:** the tracked `claude-code` reader
+scans ALL of `~/.claude/projects`; today no process on jibotmac puts
+Hermes-surface text into Claude Code transcripts (verified 2026-08-25).
+Before adding ANY Claude-Code-based agent to this host that handles
+LINE/Telegram/GIDC-email/WhatsApp text, revisit the tracked reader (e.g.
+pin its `path` to named project subdirs) — otherwise its correction
+snippets would flow into fleet-visible kata.
 `~/.amplifier/health` is the fleet-standard tracked digest dir AND the path
 the 0.6.0 kata tracker hardcodes into issue bodies — do not move it.
 The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
