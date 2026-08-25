@@ -720,7 +720,9 @@ ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\ne
       if [ "$rc" -ne "$want" ]; then echo "HARNESS-FAIL: $t exit $rc want $want"; fail=1; else echo "T-$t exit $rc OK"; fi; done \
   ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-val.err; rc=$?; \
   if [ "$rc" -ne 0 ] || [ -s /tmp/h-val.err ]; then echo "HARNESS-FAIL: badtimeout exit $rc, stderr: $(cat /tmp/h-val.err)"; fail=1; else echo "T-badtimeout exit 0 OK"; fi \
-  ; rm -f /tmp/s-*.sh /tmp/h-val.err; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val \
+  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_PREFLIGHT_TIMEOUT_SECS=notanumber JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-pval JILOG_TRACKED_DIGEST_DIR=/tmp/h-pval/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-pval/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-pval.err; rc=$?; \
+  if [ "$rc" -ne 0 ] || [ -s /tmp/h-pval.err ]; then echo "HARNESS-FAIL: badpreflighttimeout exit $rc, stderr: $(cat /tmp/h-pval.err)"; fail=1; else echo "T-badpreflighttimeout exit 0 OK"; fi \
+  ; rm -f /tmp/s-*.sh /tmp/h-val.err /tmp/h-pval.err; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val /tmp/h-pval \
   ; if [ "$fail" -eq 0 ]; then echo HARNESS-PASS; else echo HARNESS-FAILED; exit 1; fi'
 ssh jibotmac 'printf "#!/bin/bash\nsleep 600 &\necho \$! > /tmp/trap-child.pid\nwait\n" > /tmp/s-hang.sh && chmod +x /tmp/s-hang.sh && rm -f /tmp/trap-child.pid && source ~/.zshrc.local \
   && JILOG_TRACKED_JILOG_BIN=/tmp/s-hang.sh JILOG_TRACKED_TIMEOUT_SECS=600 JILOG_TRACKED_LOG_DIR=/tmp/h-trap JILOG_TRACKED_DIGEST_DIR=/tmp/h-trap/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-trap/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>&1 & wpid=$!; \
@@ -894,19 +896,23 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   Mac) contains NO issue mentioning `canary 6rzb run $RUNID`.
   **Failure path (any failure, before OR after the canary bootstrap):**
   attempt Step 5's bootout (tolerating "not loaded"), then `ssh jibotmac
-  'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && rm -rf
-  ~/.jilog/canary-6rzb'` — the RunAtLoad+token canary plist must NEVER
-  survive a failed attempt (it would re-fire at next login), and the retry
-  of Step 2 starts from an EMPTY canary dir with a fresh RUNID. ALSO check
-  for kata-side residue before retrying: a post-bootstrap failure may have
-  already filed the old-RUNID canary issue; `kata --project jilog --json
-  list --status open`, and close any issue whose title contains `canary
-  6rzb run <oldRUNID>` (Step 4's `close --done --test` form) — the new
-  RUNID's precondition and verification cannot see it, and it would
-  otherwise sit open in fleet-visible kata forever. This is mandatory even for pre-bootstrap
-  failures: a stale `canary-<oldRUNID>.jsonl` left in `fixture/` would make
-  the eventual run file a SECOND issue under the old RUNID that nothing ever
-  closes.
+  'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && {
+  trash ~/.jilog/canary-6rzb 2>/dev/null || rm -rf ~/.jilog/canary-6rzb; }'`
+  (trash-first — on a FAILED attempt the canary dir's run/launchd logs are
+  the only evidence of what went wrong; matching Step 5 and the README) —
+  the RunAtLoad+token canary plist must NEVER survive a failed attempt (it
+  would re-fire at next login), and the retry of Step 2 starts from an
+  EMPTY canary dir with a fresh RUNID. The plist+dir removal above is
+  mandatory even for PRE-bootstrap failures: a stale
+  `canary-<oldRUNID>.jsonl` left in `fixture/` would make the eventual run
+  file a SECOND issue under the old RUNID that nothing ever closes.
+  For POST-bootstrap failures additionally check kata-side residue before
+  retrying: the run may have already filed the old-RUNID canary issue;
+  `kata --project jilog --json list --status open`, and close any issue
+  whose title contains `canary 6rzb run <oldRUNID>` (Step 4's `close
+  --done --test` form) — the new RUNID's precondition and verification
+  cannot see it, and it would otherwise sit open in fleet-visible kata
+  forever.
 - [ ] **Step 3: Install + run the canary label.** `scp
   docs/ops/jibotmac-tracker-split/canary/com.jibot.jilog-canary-6rzb.plist
   jibotmac:/tmp/jilog-canary.plist.in`, then:

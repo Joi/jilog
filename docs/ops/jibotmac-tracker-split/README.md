@@ -51,9 +51,11 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
   ANNOTATION is lost silently — but the same empty list also blinds
   `create()`'s dedup passes, so recurring signals get re-filed and kata's
   idempotency layer rejects them: the observable symptom of list-JSON
-  drift is a burst of `tracker.create failed` lines WITHOUT ``missing
-  field `number` `` → exit 2. If you are debugging exactly that, check the
-  list path too. The upstream hole is tracked on jilog#fx51 as a
+  drift is `tracker.create failed` lines whose text is NOT only the fx51
+  parse pattern — e.g. `duplicate_candidates` rejections. (A drift that
+  renames `number` everywhere yields BOTH line types in one run — the
+  real-error branch wins and the night still exits 2.) If you are
+  debugging an unexplained exit 2, check the list path too. The upstream hole is tracked on jilog#fx51 as a
   jilog-review code fix (`trackers/kata.rs` list/list_closed `unwrap_or`),
   not a wrapper change.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
