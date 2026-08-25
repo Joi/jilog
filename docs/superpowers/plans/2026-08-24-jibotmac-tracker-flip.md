@@ -720,7 +720,8 @@ ssh jibotmac 'printf "#!/bin/bash\necho \"WARN tracker.create failed: probe\"\ne
       if [ "$rc" -ne "$want" ]; then echo "HARNESS-FAIL: $t exit $rc want $want"; fail=1; else echo "T-$t exit $rc OK"; fi; done \
   ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_TIMEOUT_SECS=notanumber JILOG_TRACKED_LOG_DIR=/tmp/h-val JILOG_TRACKED_DIGEST_DIR=/tmp/h-val/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-val/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-val.err; rc=$?; \
   if [ "$rc" -ne 0 ] || [ -s /tmp/h-val.err ]; then echo "HARNESS-FAIL: badtimeout exit $rc, stderr: $(cat /tmp/h-val.err)"; fail=1; else echo "T-badtimeout exit 0 OK"; fi \
-  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_PREFLIGHT_TIMEOUT_SECS=notanumber JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-pval JILOG_TRACKED_DIGEST_DIR=/tmp/h-pval/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-pval/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-pval.err; rc=$?; \
+  ; printf "#!/bin/bash\nsleep 3\necho []\nexit 0\n" > /tmp/s-slowkata.sh; chmod +x /tmp/s-slowkata.sh \
+  ; JILOG_TRACKED_JILOG_BIN=/tmp/s-ok.sh JILOG_TRACKED_KATA_BIN=/tmp/s-slowkata.sh JILOG_TRACKED_PREFLIGHT_TIMEOUT_SECS=notanumber JILOG_TRACKED_TIMEOUT_SECS=60 JILOG_TRACKED_LOG_DIR=/tmp/h-pval JILOG_TRACKED_DIGEST_DIR=/tmp/h-pval/d JILOG_TRACKED_PROCESSED_FILE=/tmp/h-pval/p.txt ~/scripts/jilog-nightly-tracked.sh >/dev/null 2>/tmp/h-pval.err; rc=$?; \
   if [ "$rc" -ne 0 ] || [ -s /tmp/h-pval.err ]; then echo "HARNESS-FAIL: badpreflighttimeout exit $rc, stderr: $(cat /tmp/h-pval.err)"; fail=1; else echo "T-badpreflighttimeout exit 0 OK"; fi \
   ; rm -f /tmp/s-*.sh /tmp/h-val.err /tmp/h-pval.err; rm -rf /tmp/h-warn /tmp/h-fx51 /tmp/h-lo51 /tmp/h-rc7 /tmp/h-ok /tmp/h-val /tmp/h-pval \
   ; if [ "$fail" -eq 0 ]; then echo HARNESS-PASS; else echo HARNESS-FAILED; exit 1; fi'
@@ -897,8 +898,8 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   **Failure path (any failure, before OR after the canary bootstrap):**
   attempt Step 5's bootout (tolerating "not loaded"), then `ssh jibotmac
   'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && {
-  trash ~/.jilog/canary-6rzb 2>/dev/null || rm -rf ~/.jilog/canary-6rzb; }'`
-  (trash-first — on a FAILED attempt the canary dir's run/launchd logs are
+  trash ~/.jilog/canary-6rzb 2>/dev/null || mv ~/.jilog/canary-6rzb ~/.jilog/canary-6rzb.failed-<oldRUNID>; }'`
+  (trash-first; the fallback RENAMES rather than deletes — over non-interactive ssh a missing `trash` binary must not silently destroy the failure evidence — on a FAILED attempt the canary dir's run/launchd logs are
   the only evidence of what went wrong; matching Step 5 and the README) —
   the RunAtLoad+token canary plist must NEVER survive a failed attempt (it
   would re-fire at next login), and the retry of Step 2 starts from an
@@ -1165,7 +1166,7 @@ Not an Agency task; the pipeline itself executes it AFTER the chunk reviews:
   run evidence with distinct processed-files/digest-dirs, canary ref +
   RUNID, follow-up refs, review summary naming the fresheyes passes) — the
   close-out comment itself contains NO secrets and NO user text.
-- [x] `/finish-worktree`. (executed at session end)
+- [ ] `/finish-worktree`. (runs immediately after the final commit; not tickable from inside the worktree)
 
 ---
 
