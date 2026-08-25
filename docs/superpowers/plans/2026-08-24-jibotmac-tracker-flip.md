@@ -898,8 +898,13 @@ RUNID=$(date -u +%Y%m%dT%H%M%SZ) \
   **Failure path (any failure, before OR after the canary bootstrap):**
   attempt Step 5's bootout (tolerating "not loaded"), then `ssh jibotmac
   'rm -f ~/Library/LaunchAgents/com.jibot.jilog-canary-6rzb.plist && {
-  trash ~/.jilog/canary-6rzb 2>/dev/null || mv ~/.jilog/canary-6rzb ~/.jilog/canary-6rzb.failed-<oldRUNID>; }'`
-  (trash-first; the fallback RENAMES rather than deletes — over non-interactive ssh a missing `trash` binary must not silently destroy the failure evidence — on a FAILED attempt the canary dir's run/launchd logs are
+  trash ~/.jilog/canary-6rzb 2>/dev/null || mv ~/.jilog/canary-6rzb
+  ~/.jilog/canary-6rzb.failed-$(date -u +%Y%m%dT%H%M%SZ); }'`
+  (trash-first; the fallback RENAMES rather than deletes — over
+  non-interactive ssh a missing `trash` binary must not silently
+  destroy the failure evidence; the suffix is remote-evaluated and
+  self-uniquifying — never a hand-substituted placeholder inside a
+  runnable command — on a FAILED attempt the canary dir's run/launchd logs are
   the only evidence of what went wrong; matching Step 5 and the README) —
   the RunAtLoad+token canary plist must NEVER survive a failed attempt (it
   would re-fire at next login), and the retry of Step 2 starts from an
