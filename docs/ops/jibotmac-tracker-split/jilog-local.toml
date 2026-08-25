@@ -1,0 +1,34 @@
+# jilog config — jibotmac LOCAL-ONLY run (hermes surfaces; tracker = "none").
+# Split 2026-08-25 (jibot-code#6rzb, Joi ruling 2026-08-24): Claude Code
+# sessions moved to the TRACKED lane (~/.jilog-tracked.toml +
+# com.jibot.jilog-nightly-tracked), which files to kata project jilog; hermes
+# text stays in THIS local lane and must never move to a tracked config.
+# Zones below also serve com.jibot.jilog-spool-ingest — do not remove.
+
+[tracker]
+type = "none"
+
+# Fleet ledger authority (jilog#546w, wired 2026-08-18). Producers (joimba,
+# macazbd via vault sync + joimba rsync bridge) push spool files into
+# spool/public-ops; the nightly com.jibot.jilog-spool-ingest job validates,
+# dedups, and commits them into public-ops-fleet — single writer: THIS host.
+# jibotmac produces no public-ops segments itself; its ledger dir stays empty.
+[[zone]]
+id = "public-ops"
+ledger_path = "~/switchboard/ops/ledgers/public-ops"
+spool_path = "~/switchboard/ops/ledgers/spool/public-ops"
+fleet_store_path = "~/switchboard/ops/ledgers/public-ops-fleet"
+
+[[zone]]
+id = "public-ops-fleet"
+ledger_path = "~/switchboard/ops/ledgers/public-ops-fleet"
+spool = false
+
+# Hermes non-intimate surface export (jibot-code#ca49, wired 2026-08-20).
+# Populated hourly by com.jibot.hermes-jilog-export (TSV allowlist, intimate
+# profiles refused in code). Persona/chat routing needs jilog >= 0.6.0.
+[[reader]]
+type = "generic"
+name = "hermes"
+path = "/Users/jibot/.jilog/hermes-export/*/*.jsonl"
+session_id_from = "file_stem"

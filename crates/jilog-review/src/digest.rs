@@ -329,6 +329,10 @@ pub fn run_review(
         let pre_open_titles: HashSet<String> = match tracker.list_open() {
             Ok(list) => list.into_iter().map(|i| i.title).collect(),
             Err(e) => {
+                // The literal "tracker.list_open failed" text is a machine
+                // contract: jibotmac's tracked-lane wrapper greps for it to
+                // fail loudly (docs/ops/jibotmac-tracker-split/). Reword in
+                // lockstep with that script.
                 tracing::warn!("tracker.list_open failed (no recurrence annotations): {}", e);
                 HashSet::new()
             }
@@ -344,6 +348,9 @@ pub fn run_review(
 
     // Create issues if requested; build index keyed by signal_title for
     // bidirectional digest annotations (improvement 4).
+    // The literal "tracker.create failed" warn text below is a machine
+    // contract: jibotmac's tracked-lane wrapper greps for it to fail loudly
+    // (docs/ops/jibotmac-tracker-split/). Reword in lockstep with that script.
     let mut issue_index: HashMap<String, IssueRef> = HashMap::new();
     if args.create_issues && !args.dry_run {
         for correction in &all_corrections {

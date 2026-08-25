@@ -11,8 +11,11 @@
 #   3. fail-loud grep — jilog's tracker errors are warn-only on its COMBINED
 #      output (tracing writes to STDOUT); if the captured output contains
 #      them, exit 2 so launchctl shows the failure.
-# Exit codes: 1 preflight failed or timed out (jilog NOT run) / 2 tracker
-# errors in output / 3 jilog timeout / else jilog's own exit code.
+# Exit codes: 1 preflight failed or timed out (jilog NOT run) / 2 REAL
+# tracker errors in output (the known jilog#fx51 create-parse pattern is
+# filtered and only counted in the log) / 3 jilog timeout / 4 jilog itself
+# exited nonzero (its rc is in the run log; jilog's own 1/2 would collide
+# with the wrapper's contract, so it is never passed through).
 # Extra args (--create-issues once armed) pass through from the plist via
 # "$@". Env overrides exist for the canary + harness tests only.
 set -u
@@ -29,31 +32,45 @@ RUN_LOG="$LOG_DIR/nightly-tracked.run.log"
 
 mkdir -p "$LOG_DIR" "$DIGEST_DIR" "$(dirname "$PROCESSED")"
 
+# Cap the append-only run log; the error-loop case (when this log matters
+# most) would otherwise grow it by a full jilog output every night.
+if [ -f "$RUN_LOG" ]; then
+    tail -n 5000 "$RUN_LOG" > "$RUN_LOG.tmp" 2>/dev/null && mv "$RUN_LOG.tmp" "$RUN_LOG"
+fi
+
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # --- 1. Preflight (BOUNDED): real daemon round-trip; fail WITHOUT running
 # jilog. Runs in its own process group so a tunnel that accepts but never
-# answers cannot wedge the label (the daemon-hang case, not just refusal). ---
+# answers cannot wedge the label (the daemon-hang case, not just refusal).
+# kata --json reports failures on STDOUT, so capture both streams and append
+# them on the failure paths — a dead token must leave a diagnostic. ---
+PRE_LOG="$(mktemp /tmp/jilog-preflight.XXXXXX)" || exit 1
 set -m
-"$KATA_BIN" --project jilog --json list --status open >/dev/null 2>>"$RUN_LOG" &
+"$KATA_BIN" --project jilog --json list --status open >"$PRE_LOG" 2>&1 &
 kpid=$!
 set +m
 kwaited=0
 while kill -0 "$kpid" 2>/dev/null; do
     if [ "$kwaited" -ge "$PREFLIGHT_TIMEOUT_SECS" ]; then
-        echo "$(ts) preflight TIMEOUT after ${PREFLIGHT_TIMEOUT_SECS}s; killing kata; jilog NOT run" >>"$RUN_LOG"
+        cat "$PRE_LOG" >>"$RUN_LOG"
+        echo "$(ts) preflight TIMEOUT after ${PREFLIGHT_TIMEOUT_SECS}s; killing kata; jilog NOT run (kata output above)" >>"$RUN_LOG"
         kill -TERM -- "-$kpid" 2>/dev/null
         sleep 2
         kill -KILL -- "-$kpid" 2>/dev/null
+        rm -f "$PRE_LOG"
         exit 1
     fi
     sleep 2
     kwaited=$((kwaited + 2))
 done
 if ! wait "$kpid"; then
-    echo "$(ts) preflight FAILED: kata daemon unreachable; jilog NOT run" >>"$RUN_LOG"
+    cat "$PRE_LOG" >>"$RUN_LOG"
+    echo "$(ts) preflight FAILED; jilog NOT run (kata output above)" >>"$RUN_LOG"
+    rm -f "$PRE_LOG"
     exit 1
 fi
+rm -f "$PRE_LOG"
 
 # --- 2. Bounded run, own process group, combined stdout+stderr capture. ---
 JOB_LOG="$(mktemp /tmp/jilog-tracked.XXXXXX)" || exit 1
@@ -82,18 +99,28 @@ done
 wait "$pid"
 rc=$?
 
-# --- 3. Fail-loud: surface jilog's warn-only tracker errors. ---
+# --- 3. Result handling. Order matters: a nonzero jilog exit is a wholesale
+# run failure (exit 4, real rc in the log — never passed through, jilog's
+# own 1/2 would collide with this wrapper's contract). The tracker-error
+# grep applies to completed runs, and the known jilog#fx51 create-response
+# parse failure (missing field `number` against kata >=0.15 JSON; the issue
+# IS created server-side) is filtered out of the fail-loud signal so exit 2
+# keeps meaning REAL tracker trouble; filtered occurrences are counted. ---
 cat "$JOB_LOG" >>"$RUN_LOG"
-if grep -Eq 'tracker\.create failed|tracker\.list_open failed' "$JOB_LOG"; then
+if [ "$rc" -ne 0 ]; then
+    echo "$(ts) jilog exited $rc; wrapper exit 4" >>"$RUN_LOG"
+    rm -f "$JOB_LOG"
+    exit 4
+fi
+if grep -E 'tracker\.create failed|tracker\.list_open failed' "$JOB_LOG" | grep -Evq 'missing field `number`'; then
     echo "$(ts) tracker errors in output; exit 2 (digest retains signals)" >>"$RUN_LOG"
     rm -f "$JOB_LOG"
     exit 2
 fi
-rm -f "$JOB_LOG"
-
-if [ "$rc" -ne 0 ]; then
-    echo "$(ts) jilog exited $rc" >>"$RUN_LOG"
-    exit "$rc"
+known=$(grep -Ec 'tracker\.create failed.*missing field `number`' "$JOB_LOG")
+if [ "$known" -gt 0 ]; then
+    echo "$(ts) known create-parse defect (jilog#fx51): $known create response(s) unparsed; issues filed server-side, digest lacks backlinks" >>"$RUN_LOG"
 fi
+rm -f "$JOB_LOG"
 echo "$(ts) OK" >>"$RUN_LOG"
 exit 0

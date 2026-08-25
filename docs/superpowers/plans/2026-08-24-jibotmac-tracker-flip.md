@@ -163,7 +163,10 @@ Repo (all new, under `docs/ops/jibotmac-tracker-split/`):
   ARMED form (`--create-issues` present), token `REDACTED` (deployed with
   real token injected, 0600; Stage-1 install strips the flag).
 - `com.amplifier.nightly-learning.plist` — target LOCAL plist.
-- `jilog.toml` — target LOCAL config (hermes-only).
+- `jilog-local.toml` — target LOCAL config (hermes-only), deployed AS
+  `~/.jilog.toml`. (Named `jilog-local` in the repo because `.gitignore`'s
+  unanchored `jilog.toml` rule silently swallows the bare name — found by
+  roborev on the first commit.)
 - `canary/canary-6rzb.jsonl.tmpl` — fixture template (`__RUNID__`
   placeholder makes each canary run-unique).
 - `canary/jilog-canary.toml` — canary config.
@@ -390,7 +393,9 @@ project = "jilog"
   tag v0.2.0` reference corrected to `jilog v0.6.0` (the deployed binary —
   leaving v0.2.0 is misleading operational doc). Everything else
   byte-identical to the captured block.
-- [ ] **Step 5: Write `jilog.toml`** — the target LOCAL config, exactly:
+- [ ] **Step 5: Write `jilog-local.toml`** — the target LOCAL config
+  (deployed as `~/.jilog.toml`; repo name dodges the `.gitignore` rule),
+  exactly:
 
 ```toml
 # jilog config — jibotmac LOCAL-ONLY run (hermes surfaces; tracker = "none").
@@ -539,7 +544,7 @@ project = "jilog"
     attempt grep-based diffs against the live file here):
 
 ```bash
-python3 - docs/ops/jibotmac-tracker-split/jilog.toml <<'EOF'
+python3 - docs/ops/jibotmac-tracker-split/jilog-local.toml <<'EOF'
 import sys, tomllib
 new = tomllib.load(open(sys.argv[1], 'rb'))
 assert [r for r in new.get('reader', [])] == [
@@ -870,7 +875,7 @@ ssh jibotmac 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jibot.
   set; `--done` + message is the established convention here):
 
 ```bash
-kata --project jilog close <ref> --done --message "gate c3 canary (jibot-code#6rzb): tracked-lane create path verified end-to-end from launchd context on jibotmac (run $RUNID); closing as test evidence."
+kata --project jilog close <ref> --done --test "launchctl bootstrap gui/501 com.jibot.jilog-canary-6rzb.plist (one-shot canary run $RUNID)" --message "gate c3 canary (jibot-code#6rzb): tracked-lane create path verified end-to-end from launchd context on jibotmac (run $RUNID); closing as test evidence."
 ```
 
 - [ ] **Step 5: Remove the canary — bootout is a hard gate, cleanup only
@@ -917,14 +922,14 @@ plutil -lint ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist \
   atomically.**
 
 ```bash
-scp docs/ops/jibotmac-tracker-split/jilog.toml jibotmac:.jilog.toml.new \
+scp docs/ops/jibotmac-tracker-split/jilog-local.toml jibotmac:.jilog.toml.new \
   && ssh jibotmac '~/.local/bin/jilog --config ~/.jilog.toml.new review nightly --digest-dir ~/.jilog/digests --processed-file ~/.jilog/telemetry/processed-sessions.txt --dry-run --json >/dev/null && echo LOADER-OK && mv ~/.jilog.toml.new ~/.jilog.toml'
 ```
 
   (Semantic zone equality vs the original was proven in Task 1 Step 10
   against the captured bytes, and Task 2 Step 1 proved the captured bytes
   are live; the machine gate is deployed == committed:
-  `diff <(ssh jibotmac cat .jilog.toml) docs/ops/jibotmac-tracker-split/jilog.toml`.)
+  `diff <(ssh jibotmac cat .jilog.toml) docs/ops/jibotmac-tracker-split/jilog-local.toml`.)
 - [ ] **Step 2: Local config assertions (gate a, local half).**
 
 ```bash

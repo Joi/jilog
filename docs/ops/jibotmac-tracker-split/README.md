@@ -30,13 +30,22 @@ The two lanes' `--processed-file`/`--digest-dir` values MUST stay distinct
 
 - `1` — kata preflight failed or timed out (`JILOG_TRACKED_PREFLIGHT_TIMEOUT_SECS`,
   default 60 s). jilog did NOT run; no session marked processed; next night
-  retries.
-- `2` — jilog ran, but its output contained `tracker.create failed` /
-  `tracker.list_open failed` (warn-only in jilog). The digest still holds the
-  signals; re-file by hand or let the follow-up fix land.
+  retries. The kata output (stdout+stderr — `--json` errors land on stdout)
+  is appended to the run log for diagnosis.
+- `2` — jilog ran clean, but its output contained a REAL `tracker.create
+  failed` / `tracker.list_open failed` (warn-only in jilog). The known
+  jilog#fx51 create-parse pattern (``missing field `number` `` — the issue IS
+  created server-side) is filtered out of this signal and only counted in
+  the run log, so exit 2 always means genuine tracker trouble.
 - `3` — jilog exceeded `JILOG_TRACKED_TIMEOUT_SECS` (default 1800 s); its
   process group was killed.
-- else — jilog's own exit code. `0` + run log ending `OK` is a healthy night.
+- `4` — jilog itself exited nonzero (real rc in the run log). jilog's own
+  exit codes are never passed through — its `1` (any anyhow error) and `2`
+  (clap argument error) would collide with the wrapper's contract above.
+- `0` + run log ending `OK` is a healthy night (possibly with an fx51
+  known-defect count line).
+
+The run log self-truncates to its last 5000 lines at each start.
 
 Run log: `~/.jilog/logs/nightly-tracked.run.log` (wrapper) plus launchd's
 `nightly-tracked.{stdout,stderr}.log`.
@@ -76,7 +85,9 @@ ssh jibotmac 'rm ~/Library/LaunchAgents/com.jibot.jilog-nightly-tracked.plist ~/
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/jilog.toml.orig ~/.jilog.toml'
 ssh jibotmac 'cp ~/.jilog/backup-6rzb/com.amplifier.nightly-learning.plist ~/Library/LaunchAgents/'
 ssh jibotmac 'launchctl bootout gui/$(id -u)/com.amplifier.nightly-learning 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.amplifier.nightly-learning.plist'
-ssh jibotmac 'trash ~/.amplifier/health ~/.jilog/telemetry/processed-sessions-tracked.txt 2>/dev/null || rm -rf ~/.amplifier/health ~/.jilog/telemetry/processed-sessions-tracked.txt'
+ssh jibotmac 'trash ~/.amplifier/health/learning-digest-*.md ~/.jilog/telemetry/processed-sessions-tracked.txt 2>/dev/null || rm -f ~/.amplifier/health/learning-digest-*.md ~/.jilog/telemetry/processed-sessions-tracked.txt'
+# NOTE: only the digest FILES — ~/.amplifier/health is the fleet-standard
+# shared dir and is not owned by this change; never delete the directory.
 ```
 
 Disclosure is prevented, not rolled back: issues already filed to kata stay
