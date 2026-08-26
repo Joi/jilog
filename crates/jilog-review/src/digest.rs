@@ -503,26 +503,61 @@ pub fn run_review(
         )?;
     }
 
-    // Persist processed-sessions — minus any session whose tracker
-    // operations failed, so it is rescanned (and its creates retried, with
-    // idempotency/dedup absorbing the already-filed ones) next run
-    // (jilog#1dvk). The retry sidecar records the failed sessions' modified
-    // times so the next run's discovery window reaches back to them.
+    // Persist processed-sessions and the retry sidecar (jilog#1dvk).
+    //
+    // A pending retry is RESOLVED only when this run actually attempted its
+    // tracker operations and none failed: scanned, with issue creation
+    // enabled, and not in failed_sessions. Anything else — a run without
+    // --create-issues, a reader failure that kept the session out of this
+    // run's scan — carries the entry forward untouched, and a carried entry
+    // whose session was scanned anyway is also unmarked from processed so
+    // the next create-enabled run retries it (fresheyes 2026-08-26 round 2:
+    // the first version truncated the sidecar to this run's failures, which
+    // silently consumed pending retries).
     if !args.dry_run {
+        let creates_attempted = args.create_issues;
+        let mut unresolved_pending: Vec<&String> = Vec::new();
+        let mut new_retry_entries: HashMap<String, chrono::DateTime<chrono::Utc>> =
+            HashMap::new();
+        let gc_floor = args.since - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS);
+        for (sid, ts) in pending_retries.entries() {
+            if *ts < gc_floor {
+                // Past the lookback cap it can never be rediscovered —
+                // carrying it forever would only pin the widened window.
+                // Drop LOUDLY: these signals are permanently lost.
+                tracing::warn!(
+                    "retry entry {} aged past the {}-day lookback cap — dropping; its unfiled signals are lost",
+                    sid, RETRY_LOOKBACK_CAP_DAYS
+                );
+                continue;
+            }
+            let scanned = scanned_modified.contains_key(sid);
+            let resolved =
+                scanned && creates_attempted && !failed_sessions.contains(sid);
+            if !resolved {
+                new_retry_entries.insert(sid.clone(), *ts);
+                if scanned {
+                    unresolved_pending.push(sid);
+                }
+            }
+        }
+        for sid in &failed_sessions {
+            if let Some(m) = scanned_modified.get(sid) {
+                new_retry_entries.insert(sid.clone(), *m);
+            }
+        }
+
         if let (Some(ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
             for sid in &failed_sessions {
+                ps.unmark(sid);
+            }
+            for sid in unresolved_pending {
                 ps.unmark(sid);
             }
             ps.save(pf)?;
         }
         if let Some(rf) = &retry_file {
-            let entries: HashMap<String, chrono::DateTime<chrono::Utc>> = failed_sessions
-                .iter()
-                .filter_map(|sid| {
-                    scanned_modified.get(sid).map(|m| (sid.clone(), *m))
-                })
-                .collect();
-            RetrySessions::save_entries(rf, &entries)?;
+            RetrySessions::save_entries(rf, &new_retry_entries)?;
         }
     }
 
@@ -1841,6 +1876,70 @@ mod tests {
         // Run 3: nothing pending, nothing rediscovered.
         let r3 = run_review(&readers, &healthy, &args).unwrap();
         assert_eq!(r3.sessions_scanned, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_retry_not_consumed_by_creates_disabled_run() {
+        // fresheyes 2026-08-26 round 2: a run without --create-issues used
+        // to rediscover the pending session, mark it processed, and
+        // truncate the sidecar — permanently dropping the unfiled signals.
+        let dir = test_dir("retry-carry-forward");
+        let processed_file = dir.join("processed-sessions.txt");
+        let retry_file = dir.join("retry-sessions.txt");
+
+        let modified = Utc::now() - chrono::Duration::hours(3);
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {
+            session_id: "sess-pending".into(),
+            modified,
+            messages: correction_messages("no, use the gog cli for calendar"),
+        })];
+
+        // Run 1: creates on, tracker down → pending.
+        let mut args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::hours(24),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed_file.clone()),
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: true,
+        };
+        let failing = FailForSessionTracker { fail_session: "sess-pending".into() };
+        run_review(&readers, &failing, &args).unwrap();
+        assert!(fs::read_to_string(&retry_file).unwrap().contains("sess-pending"));
+
+        // Run 2: creates DISABLED. The session is rediscovered and scanned,
+        // but the pending retry must survive: sidecar keeps the entry, and
+        // the session is not persisted as processed.
+        args.create_issues = false;
+        let healthy = FailForSessionTracker { fail_session: "none".into() };
+        let r2 = run_review(&readers, &healthy, &args).unwrap();
+        assert_eq!(r2.sessions_scanned, 1);
+        assert!(
+            fs::read_to_string(&retry_file).unwrap().contains("sess-pending"),
+            "creates-disabled run must not consume the pending retry"
+        );
+        assert!(
+            !fs::read_to_string(&processed_file).unwrap().contains("sess-pending"),
+            "pending session must stay unprocessed until creates actually run"
+        );
+
+        // Run 3: reader outage — the session is not discovered at all.
+        // The sidecar entry must still be carried forward.
+        let dark_readers: Vec<Box<dyn Reader>> = vec![];
+        args.create_issues = true;
+        run_review(&dark_readers, &healthy, &args).unwrap();
+        assert!(
+            fs::read_to_string(&retry_file).unwrap().contains("sess-pending"),
+            "undiscovered pending session must carry forward"
+        );
+
+        // Run 4: creates on, session rediscovered, tracker healthy →
+        // resolved: filed, processed, sidecar drained.
+        let r4 = run_review(&readers, &healthy, &args).unwrap();
+        assert_eq!(r4.created_issues.len(), 1);
+        assert!(!fs::read_to_string(&retry_file).unwrap().contains("sess-pending"));
+        assert!(fs::read_to_string(&processed_file).unwrap().contains("sess-pending"));
         let _ = fs::remove_dir_all(&dir);
     }
 

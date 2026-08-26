@@ -317,7 +317,7 @@ The issue title is built by `signal_title()` (see `crates/jilog-review/src/track
 [jilog/deferral]   <session_id>: <truncated item>
 ```
 
-With `tracker.type = "kata"`, a run that produced the digest above shells out to the `kata` CLI once per new signal. The digest reference in the body is the run's real digest file (the configured `--digest-dir`, tilde-contracted, with the same date as the digest filename). This is the exact invocation jilog builds for the `bash` timeout error on a host using the conventional `~/.amplifier/health` digest dir:
+With `tracker.type = "kata"`, a run fetches the full open and closed listings once (`kata list --limit 0`, memoized for the run; kata >= 0.14.1 required for `--limit 0`), then shells out to `kata create` once per new signal. The digest reference in the body is the run's real digest file (the configured `--digest-dir`, tilde-contracted, with the same date as the digest filename; the CLI default without a config zone is `~/.jilog/digests`). This is the exact invocation jilog builds for the `bash` timeout error on a host whose digest dir is `~/.amplifier/health`:
 
 ```console
 $ kata --project jilog --json create \
@@ -339,7 +339,7 @@ Message: Command timed out after 30 seconds" \
 
 Priorities are fixed per kind: errors file at priority 1, corrections and patterns at 2, workarounds and deferrals at 3. The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
 
-Recurrence reopens rather than duplicates: if a **closed** kata issue carries the same title, jilog reopens it, comments `Recurred on <date> — closure may have been premature.`, and adds the `jilog:recurred` label.
+Recurrence reopens rather than duplicates: if a **closed** kata issue carries the same title, jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations).
 
 The next nightly run that observes the same `bash`-timeout cluster will see the existing `[jilog/error] bash: Command timed out after 30 seconds` issue in `list_open()` and **not** file a duplicate — it will return the same `IssueRef`, which is what the digest links back to.
 

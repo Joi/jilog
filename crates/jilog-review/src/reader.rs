@@ -260,6 +260,11 @@ impl RetrySessions {
         self.entries.is_empty()
     }
 
+    /// The pending entries: session_id → transcript modified time.
+    pub fn entries(&self) -> &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
+        &self.entries
+    }
+
     /// The oldest pending retry's transcript modified time — the point the
     /// next run's discovery window must reach back to.
     pub fn min_modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {

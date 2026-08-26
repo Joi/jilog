@@ -33,6 +33,13 @@
 //! `<ref>` is kata's short_id (e.g. `e3nj`), falling back to the full ULID
 //! or, for pre-0.15 daemons, the legacy issue number.
 //!
+//! ## Minimum kata version
+//!
+//! Listings pass `--limit 0` (unlimited), which kata accepts from v0.14.1;
+//! older CLIs reject it and every create fails with a validation error that
+//! names the required upgrade. Listings are memoized per tracker instance
+//! (one run), with create/reopen updating the memo in place.
+//!
 //! ## Label charset
 //!
 //! kata enforces `[a-z0-9._:-]` length 1..64 on labels. We use `:` (not `/`)
@@ -57,11 +64,24 @@ pub struct KataTracker {
     /// The run's digest date (same source as the digest filename). None
     /// falls back to `Local::now` (jilog#re4k).
     date: Option<String>,
+    /// Per-run memo of the full open/closed listings. Without it, a run
+    /// with N signals fetches the complete project listing O(N) times
+    /// (fresheyes 2026-08-26 round 2). jilog constructs one tracker per
+    /// run and is the single writer during the run, so the memo only needs
+    /// the updates create()/reopen() apply themselves.
+    open_cache: std::sync::Mutex<Option<Vec<IssueRef>>>,
+    closed_cache: std::sync::Mutex<Option<Vec<IssueRef>>>,
 }
 
 impl KataTracker {
     pub fn new(project: impl Into<String>) -> Self {
-        Self { project: project.into(), digest_path: None, date: None }
+        Self {
+            project: project.into(),
+            digest_path: None,
+            date: None,
+            open_cache: std::sync::Mutex::new(None),
+            closed_cache: std::sync::Mutex::new(None),
+        }
     }
 
     /// Construct with the run's digest context so issue bodies point at the
@@ -75,6 +95,8 @@ impl KataTracker {
             project: project.into(),
             digest_path: Some(digest_path.into()),
             date: Some(date.into()),
+            open_cache: std::sync::Mutex::new(None),
+            closed_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -94,17 +116,39 @@ impl KataTracker {
 
     /// List closed issues for this project (mirrors `list_open` with `--status closed`).
     fn list_closed(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
+        if let Some(cached) = self.closed_cache.lock().unwrap().as_ref() {
+            return Ok(cached.clone());
+        }
+        let issues = self.fetch_list("closed")?;
+        *self.closed_cache.lock().unwrap() = Some(issues.clone());
+        Ok(issues)
+    }
+
+    /// Fetch one full listing from the CLI (`--limit 0` = unlimited; needs
+    /// kata >= 0.14.1 — see the module doc's version note).
+    fn fetch_list(&self, status: &str) -> Result<Vec<IssueRef>, JilogReviewError> {
         let output = self
             .cmd()
-            .args(["list", "--status", "closed", "--limit", "0"])
+            .args(["list", "--status", status, "--limit", "0"])
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata list failed: {}", e)))?;
 
         if !output.status.success() {
-            return Err(parse_kata_error(&output.stdout, &output.stderr, "list"));
+            let err = parse_kata_error(&output.stdout, &output.stderr, "list");
+            // kata < 0.14.1 rejects --limit 0 ("--limit must be a positive
+            // integer"); make the version requirement explicit instead of
+            // letting every create fail with an opaque validation error.
+            let msg = err.to_string();
+            if msg.contains("positive") && msg.contains("limit") {
+                return Err(JilogReviewError::Tracker(format!(
+                    "{} — jilog requires kata >= 0.14.1 (--limit 0 = unlimited); upgrade the kata CLI",
+                    msg
+                )));
+            }
+            return Err(err);
         }
 
-        parse_list_response(&String::from_utf8_lossy(&output.stdout), "closed")
+        parse_list_response(&String::from_utf8_lossy(&output.stdout), status)
     }
 
     /// Reopen a closed issue, then annotate it with a recurrence comment and
@@ -255,7 +299,15 @@ impl Tracker for KataTracker {
                 self.run_date()
             );
             self.reopen(issue_ref, &comment)?;
-            return Ok(existing.clone());
+            // Keep the per-run memo truthful: the issue moved closed -> open.
+            let reopened = existing.clone();
+            if let Some(open) = self.open_cache.lock().unwrap().as_mut() {
+                open.push(reopened.clone());
+            }
+            if let Some(closed) = self.closed_cache.lock().unwrap().as_mut() {
+                closed.retain(|i| i.id != reopened.id);
+            }
+            return Ok(reopened);
         }
 
         let body = build_body(signal, &self.run_date(), self.digest_path.as_deref());
@@ -297,26 +349,25 @@ impl Tracker for KataTracker {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let issue_ref = parse_create_response(&stdout)?;
 
-        Ok(IssueRef {
+        let created = IssueRef {
             id: format!("#{}", issue_ref),
             backend: "kata".to_string(),
             url: None,
             title,
-        })
+        };
+        if let Some(open) = self.open_cache.lock().unwrap().as_mut() {
+            open.push(created.clone());
+        }
+        Ok(created)
     }
 
     fn list_open(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
-        let output = self
-            .cmd()
-            .args(["list", "--status", "open", "--limit", "0"])
-            .output()
-            .map_err(|e| JilogReviewError::Command(format!("kata list failed: {}", e)))?;
-
-        if !output.status.success() {
-            return Err(parse_kata_error(&output.stdout, &output.stderr, "list"));
+        if let Some(cached) = self.open_cache.lock().unwrap().as_ref() {
+            return Ok(cached.clone());
         }
-
-        parse_list_response(&String::from_utf8_lossy(&output.stdout), "open")
+        let issues = self.fetch_list("open")?;
+        *self.open_cache.lock().unwrap() = Some(issues.clone());
+        Ok(issues)
     }
 
     fn is_resolved(&self, issue: &IssueRef) -> Result<bool, JilogReviewError> {
