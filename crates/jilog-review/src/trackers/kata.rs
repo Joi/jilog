@@ -66,11 +66,13 @@ pub struct KataTracker {
     date: Option<String>,
     /// Per-run memo of the full open/closed listings. Without it, a run
     /// with N signals fetches the complete project listing O(N) times
-    /// (fresheyes 2026-08-26 round 2). jilog constructs one tracker per
-    /// run and is the single writer during the run, so the memo only needs
-    /// the updates create()/reopen() apply themselves.
-    open_cache: std::sync::Mutex<Option<Vec<IssueRef>>>,
-    closed_cache: std::sync::Mutex<Option<Vec<IssueRef>>>,
+    /// (fresheyes 2026-08-26 round 2). Failures are memoized too (as the
+    /// error message) so a daemon outage costs one subprocess per status,
+    /// not one per signal (round 3). jilog constructs one tracker per run
+    /// and is the single writer during the run, so the memo only needs the
+    /// updates create()/reopen() apply themselves.
+    open_cache: std::sync::Mutex<Option<Result<Vec<IssueRef>, String>>>,
+    closed_cache: std::sync::Mutex<Option<Result<Vec<IssueRef>, String>>>,
 }
 
 impl KataTracker {
@@ -117,11 +119,15 @@ impl KataTracker {
     /// List closed issues for this project (mirrors `list_open` with `--status closed`).
     fn list_closed(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
         if let Some(cached) = self.closed_cache.lock().unwrap().as_ref() {
-            return Ok(cached.clone());
+            return match cached {
+                Ok(v) => Ok(v.clone()),
+                Err(m) => Err(JilogReviewError::Tracker(m.clone())),
+            };
         }
-        let issues = self.fetch_list("closed")?;
-        *self.closed_cache.lock().unwrap() = Some(issues.clone());
-        Ok(issues)
+        let res = self.fetch_list("closed");
+        *self.closed_cache.lock().unwrap() =
+            Some(res.as_ref().map(|v| v.clone()).map_err(|e| e.to_string()));
+        res
     }
 
     /// Fetch one full listing from the CLI (`--limit 0` = unlimited; needs
@@ -301,10 +307,10 @@ impl Tracker for KataTracker {
             self.reopen(issue_ref, &comment)?;
             // Keep the per-run memo truthful: the issue moved closed -> open.
             let reopened = existing.clone();
-            if let Some(open) = self.open_cache.lock().unwrap().as_mut() {
+            if let Some(Ok(open)) = self.open_cache.lock().unwrap().as_mut() {
                 open.push(reopened.clone());
             }
-            if let Some(closed) = self.closed_cache.lock().unwrap().as_mut() {
+            if let Some(Ok(closed)) = self.closed_cache.lock().unwrap().as_mut() {
                 closed.retain(|i| i.id != reopened.id);
             }
             return Ok(reopened);
@@ -355,7 +361,7 @@ impl Tracker for KataTracker {
             url: None,
             title,
         };
-        if let Some(open) = self.open_cache.lock().unwrap().as_mut() {
+        if let Some(Ok(open)) = self.open_cache.lock().unwrap().as_mut() {
             open.push(created.clone());
         }
         Ok(created)
@@ -363,11 +369,15 @@ impl Tracker for KataTracker {
 
     fn list_open(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
         if let Some(cached) = self.open_cache.lock().unwrap().as_ref() {
-            return Ok(cached.clone());
+            return match cached {
+                Ok(v) => Ok(v.clone()),
+                Err(m) => Err(JilogReviewError::Tracker(m.clone())),
+            };
         }
-        let issues = self.fetch_list("open")?;
-        *self.open_cache.lock().unwrap() = Some(issues.clone());
-        Ok(issues)
+        let res = self.fetch_list("open");
+        *self.open_cache.lock().unwrap() =
+            Some(res.as_ref().map(|v| v.clone()).map_err(|e| e.to_string()));
+        res
     }
 
     fn is_resolved(&self, issue: &IssueRef) -> Result<bool, JilogReviewError> {

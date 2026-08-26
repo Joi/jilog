@@ -208,6 +208,22 @@ impl ProcessedSessions {
     }
 }
 
+/// Write `content` to `path` atomically (temp file in the same directory,
+/// then rename), so an interruption or short write can never leave partial
+/// state behind — a truncated sidecar or processed file silently loses
+/// retry/dedup records (fresheyes 2026-08-26 round 3).
+fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // RetrySessions — sidecar for sessions whose tracker ops failed (jilog#1dvk)
 // ---------------------------------------------------------------------------
@@ -246,10 +262,21 @@ impl RetrySessions {
                             entries.insert(id.to_string(), t.with_timezone(&chrono::Utc));
                         }
                         Err(e) => {
-                            tracing::warn!("retry-sessions: bad timestamp '{}': {}", ts, e);
+                            // Keep the entry alive rather than dropping the
+                            // retry: stamp it "now" so it stays pending (it
+                            // resolves normally if the transcript is still
+                            // discoverable, or ages out through the GC cap).
+                            tracing::warn!(
+                                "retry-sessions: bad timestamp '{}' for {} — keeping entry with current time: {}",
+                                ts, id, e
+                            );
+                            entries.insert(id.to_string(), chrono::Utc::now());
                         }
                     },
-                    None => tracing::warn!("retry-sessions: malformed line '{}'", line),
+                    None => tracing::warn!(
+                        "retry-sessions: malformed line '{}' (no id recoverable) — dropped",
+                        line
+                    ),
                 }
             }
         }
@@ -276,11 +303,6 @@ impl RetrySessions {
         path: &Path,
         entries: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), JilogReviewError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
         let mut sorted: Vec<(&String, &chrono::DateTime<chrono::Utc>)> =
             entries.iter().collect();
         sorted.sort();
@@ -291,19 +313,14 @@ impl RetrySessions {
             content.push_str(id);
             content.push('\n');
         }
-        std::fs::write(path, content)?;
-        Ok(())
+        write_atomic(path, &content)
     }
 }
 
 impl ProcessedSessions {
-    /// Write the full set of session IDs to `path` (sorted, one per line).
+    /// Write the full set of session IDs to `path` (sorted, one per line,
+    /// atomic temp-file + rename).
     pub fn save(&self, path: &Path) -> Result<(), JilogReviewError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
         let mut sorted: Vec<&String> = self.seen.iter().collect();
         sorted.sort();
         let mut content = String::with_capacity(sorted.len() * 32);
@@ -311,8 +328,7 @@ impl ProcessedSessions {
             content.push_str(id);
             content.push('\n');
         }
-        std::fs::write(path, content)?;
-        Ok(())
+        write_atomic(path, &content)
     }
 }
 

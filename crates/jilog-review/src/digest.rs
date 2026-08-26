@@ -235,10 +235,13 @@ pub fn run_review(
     // the window back to the oldest pending retry, a daily job would never
     // rediscover them. Capped so a permanently failing session cannot grow
     // the scan window without bound.
+    // The sidecar is named after the processed file (a.txt -> a.retry.txt)
+    // so independent review jobs with distinct --processed-file values never
+    // widen, age out, or resolve each other's retries.
     let retry_file = args
         .processed_file
         .as_ref()
-        .map(|p| p.with_file_name("retry-sessions.txt"));
+        .map(|p| p.with_extension("retry.txt"));
     let pending_retries = match &retry_file {
         Some(path) => RetrySessions::load(path)?,
         None => RetrySessions::load(std::path::Path::new("/nonexistent-retry-sessions"))?,
@@ -261,6 +264,8 @@ pub fn run_review(
     // session_id → transcript modified time for sessions scanned this run,
     // recorded so failed sessions can be written to the retry sidecar.
     let mut scanned_modified: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    let pending_ids: HashSet<String> =
+        pending_retries.entries().keys().cloned().collect();
 
     for reader in readers {
         let handles = match reader.discover(effective_since) {
@@ -272,6 +277,14 @@ pub fn run_review(
         };
 
         for handle in handles {
+            // The widened portion of the window exists ONLY to rediscover
+            // pending retries — an unrelated transcript older than the
+            // caller's `since` must not be backfilled by it (fresheyes
+            // 2026-08-26 round 3).
+            if handle.modified < args.since && !pending_ids.contains(&handle.session_id) {
+                continue;
+            }
+
             // Skip already-processed sessions.
             if let Some(ref ps) = processed {
                 if ps.contains(&handle.session_id) {
@@ -483,8 +496,18 @@ pub fn run_review(
     // overwrite the populated digest with an empty one. The signal lists
     // only contain THIS run's findings, not the prior run's, so we have
     // no way to "merge" — skipping the write is the conservative choice.
+    // A retry-only run (every scanned session was a pending retry) must
+    // also not overwrite an existing same-date digest: the first run's
+    // digest already recorded these sessions' signals alongside everything
+    // else, and rewriting it with just the retried subset would delete the
+    // rest (fresheyes 2026-08-26 round 3). Like the sessions_scanned == 0
+    // guard, skipping the write is the conservative choice — there is no
+    // merge source for the prior run's signal lists.
+    let retry_only_run = sessions_scanned > 0
+        && scanned_modified.keys().all(|sid| pending_ids.contains(sid));
     let should_write = !args.dry_run
-        && !(sessions_scanned == 0 && digest_path.exists());
+        && !(sessions_scanned == 0 && digest_path.exists())
+        && !(retry_only_run && digest_path.exists());
 
     if should_write {
         write_digest(
@@ -1769,8 +1792,10 @@ mod tests {
         let akiko = report.personas.get("akiko").expect("akiko rollup");
         assert_eq!(akiko.input_tokens, 800);
         assert_eq!(akiko.cost_usd, Some(Decimal::from_str("1.5").unwrap()));
-        // A stats-only session (no messages → no signals) must still appear
-        // in the rollup with its sessions counted.
+        // A session with messages but no detected signals must still appear
+        // in the rollup with its sessions and usage counted. (A session with
+        // NO messages and no events is skipped before stats are read — that
+        // early-return is pre-existing pipeline behavior.)
         assert_eq!(akiko.sessions, 1);
 
         let body = fs::read_to_string(&report.digest_path).unwrap();
@@ -1827,7 +1852,7 @@ mod tests {
     fn retry_survives_since_window_via_sidecar() {
         let dir = test_dir("retry-window");
         let processed_file = dir.join("processed-sessions.txt");
-        let retry_file = dir.join("retry-sessions.txt");
+        let retry_file = dir.join("processed-sessions.retry.txt");
 
         // Session transcript last touched 30h ago.
         let modified = Utc::now() - chrono::Duration::hours(30);
@@ -1857,12 +1882,26 @@ mod tests {
         // Run 2: tonight's window (since = 24h ago) no longer covers the
         // 30h-old transcript. Without the sidecar widening, the session is
         // gone forever; with it, it is rediscovered and the create retries.
+        // An UNRELATED transcript of the same age must NOT ride the widened
+        // window in (fresheyes 2026-08-26 round 3).
         args.since = Utc::now() - chrono::Duration::hours(24);
+        let readers2: Vec<Box<dyn Reader>> = vec![
+            Box::new(SinceAwareReader {
+                session_id: "sess-aging".into(),
+                modified,
+                messages: correction_messages("no, use the gog cli for calendar"),
+            }),
+            Box::new(SinceAwareReader {
+                session_id: "sess-unrelated-old".into(),
+                modified,
+                messages: correction_messages("no, that path is wrong"),
+            }),
+        ];
         let healthy = FailForSessionTracker { fail_session: "no-such-session".into() };
-        let r2 = run_review(&readers, &healthy, &args).unwrap();
+        let r2 = run_review(&readers2, &healthy, &args).unwrap();
         assert_eq!(
             r2.sessions_scanned, 1,
-            "failed session must be rediscovered past the since cutoff (jilog#1dvk)"
+            "only the pending retry may be rediscovered past the since cutoff — no backfill (jilog#1dvk)"
         );
         assert_eq!(r2.tracker_failures, 0);
         assert_eq!(r2.created_issues.len(), 1);
@@ -1886,7 +1925,7 @@ mod tests {
         // truncate the sidecar — permanently dropping the unfiled signals.
         let dir = test_dir("retry-carry-forward");
         let processed_file = dir.join("processed-sessions.txt");
-        let retry_file = dir.join("retry-sessions.txt");
+        let retry_file = dir.join("processed-sessions.retry.txt");
 
         let modified = Utc::now() - chrono::Duration::hours(3);
         let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {
@@ -2035,6 +2074,16 @@ mod tests {
 
         let persisted2 = fs::read_to_string(&processed_file).unwrap();
         assert!(persisted2.contains("sess-ok") && persisted2.contains("sess-bad"));
+
+        // The retry-only second run must NOT have overwritten the same-date
+        // digest: run 1's digest recorded BOTH sessions' signals (fresheyes
+        // 2026-08-26 round 3).
+        let digest = fs::read_to_string(&report.digest_path).unwrap();
+        assert!(
+            digest.contains("use the gog cli") && digest.contains("stop rewriting the config"),
+            "retry-only rerun overwrote the fuller same-date digest:\n{}",
+            digest
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
