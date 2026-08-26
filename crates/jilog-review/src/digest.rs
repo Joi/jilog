@@ -14,16 +14,11 @@ use crate::detectors::{
 };
 use crate::error::JilogReviewError;
 use crate::health::detect_health_patterns;
-use crate::reader::{ProcessedSessions, Reader, RetrySessions};
+use crate::reader::{ProcessedSessions, Reader, RetrySessions, TranscriptHandle, RETRY_LOOKBACK_CAP_DAYS};
 use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Signal, Workaround};
 use crate::tracker::{IssueRef, Tracker, signal_title};
 use crate::util::{python_repr, truncate_with_marker};
 
-/// Upper bound on how far the retry sidecar may widen the discovery window
-/// past the caller's `since` (jilog#1dvk). A permanently failing session
-/// stops widening the window after this many days; its retry entry keeps
-/// being rewritten, but scans stay bounded.
-const RETRY_LOOKBACK_CAP_DAYS: i64 = 14;
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -235,16 +230,21 @@ pub fn run_review(
     // the window back to the oldest pending retry, a daily job would never
     // rediscover them. Capped so a permanently failing session cannot grow
     // the scan window without bound.
-    // The sidecar is named after the processed file (a.txt -> a.retry.txt)
-    // so independent review jobs with distinct --processed-file values never
-    // widen, age out, or resolve each other's retries.
-    let retry_file = args
-        .processed_file
-        .as_ref()
-        .map(|p| p.with_extension("retry.txt"));
+    // The sidecar name APPENDS to the processed filename (a.txt ->
+    // a.txt.retry, a.log -> a.log.retry) so independent review jobs with
+    // distinct --processed-file values can never share a sidecar — an
+    // extension REPLACEMENT would collapse a.txt and a.log onto one file
+    // (fresheyes 2026-08-26 round 4).
+    let retry_file = args.processed_file.as_ref().map(|p| {
+        let name = p
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "processed-sessions".to_string());
+        p.with_file_name(format!("{}.retry", name))
+    });
     let pending_retries = match &retry_file {
         Some(path) => RetrySessions::load(path)?,
-        None => RetrySessions::load(std::path::Path::new("/nonexistent-retry-sessions"))?,
+        None => RetrySessions::empty(),
     };
     let effective_since = match pending_retries.min_modified() {
         Some(oldest) => {
@@ -314,7 +314,34 @@ pub fn run_review(
             };
 
             if messages.is_empty() && events.is_empty() {
-                continue; // nothing to analyze
+                // Nothing to run detectors on — but a reader may still
+                // report usage for the session (fresheyes 2026-08-26 round
+                // 4). Count it so the spend totals and persona rollup stay
+                // complete; skip it entirely only when there are no stats
+                // either.
+                match reader.load_stats(&handle) {
+                    Ok(Some(stats)) => {
+                        fold_session_stats(
+                            &mut spend,
+                            &mut session_costs,
+                            &mut personas,
+                            &handle,
+                            &stats,
+                            true,
+                        );
+                        sessions_scanned += 1;
+                        scanned_modified.insert(handle.session_id.clone(), handle.modified);
+                        if let Some(ref mut ps) = processed {
+                            ps.mark(&handle.session_id);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        "reader '{}' load_stats failed for {}: {}",
+                        reader.name(), handle.session_id, e
+                    ),
+                }
+                continue;
             }
 
             // Chat sessions (persona present) use the chat-tuned correction
@@ -374,31 +401,20 @@ pub fn run_review(
             all_patterns.extend(patterns);
 
             // Optional usage/spend stats; Ok(None) means the source format
-            // carries no usage data.
+            // carries no usage data. A load_stats error is deliberately a
+            // warning, not a retry: the session's SIGNALS were already
+            // extracted and (if enabled) filed — re-queuing the whole
+            // session to recover advisory usage numbers would repeat
+            // tracker operations for observability data.
             match reader.load_stats(&handle) {
-                Ok(Some(stats)) => {
-                    let cost = accumulate_stats(&mut spend, &stats, &handle.session_id);
-                    if let Some(c) = cost {
-                        session_costs.insert(handle.session_id.clone(), c);
-                    }
-                    // Fold usage into the fleet rollup: tokens always, cost
-                    // only when the transcript carried one (jilog#2hwm).
-                    if let Some(persona) = handle.persona.clone() {
-                        let counts = personas
-                            .entry((persona.clone(), handle.channel.clone()))
-                            .or_insert_with(|| PersonaCounts {
-                                persona,
-                                channel: handle.channel.clone(),
-                                ..Default::default()
-                            });
-                        counts.input_tokens += stats.input_tokens;
-                        counts.output_tokens += stats.output_tokens;
-                        if let Some(c) = cost {
-                            counts.cost_usd =
-                                Some(counts.cost_usd.unwrap_or(Decimal::ZERO) + c);
-                        }
-                    }
-                }
+                Ok(Some(stats)) => fold_session_stats(
+                    &mut spend,
+                    &mut session_costs,
+                    &mut personas,
+                    &handle,
+                    &stats,
+                    false,
+                ),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
                     "reader '{}' load_stats failed for {}: {}",
@@ -496,6 +512,47 @@ pub fn run_review(
     // overwrite the populated digest with an empty one. The signal lists
     // only contain THIS run's findings, not the prior run's, so we have
     // no way to "merge" — skipping the write is the conservative choice.
+    // Persist the retry sidecar BEFORE the fallible digest and
+    // processed-file writes: if either of those errors out, the pending
+    // failures are already durably recorded and the run's early return
+    // cannot lose them (fresheyes 2026-08-26 round 4).
+    let creates_attempted = args.create_issues;
+    let mut unresolved_pending: Vec<String> = Vec::new();
+    if !args.dry_run {
+        let mut new_retry_entries: HashMap<String, chrono::DateTime<chrono::Utc>> =
+            HashMap::new();
+        let gc_floor = args.since - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS);
+        for (sid, ts) in pending_retries.entries() {
+            if *ts < gc_floor {
+                // Past the lookback cap it can never be rediscovered —
+                // carrying it forever would only pin the widened window.
+                // Drop LOUDLY: these signals are permanently lost.
+                tracing::warn!(
+                    "retry entry {} aged past the {}-day lookback cap — dropping; its unfiled signals are lost",
+                    sid, RETRY_LOOKBACK_CAP_DAYS
+                );
+                continue;
+            }
+            let scanned = scanned_modified.contains_key(sid);
+            let resolved =
+                scanned && creates_attempted && !failed_sessions.contains(sid);
+            if !resolved {
+                new_retry_entries.insert(sid.clone(), *ts);
+                if scanned {
+                    unresolved_pending.push(sid.clone());
+                }
+            }
+        }
+        for sid in &failed_sessions {
+            if let Some(m) = scanned_modified.get(sid) {
+                new_retry_entries.insert(sid.clone(), *m);
+            }
+        }
+        if let Some(rf) = &retry_file {
+            RetrySessions::save_entries(rf, &new_retry_entries)?;
+        }
+    }
+
     // A retry-only run (every scanned session was a pending retry) must
     // also not overwrite an existing same-date digest: the first run's
     // digest already recorded these sessions' signals alongside everything
@@ -526,61 +583,21 @@ pub fn run_review(
         )?;
     }
 
-    // Persist processed-sessions and the retry sidecar (jilog#1dvk).
-    //
-    // A pending retry is RESOLVED only when this run actually attempted its
-    // tracker operations and none failed: scanned, with issue creation
-    // enabled, and not in failed_sessions. Anything else — a run without
-    // --create-issues, a reader failure that kept the session out of this
-    // run's scan — carries the entry forward untouched, and a carried entry
-    // whose session was scanned anyway is also unmarked from processed so
-    // the next create-enabled run retries it (fresheyes 2026-08-26 round 2:
-    // the first version truncated the sidecar to this run's failures, which
-    // silently consumed pending retries).
+    // Persist processed-sessions (jilog#1dvk): the retry sidecar above
+    // already recorded pending failures durably; here the failed and
+    // still-pending scanned sessions are unmarked so the next
+    // create-enabled run rescans them. A pending retry counted as RESOLVED
+    // only when this run actually attempted its tracker operations and none
+    // failed (fresheyes rounds 2+4).
     if !args.dry_run {
-        let creates_attempted = args.create_issues;
-        let mut unresolved_pending: Vec<&String> = Vec::new();
-        let mut new_retry_entries: HashMap<String, chrono::DateTime<chrono::Utc>> =
-            HashMap::new();
-        let gc_floor = args.since - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS);
-        for (sid, ts) in pending_retries.entries() {
-            if *ts < gc_floor {
-                // Past the lookback cap it can never be rediscovered —
-                // carrying it forever would only pin the widened window.
-                // Drop LOUDLY: these signals are permanently lost.
-                tracing::warn!(
-                    "retry entry {} aged past the {}-day lookback cap — dropping; its unfiled signals are lost",
-                    sid, RETRY_LOOKBACK_CAP_DAYS
-                );
-                continue;
-            }
-            let scanned = scanned_modified.contains_key(sid);
-            let resolved =
-                scanned && creates_attempted && !failed_sessions.contains(sid);
-            if !resolved {
-                new_retry_entries.insert(sid.clone(), *ts);
-                if scanned {
-                    unresolved_pending.push(sid);
-                }
-            }
-        }
-        for sid in &failed_sessions {
-            if let Some(m) = scanned_modified.get(sid) {
-                new_retry_entries.insert(sid.clone(), *m);
-            }
-        }
-
         if let (Some(ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
             for sid in &failed_sessions {
                 ps.unmark(sid);
             }
-            for sid in unresolved_pending {
+            for sid in &unresolved_pending {
                 ps.unmark(sid);
             }
             ps.save(pf)?;
-        }
-        if let Some(rf) = &retry_file {
-            RetrySessions::save_entries(rf, &new_retry_entries)?;
         }
     }
 
@@ -941,6 +958,44 @@ fn format_usd(d: &Decimal) -> String {
         d.rescale(2);
     }
     format!("${}", d)
+}
+
+/// Fold one session's stats into the spend totals, the per-session cost
+/// map, and the persona usage rollup (jilog#2hwm). Shared by the normal
+/// scan path and the stats-only (no messages/events) path.
+/// `count_session`: true on the stats-only path, where the signal-stamping
+/// block (which normally counts the session into the persona rollup) never
+/// runs.
+fn fold_session_stats(
+    spend: &mut SpendSummary,
+    session_costs: &mut HashMap<String, Decimal>,
+    personas: &mut BTreeMap<(String, Option<String>), PersonaCounts>,
+    handle: &TranscriptHandle,
+    stats: &crate::reader::SessionStats,
+    count_session: bool,
+) {
+    let cost = accumulate_stats(spend, stats, &handle.session_id);
+    if let Some(c) = cost {
+        session_costs.insert(handle.session_id.clone(), c);
+    }
+    // Tokens always; cost only when the transcript carried one.
+    if let Some(persona) = handle.persona.clone() {
+        let counts = personas
+            .entry((persona.clone(), handle.channel.clone()))
+            .or_insert_with(|| PersonaCounts {
+                persona,
+                channel: handle.channel.clone(),
+                ..Default::default()
+            });
+        if count_session {
+            counts.sessions += 1;
+        }
+        counts.input_tokens += stats.input_tokens;
+        counts.output_tokens += stats.output_tokens;
+        if let Some(c) = cost {
+            counts.cost_usd = Some(counts.cost_usd.unwrap_or(Decimal::ZERO) + c);
+        }
+    }
 }
 
 /// Fold one session's [`SessionStats`] into the run-wide [`SpendSummary`].
@@ -1852,7 +1907,7 @@ mod tests {
     fn retry_survives_since_window_via_sidecar() {
         let dir = test_dir("retry-window");
         let processed_file = dir.join("processed-sessions.txt");
-        let retry_file = dir.join("processed-sessions.retry.txt");
+        let retry_file = dir.join("processed-sessions.txt.retry");
 
         // Session transcript last touched 30h ago.
         let modified = Utc::now() - chrono::Duration::hours(30);
@@ -1918,6 +1973,137 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Reader with usage stats but NO messages/events — e.g. a source that
+    /// only exports counters (fresheyes 2026-08-26 round 4).
+    struct StatsOnlyReader {
+        session_id: String,
+        stats: SessionStats,
+        persona: Option<String>,
+    }
+
+    impl Reader for StatsOnlyReader {
+        fn name(&self) -> &str {
+            "stats-only"
+        }
+        fn discover(&self, _since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
+            Ok(vec![TranscriptHandle {
+                session_id: self.session_id.clone(),
+                path: PathBuf::from("/nonexistent/fixture.jsonl"),
+                modified: Utc::now(),
+                reader_name: "stats-only".to_string(),
+                persona: self.persona.clone(),
+                channel: None,
+            }])
+        }
+        fn load(&self, _handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
+            Ok(vec![])
+        }
+        fn load_stats(
+            &self,
+            _handle: &TranscriptHandle,
+        ) -> Result<Option<SessionStats>, JilogReviewError> {
+            Ok(Some(self.stats.clone()))
+        }
+    }
+
+    #[test]
+    fn stats_only_session_counts_toward_spend_and_personas() {
+        let dir = test_dir("stats-only");
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(StatsOnlyReader {
+            session_id: "sess-counters".into(),
+            stats: SessionStats {
+                cost_usd: None,
+                input_tokens: 500,
+                output_tokens: 25,
+                role: None,
+                model_costs: BTreeMap::new(),
+            },
+            persona: Some("meter".into()),
+        })];
+        let tracker = OpenTitlesTracker { titles: vec![] };
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &tracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 1, "stats-only session must be counted");
+        let spend = report.spend.expect("stats were provided");
+        assert_eq!(spend.input_tokens, 500);
+        let meter = report.personas.get("meter").expect("persona rollup entry");
+        assert_eq!(meter.sessions, 1);
+        assert_eq!(meter.input_tokens, 500);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_sidecar_timestamp_still_rediscovers_old_transcript() {
+        // A pending entry with an unparseable timestamp must still widen
+        // the window enough to rediscover an old transcript (fresheyes
+        // 2026-08-26 round 4: a "now" stamp kept the entry but never
+        // widened the window).
+        let dir = test_dir("retry-corrupt-ts");
+        let processed_file = dir.join("processed-sessions.txt");
+        let retry_file = dir.join("processed-sessions.txt.retry");
+        fs::write(&retry_file, "not-a-timestamp\tsess-corrupt\n").unwrap();
+
+        let modified = Utc::now() - chrono::Duration::hours(30);
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {
+            session_id: "sess-corrupt".into(),
+            modified,
+            messages: correction_messages("no, use the gog cli for calendar"),
+        })];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::hours(24),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed_file),
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: true,
+        };
+        let healthy = FailForSessionTracker { fail_session: "none".into() };
+        let report = run_review(&readers, &healthy, &args).unwrap();
+        assert_eq!(
+            report.sessions_scanned, 1,
+            "corrupt-timestamp retry must still be rediscovered past the since cutoff"
+        );
+        assert_eq!(report.created_issues.len(), 1);
+        assert!(!fs::read_to_string(&retry_file).unwrap().contains("sess-corrupt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_names_do_not_collide_across_processed_files() {
+        // a.txt and a.log must map to distinct sidecars (fresheyes round 4:
+        // with_extension collapsed both onto a.retry.txt).
+        let dir = test_dir("sidecar-isolation");
+        for name in ["a.txt", "a.log"] {
+            let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {
+                session_id: format!("sess-{}", name),
+                modified: Utc::now() - chrono::Duration::hours(1),
+                messages: correction_messages("no, that is the wrong file entirely"),
+            })];
+            let args = ReviewArgs {
+                since: Utc::now() - chrono::Duration::days(1),
+                digest_dir: dir.clone(),
+                processed_file: Some(dir.join(name)),
+                date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+                dry_run: false,
+                create_issues: true,
+            };
+            let failing = FailForSessionTracker { fail_session: format!("sess-{}", name) };
+            run_review(&readers, &failing, &args).unwrap();
+        }
+        let a_txt = fs::read_to_string(dir.join("a.txt.retry")).unwrap();
+        let a_log = fs::read_to_string(dir.join("a.log.retry")).unwrap();
+        assert!(a_txt.contains("sess-a.txt") && !a_txt.contains("sess-a.log"));
+        assert!(a_log.contains("sess-a.log") && !a_log.contains("sess-a.txt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pending_retry_not_consumed_by_creates_disabled_run() {
         // fresheyes 2026-08-26 round 2: a run without --create-issues used
@@ -1925,7 +2111,7 @@ mod tests {
         // truncate the sidecar — permanently dropping the unfiled signals.
         let dir = test_dir("retry-carry-forward");
         let processed_file = dir.join("processed-sessions.txt");
-        let retry_file = dir.join("processed-sessions.retry.txt");
+        let retry_file = dir.join("processed-sessions.txt.retry");
 
         let modified = Utc::now() - chrono::Duration::hours(3);
         let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {

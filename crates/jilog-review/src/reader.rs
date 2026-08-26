@@ -208,20 +208,53 @@ impl ProcessedSessions {
     }
 }
 
-/// Write `content` to `path` atomically (temp file in the same directory,
-/// then rename), so an interruption or short write can never leave partial
-/// state behind — a truncated sidecar or processed file silently loses
-/// retry/dedup records (fresheyes 2026-08-26 round 3).
+/// Write `content` to `path` atomically: a uniquely named, exclusively
+/// created temp file in the same directory, then rename. An interruption or
+/// short write can never leave partial state behind — a truncated sidecar
+/// or processed file silently loses retry/dedup records (fresheyes
+/// 2026-08-26 rounds 3-4). The temp name embeds the pid and a process-wide
+/// counter and is opened with `create_new`, so it never truncates an
+/// unrelated file, follows a planted symlink, or collides with the
+/// destination or a concurrent writer.
 fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
+    use std::io::Write as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let base = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    loop {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_file_name(format!(
+            ".{}.{}.{}.tmp",
+            base,
+            std::process::id(),
+            n
+        ));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(content.as_bytes()).and_then(|_| f.sync_all()) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,11 +272,26 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
 /// discovery window back to the oldest pending retry.
 ///
 /// File format: one `<RFC3339 modified>\t<session_id>` per line.
+///
+/// [`RETRY_LOOKBACK_CAP_DAYS`] bounds how far a pending entry may widen a
+/// run's discovery window past its `since` (and doubles as the GC horizon
+/// for entries that can no longer be rediscovered).
 pub struct RetrySessions {
     entries: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 
+/// Upper bound on how far the retry sidecar may widen the discovery window
+/// past the caller's `since` (jilog#1dvk). A permanently failing session
+/// stops widening the window after this many days; its retry entry keeps
+/// being rewritten, but scans stay bounded.
+pub const RETRY_LOOKBACK_CAP_DAYS: i64 = 14;
+
 impl RetrySessions {
+    /// An empty queue, touching no filesystem path.
+    pub fn empty() -> Self {
+        Self { entries: std::collections::HashMap::new() }
+    }
+
     /// Load from `path`; missing file = empty queue. Malformed lines are
     /// skipped with a warning (a corrupt sidecar must not kill the run —
     /// worst case is a narrower window, i.e. the pre-sidecar behavior).
@@ -263,14 +311,18 @@ impl RetrySessions {
                         }
                         Err(e) => {
                             // Keep the entry alive rather than dropping the
-                            // retry: stamp it "now" so it stays pending (it
-                            // resolves normally if the transcript is still
-                            // discoverable, or ages out through the GC cap).
+                            // retry — stamped just inside the lookback cap,
+                            // so the discovery window still widens far
+                            // enough to rediscover an old transcript (a
+                            // "now" stamp would keep the entry pending but
+                            // never widen the window — fresheyes round 4).
+                            let assumed = chrono::Utc::now()
+                                - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS - 1);
                             tracing::warn!(
-                                "retry-sessions: bad timestamp '{}' for {} — keeping entry with current time: {}",
-                                ts, id, e
+                                "retry-sessions: bad timestamp '{}' for {} — keeping entry, assuming modified {}: {}",
+                                ts, id, assumed.to_rfc3339(), e
                             );
-                            entries.insert(id.to_string(), chrono::Utc::now());
+                            entries.insert(id.to_string(), assumed);
                         }
                     },
                     None => tracing::warn!(

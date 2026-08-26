@@ -241,7 +241,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         .collect::<serde_json::Map<String, serde_json::Value>>();
 
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "sessions_scanned": report.sessions_scanned,
         "tracker_failures": report.tracker_failures,
         "corrections": report.corrections.len(),
@@ -420,7 +420,7 @@ mod tests {
                 }
             })
         );
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], 2);
         assert_eq!(parsed["sessions_scanned"], 3);
         assert_eq!(
             parsed["p0_alerts"]["bash"],
