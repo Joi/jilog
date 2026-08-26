@@ -494,7 +494,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jilog"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "jilog-review"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -555,7 +555,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "ledger-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "ledger-spool"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "ledger-core",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "ledger-sqlite"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "ledger-core",
