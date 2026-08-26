@@ -14,10 +14,16 @@ use crate::detectors::{
 };
 use crate::error::JilogReviewError;
 use crate::health::detect_health_patterns;
-use crate::reader::{ProcessedSessions, Reader};
+use crate::reader::{ProcessedSessions, Reader, RetrySessions};
 use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Signal, Workaround};
 use crate::tracker::{IssueRef, Tracker, signal_title};
 use crate::util::{python_repr, truncate_with_marker};
+
+/// Upper bound on how far the retry sidecar may widen the discovery window
+/// past the caller's `since` (jilog#1dvk). A permanently failing session
+/// stops widening the window after this many days; its retry entry keeps
+/// being rewritten, but scans stay bounded.
+const RETRY_LOOKBACK_CAP_DAYS: i64 = 14;
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -224,8 +230,40 @@ pub fn run_review(
         None => None,
     };
 
+    // Retry sidecar (jilog#1dvk): sessions whose tracker ops failed last run
+    // were unmarked, but discovery is bounded by `since` — without widening
+    // the window back to the oldest pending retry, a daily job would never
+    // rediscover them. Capped so a permanently failing session cannot grow
+    // the scan window without bound.
+    let retry_file = args
+        .processed_file
+        .as_ref()
+        .map(|p| p.with_file_name("retry-sessions.txt"));
+    let pending_retries = match &retry_file {
+        Some(path) => RetrySessions::load(path)?,
+        None => RetrySessions::load(std::path::Path::new("/nonexistent-retry-sessions"))?,
+    };
+    let effective_since = match pending_retries.min_modified() {
+        Some(oldest) => {
+            let widened = std::cmp::min(args.since, oldest - chrono::Duration::seconds(1));
+            let floor = args.since - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS);
+            let clamped = std::cmp::max(widened, floor);
+            if clamped < args.since {
+                tracing::info!(
+                    "retry queue pending: widening discovery window from {} to {}",
+                    args.since, clamped
+                );
+            }
+            clamped
+        }
+        None => args.since,
+    };
+    // session_id → transcript modified time for sessions scanned this run,
+    // recorded so failed sessions can be written to the retry sidecar.
+    let mut scanned_modified: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+
     for reader in readers {
-        let handles = match reader.discover(args.since) {
+        let handles = match reader.discover(effective_since) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!("reader '{}' discover failed: {}", reader.name(), e);
@@ -356,6 +394,7 @@ pub fn run_review(
             }
 
             sessions_scanned += 1;
+            scanned_modified.insert(handle.session_id.clone(), handle.modified);
 
             if let Some(ref mut ps) = processed {
                 ps.mark(&handle.session_id);
@@ -467,13 +506,23 @@ pub fn run_review(
     // Persist processed-sessions — minus any session whose tracker
     // operations failed, so it is rescanned (and its creates retried, with
     // idempotency/dedup absorbing the already-filed ones) next run
-    // (jilog#1dvk).
+    // (jilog#1dvk). The retry sidecar records the failed sessions' modified
+    // times so the next run's discovery window reaches back to them.
     if !args.dry_run {
-        if let (Some(ref mut ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
+        if let (Some(ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
             for sid in &failed_sessions {
                 ps.unmark(sid);
             }
             ps.save(pf)?;
+        }
+        if let Some(rf) = &retry_file {
+            let entries: HashMap<String, chrono::DateTime<chrono::Utc>> = failed_sessions
+                .iter()
+                .filter_map(|sid| {
+                    scanned_modified.get(sid).map(|m| (sid.clone(), *m))
+                })
+                .collect();
+            RetrySessions::save_entries(rf, &entries)?;
         }
     }
 
@@ -1700,6 +1749,98 @@ mod tests {
             "priced usage suffix missing:\n{}",
             body
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#1dvk — retry must survive the since-window: a failed session
+    // older than the next run's cutoff is rediscovered via the retry sidecar
+    // -----------------------------------------------------------------------
+
+    /// Reader that respects `since`, like every real reader (the plain
+    /// FixtureReader ignores it, which is exactly how the aging-out bug
+    /// slipped past the first test — fresheyes 2026-08-26).
+    struct SinceAwareReader {
+        session_id: String,
+        modified: DateTime<Utc>,
+        messages: Vec<Message>,
+    }
+
+    impl Reader for SinceAwareReader {
+        fn name(&self) -> &str {
+            "since-aware"
+        }
+        fn discover(&self, since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
+            if self.modified < since {
+                return Ok(vec![]);
+            }
+            Ok(vec![TranscriptHandle {
+                session_id: self.session_id.clone(),
+                path: PathBuf::from("/nonexistent/fixture.jsonl"),
+                modified: self.modified,
+                reader_name: "since-aware".to_string(),
+                persona: None,
+                channel: None,
+            }])
+        }
+        fn load(&self, _handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
+            Ok(self.messages.clone())
+        }
+    }
+
+    #[test]
+    fn retry_survives_since_window_via_sidecar() {
+        let dir = test_dir("retry-window");
+        let processed_file = dir.join("processed-sessions.txt");
+        let retry_file = dir.join("retry-sessions.txt");
+
+        // Session transcript last touched 30h ago.
+        let modified = Utc::now() - chrono::Duration::hours(30);
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(SinceAwareReader {
+            session_id: "sess-aging".into(),
+            modified,
+            messages: correction_messages("no, use the gog cli for calendar"),
+        })];
+
+        // Run 1: window still covers the session (since = 36h ago); the
+        // tracker fails, so the session is unmarked and lands in the sidecar.
+        let mut args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::hours(36),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed_file.clone()),
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: true,
+        };
+        let failing = FailForSessionTracker { fail_session: "sess-aging".into() };
+        let r1 = run_review(&readers, &failing, &args).unwrap();
+        assert_eq!(r1.sessions_scanned, 1);
+        assert_eq!(r1.tracker_failures, 1);
+        let sidecar = fs::read_to_string(&retry_file).unwrap();
+        assert!(sidecar.contains("sess-aging"), "sidecar must record the failure: {}", sidecar);
+
+        // Run 2: tonight's window (since = 24h ago) no longer covers the
+        // 30h-old transcript. Without the sidecar widening, the session is
+        // gone forever; with it, it is rediscovered and the create retries.
+        args.since = Utc::now() - chrono::Duration::hours(24);
+        let healthy = FailForSessionTracker { fail_session: "no-such-session".into() };
+        let r2 = run_review(&readers, &healthy, &args).unwrap();
+        assert_eq!(
+            r2.sessions_scanned, 1,
+            "failed session must be rediscovered past the since cutoff (jilog#1dvk)"
+        );
+        assert_eq!(r2.tracker_failures, 0);
+        assert_eq!(r2.created_issues.len(), 1);
+
+        // Sidecar drained; session persisted as processed.
+        let sidecar2 = fs::read_to_string(&retry_file).unwrap();
+        assert!(!sidecar2.contains("sess-aging"), "sidecar must drain on success: {}", sidecar2);
+        let persisted = fs::read_to_string(&processed_file).unwrap();
+        assert!(persisted.contains("sess-aging"));
+
+        // Run 3: nothing pending, nothing rediscovered.
+        let r3 = run_review(&readers, &healthy, &args).unwrap();
+        assert_eq!(r3.sessions_scanned, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

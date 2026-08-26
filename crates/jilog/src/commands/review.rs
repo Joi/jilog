@@ -92,9 +92,18 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
 
     // Issue-body backlinks use the REAL digest file with the SAME date the
     // filename uses — one date source, threaded everywhere (jilog#re4k).
+    // Absolutize first: a relative --digest-dir would otherwise put a
+    // cwd-dependent path into issue bodies read long after the run.
     let date_str = date.format("%Y-%m-%d").to_string();
+    let digest_dir_abs = if digest_dir.is_absolute() {
+        digest_dir.clone()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&digest_dir))
+            .unwrap_or_else(|_| digest_dir.clone())
+    };
     let digest_display_path =
-        contract_tilde(&digest_file_path(&digest_dir, &date_str));
+        contract_tilde(&digest_file_path(&digest_dir_abs, &date_str));
     let tracker = cfg.into_tracker(Some((digest_display_path.as_str(), date_str.as_str())));
 
     let review_args = LibReviewArgs {

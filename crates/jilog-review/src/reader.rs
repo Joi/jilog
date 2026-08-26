@@ -206,7 +206,92 @@ impl ProcessedSessions {
     pub fn unmark(&mut self, session_id: &str) {
         self.seen.remove(session_id);
     }
+}
 
+// ---------------------------------------------------------------------------
+// RetrySessions — sidecar for sessions whose tracker ops failed (jilog#1dvk)
+// ---------------------------------------------------------------------------
+
+/// Sessions whose required tracker operations failed on a previous run,
+/// with each session's transcript `modified` timestamp.
+///
+/// Unmarking a failed session from [`ProcessedSessions`] is not enough to
+/// retry it: discovery is bounded by the run's `since` cutoff, and a daily
+/// job's next window usually no longer covers the failed session's
+/// transcript (fresheyes 2026-08-26 on jilog#1dvk). This sidecar records
+/// the failed sessions' modified times so the next run can widen its
+/// discovery window back to the oldest pending retry.
+///
+/// File format: one `<RFC3339 modified>\t<session_id>` per line.
+pub struct RetrySessions {
+    entries: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+
+impl RetrySessions {
+    /// Load from `path`; missing file = empty queue. Malformed lines are
+    /// skipped with a warning (a corrupt sidecar must not kill the run —
+    /// worst case is a narrower window, i.e. the pre-sidecar behavior).
+    pub fn load(path: &Path) -> Result<Self, JilogReviewError> {
+        let mut entries = std::collections::HashMap::new();
+        if path.exists() {
+            let content = std::fs::read_to_string(path)?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match line.split_once('\t') {
+                    Some((ts, id)) => match chrono::DateTime::parse_from_rfc3339(ts) {
+                        Ok(t) => {
+                            entries.insert(id.to_string(), t.with_timezone(&chrono::Utc));
+                        }
+                        Err(e) => {
+                            tracing::warn!("retry-sessions: bad timestamp '{}': {}", ts, e);
+                        }
+                    },
+                    None => tracing::warn!("retry-sessions: malformed line '{}'", line),
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The oldest pending retry's transcript modified time — the point the
+    /// next run's discovery window must reach back to.
+    pub fn min_modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.entries.values().min().copied()
+    }
+
+    /// Overwrite `path` with `entries` (empty map truncates the file).
+    pub fn save_entries(
+        path: &Path,
+        entries: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), JilogReviewError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut sorted: Vec<(&String, &chrono::DateTime<chrono::Utc>)> =
+            entries.iter().collect();
+        sorted.sort();
+        let mut content = String::with_capacity(sorted.len() * 64);
+        for (id, ts) in sorted {
+            content.push_str(&ts.to_rfc3339());
+            content.push('\t');
+            content.push_str(id);
+            content.push('\n');
+        }
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+impl ProcessedSessions {
     /// Write the full set of session IDs to `path` (sorted, one per line).
     pub fn save(&self, path: &Path) -> Result<(), JilogReviewError> {
         if let Some(parent) = path.parent() {
@@ -284,6 +369,36 @@ mod tests {
         p.save(&path).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_sessions_round_trip_and_min_modified() {
+        let dir = test_dir("retry-sessions");
+        let path = dir.join("retry-sessions.txt");
+        let older = chrono::Utc::now() - chrono::Duration::hours(30);
+        let newer = chrono::Utc::now() - chrono::Duration::hours(2);
+        let entries = std::collections::HashMap::from([
+            ("sess-old".to_string(), older),
+            ("sess-new".to_string(), newer),
+        ]);
+        RetrySessions::save_entries(&path, &entries).unwrap();
+        let loaded = RetrySessions::load(&path).unwrap();
+        assert!(!loaded.is_empty());
+        // RFC3339 round-trip is second-preserving; compare timestamps.
+        assert_eq!(
+            loaded.min_modified().unwrap().timestamp(),
+            older.timestamp(),
+            "min_modified must be the oldest entry"
+        );
+        // Empty save truncates.
+        RetrySessions::save_entries(&path, &std::collections::HashMap::new()).unwrap();
+        let drained = RetrySessions::load(&path).unwrap();
+        assert!(drained.is_empty());
+        assert_eq!(drained.min_modified(), None);
+        // Missing file loads empty.
+        let missing = RetrySessions::load(&dir.join("nope.txt")).unwrap();
+        assert!(missing.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -317,7 +317,7 @@ The issue title is built by `signal_title()` (see `crates/jilog-review/src/track
 [jilog/deferral]   <session_id>: <truncated item>
 ```
 
-With `tracker.type = "kata"`, a run that produced the digest above shells out to the `kata` CLI once per new signal. This is the exact invocation jilog builds for the `bash` timeout error:
+With `tracker.type = "kata"`, a run that produced the digest above shells out to the `kata` CLI once per new signal. The digest reference in the body is the run's real digest file (the configured `--digest-dir`, tilde-contracted, with the same date as the digest filename). This is the exact invocation jilog builds for the `bash` timeout error on a host using the conventional `~/.amplifier/health` digest dir:
 
 ```console
 $ kata --project jilog --json create \

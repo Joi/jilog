@@ -25,8 +25,8 @@
 //! | Trait method     | CLI invocation |
 //! |------------------|----------------|
 //! | `create()`       | `kata --project <p> --json create "<title>" --body "..." --label jilog --label jilog:<kind> --idempotency-key <key> --priority <n>` |
-//! | `list_open()`    | `kata --project <p> --json list --status open` |
-//! | `list_closed()`  | `kata --project <p> --json list --status closed` |
+//! | `list_open()`    | `kata --project <p> --json list --status open --limit 0` |
+//! | `list_closed()`  | `kata --project <p> --json list --status closed --limit 0` |
 //! | `is_resolved()`  | `kata --project <p> --json show <ref>` → status == "closed" |
 //! | `reopen()`       | `kata --project <p> --json reopen <ref>` + comment + label add |
 //!
@@ -96,7 +96,7 @@ impl KataTracker {
     fn list_closed(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
         let output = self
             .cmd()
-            .args(["list", "--status", "closed"])
+            .args(["list", "--status", "closed", "--limit", "0"])
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata list failed: {}", e)))?;
 
@@ -107,37 +107,50 @@ impl KataTracker {
         parse_list_response(&String::from_utf8_lossy(&output.stdout), "closed")
     }
 
-    /// Reopen a closed issue: runs `kata reopen <n>`, adds a recurrence comment,
-    /// and labels it `jilog:recurred`. Fails loud on any error.
-    fn reopen(&self, number: &str, comment_body: &str) -> Result<(), JilogReviewError> {
-        // Step 1: reopen the issue.
+    /// Reopen a closed issue, then annotate it with a recurrence comment and
+    /// the `jilog:recurred` label.
+    ///
+    /// Only the reopen itself is fail-loud. The annotations are best-effort
+    /// (warn): if they errored after a successful reopen, the caller would
+    /// unmark the session for retry, but the retry finds the issue already
+    /// OPEN via title dedup and returns early — the annotations would never
+    /// be repaired and the session would re-fail forever (fresheyes
+    /// 2026-08-26 on jilog#1dvk).
+    fn reopen(&self, issue_ref: &str, comment_body: &str) -> Result<(), JilogReviewError> {
+        // Step 1: reopen the issue — the semantically required part.
         let out = self
             .cmd()
-            .args(["reopen", number])
+            .args(["reopen", issue_ref])
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata reopen failed: {}", e)))?;
         if !out.status.success() {
             return Err(parse_kata_error(&out.stdout, &out.stderr, "reopen"));
         }
 
-        // Step 2: add a recurrence comment.
-        let out = self
-            .cmd()
-            .args(["comment", number, "--body", comment_body])
-            .output()
-            .map_err(|e| JilogReviewError::Command(format!("kata comment failed: {}", e)))?;
-        if !out.status.success() {
-            return Err(parse_kata_error(&out.stdout, &out.stderr, "comment"));
+        // Steps 2+3: advisory annotations — warn, never fail the create.
+        match self.cmd().args(["comment", issue_ref, "--body", comment_body]).output() {
+            Ok(out) if !out.status.success() => tracing::warn!(
+                "kata recurrence comment on {} failed (issue reopened anyway): {}",
+                issue_ref,
+                parse_kata_error(&out.stdout, &out.stderr, "comment")
+            ),
+            Err(e) => tracing::warn!(
+                "kata recurrence comment on {} failed (issue reopened anyway): {}",
+                issue_ref, e
+            ),
+            _ => {}
         }
-
-        // Step 3: add the jilog:recurred label.
-        let out = self
-            .cmd()
-            .args(["label", "add", number, "jilog:recurred"])
-            .output()
-            .map_err(|e| JilogReviewError::Command(format!("kata label add failed: {}", e)))?;
-        if !out.status.success() {
-            return Err(parse_kata_error(&out.stdout, &out.stderr, "label add"));
+        match self.cmd().args(["label", "add", issue_ref, "jilog:recurred"]).output() {
+            Ok(out) if !out.status.success() => tracing::warn!(
+                "kata jilog:recurred label on {} failed (issue reopened anyway): {}",
+                issue_ref,
+                parse_kata_error(&out.stdout, &out.stderr, "label add")
+            ),
+            Err(e) => tracing::warn!(
+                "kata jilog:recurred label on {} failed (issue reopened anyway): {}",
+                issue_ref, e
+            ),
+            _ => {}
         }
 
         Ok(())
@@ -161,7 +174,9 @@ struct KataIssue {
     #[serde(default)]
     number: Option<u64>,
     title: String,
-    #[serde(default)]
+    /// Required: a row without `status` is schema drift, and defaulting it
+    /// would silently filter the row out of every listing (fresheyes
+    /// 2026-08-26 on jilog#fx51).
     status: String,
 }
 
@@ -185,7 +200,8 @@ impl KataIssue {
 
 #[derive(Debug, Deserialize)]
 struct KataList {
-    #[serde(default)]
+    /// Required: a payload without `issues` (renamed collection, error-ish
+    /// shape that still exits 0) must fail loud, not read as an empty list.
     issues: Vec<KataIssue>,
 }
 
@@ -292,7 +308,7 @@ impl Tracker for KataTracker {
     fn list_open(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
         let output = self
             .cmd()
-            .args(["list", "--status", "open"])
+            .args(["list", "--status", "open", "--limit", "0"])
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata list failed: {}", e)))?;
 
@@ -782,6 +798,36 @@ mod tests {
         // disabling dedup (jilog#fx51 comment thread). Must be an error.
         let err = parse_list_response("not json at all", "open")
             .expect_err("malformed list JSON must be an error, never an empty list");
+        match err {
+            JilogReviewError::Tracker(msg) => {
+                assert!(msg.contains("kata list JSON parse"), "unexpected message: {}", msg);
+            }
+            other => panic!("expected Tracker variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_response_missing_status_is_loud() {
+        // A row without `status` must not deserialize-with-default and then
+        // vanish through the status filter (fresheyes 2026-08-26).
+        let stdout = r#"{"issues":[{"short_id":"ab12","title":"drifty","uid":"01AAA"}]}"#;
+        let err = parse_list_response(stdout, "open")
+            .expect_err("row without status must be a parse error");
+        match err {
+            JilogReviewError::Tracker(msg) => {
+                assert!(msg.contains("kata list JSON parse"), "unexpected message: {}", msg);
+            }
+            other => panic!("expected Tracker variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_response_missing_issues_collection_is_loud() {
+        // A syntactically valid payload without the `issues` collection
+        // (renamed key, error-ish shape that still exits 0) must not read
+        // as an empty list (fresheyes 2026-08-26).
+        let err = parse_list_response(r#"{"kata_api_version":1,"items":[]}"#, "open")
+            .expect_err("missing issues collection must be a parse error");
         match err {
             JilogReviewError::Tracker(msg) => {
                 assert!(msg.contains("kata list JSON parse"), "unexpected message: {}", msg);

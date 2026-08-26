@@ -217,4 +217,24 @@ mod tests {
         assert_eq!(result, "short");
         assert!(!result.contains("[truncated]"));
     }
+
+    #[test]
+    fn contract_tilde_home_prefix_and_passthrough() {
+        let home = std::env::var("HOME").expect("HOME set in tests");
+        let under = std::path::PathBuf::from(&home).join("x/y.md");
+        assert_eq!(contract_tilde(&under), "~/x/y.md");
+        // Exactly HOME (no trailing segment) stays as-is — no bare "~".
+        assert_eq!(contract_tilde(std::path::Path::new(&home)), home);
+        // Prefix that merely STARTS with the home string must not contract.
+        let sibling = format!("{}2/x.md", home);
+        assert_eq!(contract_tilde(std::path::Path::new(&sibling)), sibling);
+        // Outside HOME passes through.
+        assert_eq!(contract_tilde(std::path::Path::new("/var/log/x.md")), "/var/log/x.md");
+    }
+
+    #[test]
+    fn digest_file_path_formula() {
+        let p = digest_file_path(std::path::Path::new("/tmp/d"), "2026-08-26");
+        assert_eq!(p, std::path::PathBuf::from("/tmp/d/learning-digest-2026-08-26.md"));
+    }
 }
