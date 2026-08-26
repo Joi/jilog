@@ -308,6 +308,9 @@ mod tests {
                     workarounds: 0,
                     deferrals: 0,
                     patterns: 1,
+                    input_tokens: 5000,
+                    output_tokens: 250,
+                    cost_usd: None,
                 },
             )]),
             digest_path: PathBuf::from("/tmp/learning-digest-2026-05-10.md"),
@@ -402,6 +405,9 @@ mod tests {
                     "workarounds": 0,
                     "deferrals": 0,
                     "patterns": 1,
+                    "input_tokens": 5000,
+                    "output_tokens": 250,
+                    "cost_usd": null,
                 }
             })
         );

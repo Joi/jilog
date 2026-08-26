@@ -84,11 +84,38 @@ pub struct PersonaCounts {
     pub workarounds: usize,
     pub deferrals: usize,
     pub patterns: usize,
+    /// Summed token usage across this key's sessions. Cell transcripts
+    /// carry tokens but no cost field, so the fleet rollup is tokens-first
+    /// (jilog#2hwm).
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Summed known cost when transcripts carried `cost_usd`; None
+    /// otherwise — jilog keeps no price tables by design, so tokens never
+    /// get converted to dollars here. Serialized as a decimal string like
+    /// the other `*_usd` JSON fields.
+    #[serde(serialize_with = "ser_opt_decimal_str")]
+    pub cost_usd: Option<Decimal>,
 }
 
 impl PersonaCounts {
     fn signal_total(&self) -> usize {
         self.corrections + self.errors + self.workarounds + self.deferrals + self.patterns
+    }
+
+    fn has_usage(&self) -> bool {
+        self.input_tokens > 0 || self.output_tokens > 0 || self.cost_usd.is_some()
+    }
+}
+
+/// Serialize `Option<Decimal>` as an optional decimal STRING, matching the
+/// `role_costs_usd` / `model_costs_usd` convention in the review JSON.
+fn ser_opt_decimal_str<S: serde::Serializer>(
+    v: &Option<Decimal>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(d) => s.serialize_some(&d.to_string()),
+        None => s.serialize_none(),
     }
 }
 
@@ -299,8 +326,26 @@ pub fn run_review(
             // carries no usage data.
             match reader.load_stats(&handle) {
                 Ok(Some(stats)) => {
-                    if let Some(cost) = accumulate_stats(&mut spend, &stats, &handle.session_id) {
-                        session_costs.insert(handle.session_id.clone(), cost);
+                    let cost = accumulate_stats(&mut spend, &stats, &handle.session_id);
+                    if let Some(c) = cost {
+                        session_costs.insert(handle.session_id.clone(), c);
+                    }
+                    // Fold usage into the fleet rollup: tokens always, cost
+                    // only when the transcript carried one (jilog#2hwm).
+                    if let Some(persona) = handle.persona.clone() {
+                        let counts = personas
+                            .entry((persona.clone(), handle.channel.clone()))
+                            .or_insert_with(|| PersonaCounts {
+                                persona,
+                                channel: handle.channel.clone(),
+                                ..Default::default()
+                            });
+                        counts.input_tokens += stats.input_tokens;
+                        counts.output_tokens += stats.output_tokens;
+                        if let Some(c) = cost {
+                            counts.cost_usd =
+                                Some(counts.cost_usd.unwrap_or(Decimal::ZERO) + c);
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -625,21 +670,39 @@ pub fn render_digest(
     if !personas.is_empty() {
         buf.push_str("## Personas\n\n");
         for (key, counts) in personas {
+            // Usage suffix (jilog#2hwm): tokens whenever the sessions carried
+            // usage data, dollars only when transcripts carried cost — jilog
+            // holds no price tables, so cell sessions stay tokens-only.
+            let usage = if counts.has_usage() {
+                match &counts.cost_usd {
+                    Some(c) => format!(
+                        " — {} in / {} out tokens, {}",
+                        counts.input_tokens, counts.output_tokens, format_usd(c)
+                    ),
+                    None => format!(
+                        " — {} in / {} out tokens",
+                        counts.input_tokens, counts.output_tokens
+                    ),
+                }
+            } else {
+                String::new()
+            };
             if counts.signal_total() == 0 {
                 buf.push_str(&format!(
-                    "- `{}`: no signals ({} session(s))\n",
-                    key, counts.sessions
+                    "- `{}`: no signals ({} session(s)){}\n",
+                    key, counts.sessions, usage
                 ));
             } else {
                 buf.push_str(&format!(
-                    "- `{}`: {} corrections, {} errors, {} workarounds, {} deferrals, {} patterns ({} session(s))\n",
+                    "- `{}`: {} corrections, {} errors, {} workarounds, {} deferrals, {} patterns ({} session(s)){}\n",
                     key,
                     counts.corrections,
                     counts.errors,
                     counts.workarounds,
                     counts.deferrals,
                     counts.patterns,
-                    counts.sessions
+                    counts.sessions,
+                    usage
                 ));
             }
         }
@@ -1558,6 +1621,86 @@ mod tests {
         let ann_line_without = body_without.lines().find(|l| l.contains("do this")).unwrap();
         assert_ne!(ann_line_with, ann_line_without, "annotated line should differ");
         assert!(ann_line_with.ends_with("(→ kata#3)"), "annotation must be at end of line");
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#2hwm — fleet usage rollup: tokens per persona, dollars only when
+    // the transcript carried cost
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn personas_rollup_carries_tokens_and_optional_cost() {
+        let dir = test_dir("personas-usage");
+        // Cell-style session: tokens, NO cost field (cell transcripts never
+        // carry cost — jilog keeps no price tables).
+        let cell = FixtureReader {
+            session_id: "sess-cell".into(),
+            messages: correction_messages("jibot no, answer in the thread"),
+            stats: Some(SessionStats {
+                cost_usd: None,
+                input_tokens: 12000,
+                output_tokens: 300,
+                role: None,
+                model_costs: BTreeMap::new(),
+            }),
+            persona: Some("jibot".into()),
+            channel: Some("BIF".into()),
+        };
+        // Priced fleet session: tokens AND cost, no signals.
+        let priced = FixtureReader {
+            session_id: "sess-priced".into(),
+            messages: vec![Message {
+                role: Some("assistant".to_string()),
+                content: Some(serde_json::Value::String("done".to_string())),
+                name: None,
+            }],
+            stats: Some(SessionStats {
+                cost_usd: Some("1.5".into()),
+                input_tokens: 800,
+                output_tokens: 40,
+                role: None,
+                model_costs: BTreeMap::new(),
+            }),
+            persona: Some("akiko".into()),
+            channel: None,
+        };
+        let readers: Vec<Box<dyn Reader>> =
+            vec![Box::new(cell), Box::new(priced)];
+        let tracker = OpenTitlesTracker { titles: vec![] };
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &tracker, &args).unwrap();
+
+        let jibot = report.personas.get("jibot@BIF").expect("jibot rollup");
+        assert_eq!(jibot.input_tokens, 12000);
+        assert_eq!(jibot.output_tokens, 300);
+        assert_eq!(jibot.cost_usd, None, "cell sessions must stay tokens-only");
+
+        let akiko = report.personas.get("akiko").expect("akiko rollup");
+        assert_eq!(akiko.input_tokens, 800);
+        assert_eq!(akiko.cost_usd, Some(Decimal::from_str("1.5").unwrap()));
+        // A stats-only session (no messages → no signals) must still appear
+        // in the rollup with its sessions counted.
+        assert_eq!(akiko.sessions, 1);
+
+        let body = fs::read_to_string(&report.digest_path).unwrap();
+        assert!(
+            body.contains("`jibot@BIF`") && body.contains("12000 in / 300 out tokens"),
+            "tokens-only usage suffix missing:\n{}",
+            body
+        );
+        assert!(
+            body.contains("800 in / 40 out tokens, $1.50"),
+            "priced usage suffix missing:\n{}",
+            body
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
