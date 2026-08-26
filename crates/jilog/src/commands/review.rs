@@ -4,7 +4,7 @@ use anyhow::Context;
 use chrono::{Duration, NaiveDate, Utc};
 
 use jilog_review::digest::{DigestReport, ReviewArgs as LibReviewArgs};
-use jilog_review::util::expand_tilde;
+use jilog_review::util::{contract_tilde, digest_file_path, expand_tilde};
 
 use crate::config::JilogConfig;
 
@@ -89,7 +89,13 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
     });
 
     let readers = cfg.into_readers();
-    let tracker = cfg.into_tracker();
+
+    // Issue-body backlinks use the REAL digest file with the SAME date the
+    // filename uses — one date source, threaded everywhere (jilog#re4k).
+    let date_str = date.format("%Y-%m-%d").to_string();
+    let digest_display_path =
+        contract_tilde(&digest_file_path(&digest_dir, &date_str));
+    let tracker = cfg.into_tracker(Some((digest_display_path.as_str(), date_str.as_str())));
 
     let review_args = LibReviewArgs {
         since,
@@ -137,6 +143,13 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
 
         if !report.created_issues.is_empty() {
             println!("Created {} issue(s)", report.created_issues.len());
+        }
+
+        if report.tracker_failures > 0 {
+            println!(
+                "Tracker failures: {} (affected sessions retry next run)",
+                report.tracker_failures
+            );
         }
     }
 
@@ -221,6 +234,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
     serde_json::json!({
         "schema_version": 1,
         "sessions_scanned": report.sessions_scanned,
+        "tracker_failures": report.tracker_failures,
         "corrections": report.corrections.len(),
         "errors": report.errors.len(),
         "workarounds": report.workarounds.len(),
@@ -304,6 +318,7 @@ mod tests {
                 url: Some("https://example.com/issues/42".to_string()),
             }],
             sessions_scanned: 3,
+            tracker_failures: 0,
         }
     }
 
@@ -359,6 +374,7 @@ mod tests {
             BTreeSet::from([
                 "schema_version",
                 "sessions_scanned",
+                "tracker_failures",
                 "corrections",
                 "errors",
                 "workarounds",

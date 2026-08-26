@@ -344,7 +344,13 @@ impl JilogConfig {
     }
 
     /// Build a Tracker implementation from config.
-    pub fn into_tracker(&self) -> Box<dyn Tracker> {
+    ///
+    /// `run_context`, when present, is `(digest_path, date)` for the run —
+    /// the REAL digest file the run writes and the SAME date string used in
+    /// its filename — so issue bodies backlink correctly on hosts whose
+    /// `--digest-dir` deviates from the default and never mix date sources
+    /// (jilog#re4k). Only the kata tracker uses it today.
+    pub fn into_tracker(&self, run_context: Option<(&str, &str)>) -> Box<dyn Tracker> {
         match &self.tracker {
             TrackerConfig::Beads { .. } => {
                 unreachable!("tracker=\"beads\" is rejected in JilogConfig::from_toml_str")
@@ -352,9 +358,12 @@ impl JilogConfig {
             TrackerConfig::Github { repo } => {
                 Box::new(GithubTracker::new(repo))
             }
-            TrackerConfig::Kata { project } => {
-                Box::new(KataTracker::new(project))
-            }
+            TrackerConfig::Kata { project } => match run_context {
+                Some((digest_path, date)) => {
+                    Box::new(KataTracker::with_run_context(project, digest_path, date))
+                }
+                None => Box::new(KataTracker::new(project)),
+            },
             TrackerConfig::None => Box::new(NoneTracker),
         }
     }

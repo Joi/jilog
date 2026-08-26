@@ -59,6 +59,10 @@ pub struct DigestReport {
     pub digest_path: PathBuf,
     pub created_issues: Vec<IssueRef>,
     pub sessions_scanned: usize,
+    /// Count of tracker create() calls that failed this run. The sessions
+    /// those signals came from are NOT persisted as processed, so the next
+    /// run rescans and retries them (jilog#1dvk).
+    pub tracker_failures: usize,
 }
 
 /// Sessions and signal counts for one persona@channel key.
@@ -343,61 +347,51 @@ pub fn run_review(
     };
 
     // Create issues if requested; build index keyed by signal_title for
-    // bidirectional digest annotations (improvement 4).
+    // bidirectional digest annotations (improvement 4). Failures are
+    // remembered per-session: those sessions are unmarked below so the next
+    // run rescans and retries them instead of silently dropping the signals
+    // (jilog#1dvk).
     let mut issue_index: HashMap<String, IssueRef> = HashMap::new();
+    let mut failed_sessions: HashSet<String> = HashSet::new();
+    let mut tracker_failures: usize = 0;
     if args.create_issues && !args.dry_run {
-        for correction in &all_corrections {
-            let signal = Signal::Correction(correction.clone());
+        let signals = all_corrections
+            .iter()
+            .map(|c| Signal::Correction(c.clone()))
+            .chain(all_errors.iter().map(|e| Signal::Error(e.clone())))
+            .chain(all_workarounds.iter().map(|w| Signal::Workaround(w.clone())))
+            .chain(all_deferrals.iter().map(|d| Signal::Deferral(d.clone())))
+            .chain(all_patterns.iter().map(|p| Signal::Pattern(p.clone())));
+        for signal in signals {
             match tracker.create(&signal) {
                 Ok(issue_ref) => {
-                    issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    // Deferrals are deliberately excluded from digest
+                    // annotations (no issue_index entry), matching the
+                    // pre-refactor per-kind loops.
+                    if !matches!(signal, Signal::Deferral(_)) {
+                        issue_index.insert(signal_title(&signal), issue_ref.clone());
+                    }
                     created_issues.push(issue_ref);
                 }
-                Err(e) => tracing::warn!("tracker.create failed: {}", e),
-            }
-        }
-        for error in &all_errors {
-            let signal = Signal::Error(error.clone());
-            match tracker.create(&signal) {
-                Ok(issue_ref) => {
-                    issue_index.insert(signal_title(&signal), issue_ref.clone());
-                    created_issues.push(issue_ref);
+                Err(e) => {
+                    tracker_failures += 1;
+                    failed_sessions.insert(signal.session_id().to_string());
+                    tracing::warn!("tracker.create failed: {}", e);
                 }
-                Err(e) => tracing::warn!("tracker.create failed: {}", e),
             }
         }
-        for workaround in &all_workarounds {
-            let signal = Signal::Workaround(workaround.clone());
-            match tracker.create(&signal) {
-                Ok(issue_ref) => {
-                    issue_index.insert(signal_title(&signal), issue_ref.clone());
-                    created_issues.push(issue_ref);
-                }
-                Err(e) => tracing::warn!("tracker.create failed: {}", e),
-            }
-        }
-        for deferral in &all_deferrals {
-            let signal = Signal::Deferral(deferral.clone());
-            match tracker.create(&signal) {
-                Ok(issue_ref) => created_issues.push(issue_ref),
-                Err(e) => tracing::warn!("tracker.create failed: {}", e),
-            }
-        }
-        for pattern in &all_patterns {
-            let signal = Signal::Pattern(pattern.clone());
-            match tracker.create(&signal) {
-                Ok(issue_ref) => {
-                    issue_index.insert(signal_title(&signal), issue_ref.clone());
-                    created_issues.push(issue_ref);
-                }
-                Err(e) => tracing::warn!("tracker.create failed: {}", e),
-            }
+        if tracker_failures > 0 {
+            tracing::warn!(
+                "{} tracker create failure(s) across {} session(s); those sessions stay unprocessed and retry next run",
+                tracker_failures,
+                failed_sessions.len()
+            );
         }
     }
 
     // Render and write digest.
     let date_str = args.date.format("%Y-%m-%d").to_string();
-    let digest_path = args.digest_dir.join(format!("learning-digest-{}.md", date_str));
+    let digest_path = crate::util::digest_file_path(&args.digest_dir, &date_str);
 
     // Preserve an earlier-written digest for the same date when this run
     // has nothing new to record. Without this, a mid-day re-run that sees
@@ -425,9 +419,15 @@ pub fn run_review(
         )?;
     }
 
-    // Persist processed-sessions.
+    // Persist processed-sessions — minus any session whose tracker
+    // operations failed, so it is rescanned (and its creates retried, with
+    // idempotency/dedup absorbing the already-filed ones) next run
+    // (jilog#1dvk).
     if !args.dry_run {
-        if let (Some(ref ps), Some(ref pf)) = (&processed, &args.processed_file) {
+        if let (Some(ref mut ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
+            for sid in &failed_sessions {
+                ps.unmark(sid);
+            }
             ps.save(pf)?;
         }
     }
@@ -445,6 +445,7 @@ pub fn run_review(
         digest_path,
         created_issues,
         sessions_scanned,
+        tracker_failures,
     })
 }
 
@@ -708,7 +709,7 @@ pub fn write_digest(
     personas: &BTreeMap<String, PersonaCounts>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
-    let path = digest_dir.join(format!("learning-digest-{}.md", date));
+    let path = crate::util::digest_file_path(digest_dir, date);
     let body = render_digest(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
         spend, recurrence_costs, issue_index, personas,
@@ -1557,5 +1558,100 @@ mod tests {
         let ann_line_without = body_without.lines().find(|l| l.contains("do this")).unwrap();
         assert_ne!(ann_line_with, ann_line_without, "annotated line should differ");
         assert!(ann_line_with.ends_with("(→ kata#3)"), "annotation must be at end of line");
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#1dvk — failed tracker creates must not persist processed state
+    // -----------------------------------------------------------------------
+
+    /// Tracker whose create() fails for signals from one session and
+    /// succeeds for everything else.
+    struct FailForSessionTracker {
+        fail_session: String,
+    }
+
+    impl Tracker for FailForSessionTracker {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn create(&self, signal: &Signal) -> Result<IssueRef, JilogReviewError> {
+            if signal.session_id() == self.fail_session {
+                Err(JilogReviewError::Tracker("daemon unreachable (simulated)".into()))
+            } else {
+                Ok(IssueRef {
+                    id: "#ok1".to_string(),
+                    backend: "mock".to_string(),
+                    url: None,
+                    title: signal_title(signal),
+                })
+            }
+        }
+        fn list_open(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
+            Ok(vec![])
+        }
+        fn is_resolved(&self, _issue: &IssueRef) -> Result<bool, JilogReviewError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn failed_tracker_creates_leave_session_unprocessed_for_retry() {
+        let dir = test_dir("tracker-retry");
+        let processed_file = dir.join("processed-sessions.txt");
+
+        let readers: Vec<Box<dyn Reader>> = vec![
+            Box::new(FixtureReader {
+                session_id: "sess-ok".into(),
+                messages: correction_messages("no, use the gog cli for calendar"),
+                stats: None,
+                persona: None,
+                channel: None,
+            }),
+            Box::new(FixtureReader {
+                session_id: "sess-bad".into(),
+                messages: correction_messages("no, stop rewriting the config"),
+                stats: None,
+                persona: None,
+                channel: None,
+            }),
+        ];
+        let tracker = FailForSessionTracker { fail_session: "sess-bad".into() };
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed_file.clone()),
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+            dry_run: false,
+            create_issues: true,
+        };
+
+        let report = run_review(&readers, &tracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 2);
+        assert_eq!(report.tracker_failures, 1, "one create must have failed");
+        assert_eq!(report.created_issues.len(), 1, "the other create succeeded");
+
+        let persisted = fs::read_to_string(&processed_file).unwrap();
+        assert!(
+            persisted.contains("sess-ok"),
+            "successful session must be persisted as processed: {}",
+            persisted
+        );
+        assert!(
+            !persisted.contains("sess-bad"),
+            "failed session must NOT be persisted (jilog#1dvk): {}",
+            persisted
+        );
+
+        // Second run with a healthy tracker: only the failed session is
+        // rescanned, and its create retries.
+        let tracker2 = FailForSessionTracker { fail_session: "no-such-session".into() };
+        let report2 = run_review(&readers, &tracker2, &args).unwrap();
+        assert_eq!(report2.sessions_scanned, 1, "only sess-bad should be rescanned");
+        assert_eq!(report2.tracker_failures, 0);
+        assert_eq!(report2.created_issues.len(), 1);
+
+        let persisted2 = fs::read_to_string(&processed_file).unwrap();
+        assert!(persisted2.contains("sess-ok") && persisted2.contains("sess-bad"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

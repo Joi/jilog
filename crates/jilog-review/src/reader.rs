@@ -199,6 +199,14 @@ impl ProcessedSessions {
         self.seen.insert(session_id.to_string());
     }
 
+    /// Remove `session_id` from the processed set (in-memory only), so the
+    /// next run rescans it. Used when a session's required tracker
+    /// operations failed — persisting it as processed would silently drop
+    /// its signals forever (jilog#1dvk).
+    pub fn unmark(&mut self, session_id: &str) {
+        self.seen.remove(session_id);
+    }
+
     /// Write the full set of session IDs to `path` (sorted, one per line).
     pub fn save(&self, path: &Path) -> Result<(), JilogReviewError> {
         if let Some(parent) = path.parent() {
@@ -276,6 +284,22 @@ mod tests {
         p.save(&path).unwrap();
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn processed_sessions_unmark_removes_for_retry() {
+        let dir = test_dir("processed-unmark");
+        let path = dir.join("processed.txt");
+        let mut p = ProcessedSessions::load(&path).unwrap();
+        p.mark("keep");
+        p.mark("retry-me");
+        p.unmark("retry-me");
+        p.unmark("never-marked"); // no-op, must not panic
+        p.save(&path).unwrap();
+        let p2 = ProcessedSessions::load(&path).unwrap();
+        assert!(p2.contains("keep"));
+        assert!(!p2.contains("retry-me"), "unmarked session must not persist (jilog#1dvk)");
         let _ = fs::remove_dir_all(&dir);
     }
 }

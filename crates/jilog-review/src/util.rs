@@ -38,6 +38,29 @@ fn expand_tilde_glob_in(pattern: &str, home: &str) -> String {
     }
 }
 
+/// Contract a path under `$HOME` back to `~/...` for host-portable display
+/// (the inverse of [`expand_tilde`], for paths shown in issue bodies).
+pub fn contract_tilde(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            if let Some(rest) = s.strip_prefix(&home) {
+                if rest.starts_with('/') {
+                    return format!("~{}", rest);
+                }
+            }
+        }
+    }
+    s
+}
+
+/// The digest file a review run writes: `<digest_dir>/learning-digest-<date>.md`.
+/// Single source of the filename formula so issue-body backlinks can never
+/// drift from the actual filename (jilog#re4k).
+pub fn digest_file_path(digest_dir: &std::path::Path, date_str: &str) -> PathBuf {
+    digest_dir.join(format!("learning-digest-{}.md", date_str))
+}
+
 // ---------------------------------------------------------------------------
 // truncate_chars — port from opsctl/src/review_nightly.rs:407-412
 // ---------------------------------------------------------------------------

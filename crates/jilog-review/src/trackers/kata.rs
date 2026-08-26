@@ -27,8 +27,11 @@
 //! | `create()`       | `kata --project <p> --json create "<title>" --body "..." --label jilog --label jilog:<kind> --idempotency-key <key> --priority <n>` |
 //! | `list_open()`    | `kata --project <p> --json list --status open` |
 //! | `list_closed()`  | `kata --project <p> --json list --status closed` |
-//! | `is_resolved()`  | `kata --project <p> --json show <number>` → status == "closed" |
-//! | `reopen()`       | `kata --project <p> --json reopen <n>` + comment + label add |
+//! | `is_resolved()`  | `kata --project <p> --json show <ref>` → status == "closed" |
+//! | `reopen()`       | `kata --project <p> --json reopen <ref>` + comment + label add |
+//!
+//! `<ref>` is kata's short_id (e.g. `e3nj`), falling back to the full ULID
+//! or, for pre-0.15 daemons, the legacy issue number.
 //!
 //! ## Label charset
 //!
@@ -47,11 +50,39 @@ use crate::tracker::{IssueRef, Tracker, signal_title};
 /// Tracker backed by the `kata` CLI against a named kata project.
 pub struct KataTracker {
     pub project: String,
+    /// Display path of the digest file this run writes, for issue-body
+    /// backlinks. None falls back to the conventional `~/.amplifier/health`
+    /// location (jilog#re4k).
+    digest_path: Option<String>,
+    /// The run's digest date (same source as the digest filename). None
+    /// falls back to `Local::now` (jilog#re4k).
+    date: Option<String>,
 }
 
 impl KataTracker {
     pub fn new(project: impl Into<String>) -> Self {
-        Self { project: project.into() }
+        Self { project: project.into(), digest_path: None, date: None }
+    }
+
+    /// Construct with the run's digest context so issue bodies point at the
+    /// REAL digest file with the SAME date the filename uses (jilog#re4k).
+    pub fn with_run_context(
+        project: impl Into<String>,
+        digest_path: impl Into<String>,
+        date: impl Into<String>,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            digest_path: Some(digest_path.into()),
+            date: Some(date.into()),
+        }
+    }
+
+    /// The run date used in issue bodies and recurrence comments.
+    fn run_date(&self) -> String {
+        self.date
+            .clone()
+            .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string())
     }
 
     /// Build a `kata` command pre-configured with `--project <name> --json`.
@@ -73,20 +104,7 @@ impl KataTracker {
             return Err(parse_kata_error(&output.stdout, &output.stderr, "list"));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: KataList = serde_json::from_str(&stdout).unwrap_or(KataList { issues: vec![] });
-
-        Ok(parsed
-            .issues
-            .into_iter()
-            .filter(|i| i.status == "closed")
-            .map(|i| IssueRef {
-                id: format!("#{}", i.number),
-                backend: "kata".to_string(),
-                url: None,
-                title: i.title,
-            })
-            .collect())
+        parse_list_response(&String::from_utf8_lossy(&output.stdout), "closed")
     }
 
     /// Reopen a closed issue: runs `kata reopen <n>`, adds a recurrence comment,
@@ -132,9 +150,37 @@ impl KataTracker {
 
 #[derive(Debug, Deserialize)]
 struct KataIssue {
-    number: u64,
+    /// Short ref like "e3nj" (kata ≥0.15 JSON; the canonical CLI ref form).
+    #[serde(default)]
+    short_id: Option<String>,
+    /// Full ULID — also accepted by the CLI as a ref.
+    #[serde(default)]
+    uid: Option<String>,
+    /// Legacy numeric ref (pre-0.15 JSON carried `number`; newer versions
+    /// have a numeric row `id` that is NOT a CLI ref, so we never read `id`).
+    #[serde(default)]
+    number: Option<u64>,
     title: String,
+    #[serde(default)]
     status: String,
+}
+
+impl KataIssue {
+    /// The CLI-usable ref for this issue: short_id > uid > legacy number.
+    /// An issue with none of them means the JSON shape drifted — fail loud
+    /// rather than fabricate a ref (jilog#fx51).
+    fn issue_ref(&self) -> Result<String, JilogReviewError> {
+        self.short_id
+            .clone()
+            .or_else(|| self.uid.clone())
+            .or_else(|| self.number.map(|n| n.to_string()))
+            .ok_or_else(|| {
+                JilogReviewError::Tracker(format!(
+                    "kata issue '{}' has no short_id/uid/number — JSON shape drifted",
+                    self.title
+                ))
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,18 +233,16 @@ impl Tracker for KataTracker {
         // title, reopen it instead of filing a duplicate.
         let closed = self.list_closed()?;
         if let Some(existing) = closed.iter().find(|i| i.title == title) {
-            let number = existing.id.trim_start_matches('#');
-            let today = Local::now().format("%Y-%m-%d").to_string();
+            let issue_ref = existing.id.trim_start_matches('#');
             let comment = format!(
                 "Recurred on {} — closure may have been premature.",
-                today
+                self.run_date()
             );
-            self.reopen(number, &comment)?;
+            self.reopen(issue_ref, &comment)?;
             return Ok(existing.clone());
         }
 
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        let body = build_body(signal, &today);
+        let body = build_body(signal, &self.run_date(), self.digest_path.as_deref());
 
         // kata also enforces idempotency at the daemon level: if the same key
         // arrives twice, kata returns a `duplicate_candidates` error. The
@@ -235,16 +279,10 @@ impl Tracker for KataTracker {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: KataCreate = serde_json::from_str(&stdout).map_err(|e| {
-            JilogReviewError::Tracker(format!(
-                "kata create JSON parse: {} (stdout: {})",
-                e,
-                stdout.chars().take(200).collect::<String>()
-            ))
-        })?;
+        let issue_ref = parse_create_response(&stdout)?;
 
         Ok(IssueRef {
-            id: format!("#{}", parsed.issue.number),
+            id: format!("#{}", issue_ref),
             backend: "kata".to_string(),
             url: None,
             title,
@@ -262,20 +300,7 @@ impl Tracker for KataTracker {
             return Err(parse_kata_error(&output.stdout, &output.stderr, "list"));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: KataList = serde_json::from_str(&stdout).unwrap_or(KataList { issues: vec![] });
-
-        Ok(parsed
-            .issues
-            .into_iter()
-            .filter(|i| i.status == "open")
-            .map(|i| IssueRef {
-                id: format!("#{}", i.number),
-                backend: "kata".to_string(),
-                url: None,
-                title: i.title,
-            })
-            .collect())
+        parse_list_response(&String::from_utf8_lossy(&output.stdout), "open")
     }
 
     fn is_resolved(&self, issue: &IssueRef) -> Result<bool, JilogReviewError> {
@@ -363,10 +388,13 @@ fn signal_priority(signal: &Signal) -> u8 {
 /// - Workaround:  `Pattern: <pattern>` + `Context: <context>`
 /// - Pattern:     the `description` field
 /// - Deferral:    the `item` field
-fn build_body(signal: &Signal, date: &str) -> String {
+fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String {
     let session_id = signal.session_id();
     let kind = signal.kind();
-    let digest_path = format!("~/.amplifier/health/learning-digest-{}.md", date);
+    let digest_path = match digest_path {
+        Some(p) => p.to_string(),
+        None => format!("~/.amplifier/health/learning-digest-{}.md", date),
+    };
 
     let kind_specific = match signal {
         Signal::Correction(c) => c.context.clone(),
@@ -385,6 +413,55 @@ fn build_body(signal: &Signal, date: &str) -> String {
 ## Signal\n\
 {kind_specific}"
     )
+}
+
+/// Parse a `kata --json create` response into a CLI-usable issue ref.
+///
+/// kata ≥0.15 returns `{"kata_api_version":1,"issue":{"id":..,"uid":..,
+/// "short_id":..,"title":..,...}}` with no `number` field; older versions
+/// carried `number`. Fail loud on any shape we cannot get a ref out of —
+/// a create that succeeded server-side but parses as a failure poisons
+/// digest backlinks and (worse) retry logic (jilog#fx51).
+fn parse_create_response(stdout: &str) -> Result<String, JilogReviewError> {
+    let parsed: KataCreate = serde_json::from_str(stdout).map_err(|e| {
+        JilogReviewError::Tracker(format!(
+            "kata create JSON parse: {} (stdout: {})",
+            e,
+            stdout.chars().take(200).collect::<String>()
+        ))
+    })?;
+    parsed.issue.issue_ref()
+}
+
+/// Parse a `kata --json list` response, keeping issues whose status matches
+/// `want_status`. Any parse failure — the whole payload or a single issue
+/// missing every ref field — is a loud error, never an empty list: an empty
+/// list here silently disables dedup and recurrence detection, and the
+/// resulting re-files surface only as opaque idempotency rejections
+/// (jilog#fx51, comment thread).
+fn parse_list_response(stdout: &str, want_status: &str) -> Result<Vec<IssueRef>, JilogReviewError> {
+    let parsed: KataList = serde_json::from_str(stdout).map_err(|e| {
+        JilogReviewError::Tracker(format!(
+            "kata list JSON parse: {} (stdout: {})",
+            e,
+            stdout.chars().take(200).collect::<String>()
+        ))
+    })?;
+
+    parsed
+        .issues
+        .into_iter()
+        .filter(|i| i.status == want_status)
+        .map(|i| {
+            let r = i.issue_ref()?;
+            Ok(IssueRef {
+                id: format!("#{}", r),
+                backend: "kata".to_string(),
+                url: None,
+                title: i.title,
+            })
+        })
+        .collect()
 }
 
 /// Best-effort parse of kata's structured JSON error output. Falls back to
@@ -556,7 +633,7 @@ mod tests {
             context: "no, use the gog cli for calendar".into(),
             ..Default::default()
         });
-        let body = build_body(&signal, "2026-05-11");
+        let body = build_body(&signal, "2026-05-11", None);
         assert!(body.contains("2026-05-11"), "body must contain date");
         assert!(body.contains("sess-abc"), "body must contain session_id");
         assert!(body.contains("correction"), "body must contain kind");
@@ -574,7 +651,7 @@ mod tests {
             message: "command not found: fzf".into(),
             ..Default::default()
         });
-        let body = build_body(&signal, "2026-05-11");
+        let body = build_body(&signal, "2026-05-11", None);
         assert!(body.contains("Tool: bash"), "body must have 'Tool: bash'");
         assert!(body.contains("Message: command not found: fzf"), "body must have message line");
         assert!(body.contains("error"), "body must contain kind");
@@ -588,7 +665,7 @@ mod tests {
             context: "temporarily using osascript".into(),
             ..Default::default()
         });
-        let body = build_body(&signal, "2026-05-11");
+        let body = build_body(&signal, "2026-05-11", None);
         assert!(body.contains("Pattern: for now"), "body must have 'Pattern: for now'");
         assert!(body.contains("Context: temporarily using osascript"), "body must have context line");
         assert!(body.contains("workaround"), "body must contain kind");
@@ -601,7 +678,7 @@ mod tests {
             description: "always asks for confirmation before deleting".into(),
             ..Default::default()
         });
-        let body = build_body(&signal, "2026-05-11");
+        let body = build_body(&signal, "2026-05-11", None);
         assert!(body.contains("always asks for confirmation before deleting"), "body must have description");
         assert!(body.contains("pattern"), "body must contain kind");
     }
@@ -613,7 +690,7 @@ mod tests {
             item: "set up the CI pipeline".into(),
             ..Default::default()
         });
-        let body = build_body(&signal, "2026-05-11");
+        let body = build_body(&signal, "2026-05-11", None);
         assert!(body.contains("set up the CI pipeline"), "body must have item");
         assert!(body.contains("deferral"), "body must contain kind");
     }
@@ -651,6 +728,117 @@ mod tests {
     // shell-out returns Err(Command(..)) immediately — no panic, no silent
     // swallow, no half-completed state.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // jilog#fx51 — create/list parsing against kata ≥0.15 JSON (no `number`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_create_response_modern_json_uses_short_id() {
+        // Real kata v0.15.1 shape: id is a numeric row id (NOT a CLI ref),
+        // short_id is the ref, no `number` field anywhere.
+        let stdout = r#"{"kata_api_version":1,"issue":{"id":2701,"uid":"01M0VTCB8995GXBZ1C0464K8N0","project_id":2,"project_uid":"01KR8TZZZ7XR7JAKE2S9D0CG71","short_id":"e3nj","title":"some issue","body":"...","status":"open","owner":null,"author":"jilog","metadata":{},"revision":1,"created_at":"2026-08-26T00:00:00Z","updated_at":"2026-08-26T00:00:00Z"}}"#;
+        let r = parse_create_response(stdout).expect("modern create JSON must parse");
+        assert_eq!(r, "e3nj");
+    }
+
+    #[test]
+    fn parse_create_response_legacy_json_uses_number() {
+        let stdout = r#"{"issue":{"number":42,"title":"legacy","status":"open"}}"#;
+        let r = parse_create_response(stdout).expect("legacy create JSON must parse");
+        assert_eq!(r, "42");
+    }
+
+    #[test]
+    fn parse_create_response_without_any_ref_fails_loud() {
+        let stdout = r#"{"issue":{"title":"drifty","status":"open"}}"#;
+        let err = parse_create_response(stdout).expect_err("no ref fields must be an error");
+        match err {
+            JilogReviewError::Tracker(msg) => {
+                assert!(msg.contains("shape drifted"), "unexpected message: {}", msg);
+            }
+            other => panic!("expected Tracker variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_response_modern_json_filters_status_and_uses_short_id() {
+        let stdout = r#"{"kata_api_version":1,"issues":[
+            {"id":1,"uid":"01AAA","short_id":"ab12","title":"open one","status":"open"},
+            {"id":2,"uid":"01BBB","short_id":"cd34","title":"closed one","status":"closed"}
+        ]}"#;
+        let open = parse_list_response(stdout, "open").expect("list JSON must parse");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, "#ab12");
+        assert_eq!(open[0].title, "open one");
+        let closed = parse_list_response(stdout, "closed").expect("list JSON must parse");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, "#cd34");
+    }
+
+    #[test]
+    fn parse_list_response_malformed_json_is_loud_not_empty() {
+        // The old code unwrap_or'd this into an empty list, silently
+        // disabling dedup (jilog#fx51 comment thread). Must be an error.
+        let err = parse_list_response("not json at all", "open")
+            .expect_err("malformed list JSON must be an error, never an empty list");
+        match err {
+            JilogReviewError::Tracker(msg) => {
+                assert!(msg.contains("kata list JSON parse"), "unexpected message: {}", msg);
+            }
+            other => panic!("expected Tracker variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_response_issue_without_ref_is_loud() {
+        let stdout = r#"{"issues":[{"title":"no refs here","status":"open"}]}"#;
+        let err = parse_list_response(stdout, "open")
+            .expect_err("issue with no ref fields must be an error");
+        match err {
+            JilogReviewError::Tracker(msg) => {
+                assert!(msg.contains("shape drifted"), "unexpected message: {}", msg);
+            }
+            other => panic!("expected Tracker variant, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#re4k — digest path + date threading into issue bodies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_body_uses_threaded_digest_path_when_present() {
+        let signal = Signal::Correction(Correction {
+            session_id: "sess-abc".into(),
+            context: "context".into(),
+            ..Default::default()
+        });
+        let body = build_body(
+            &signal,
+            "2026-08-26",
+            Some("~/custom/digests/learning-digest-2026-08-26.md"),
+        );
+        assert!(
+            body.contains("`~/custom/digests/learning-digest-2026-08-26.md`"),
+            "body must use the threaded digest path: {}",
+            body
+        );
+        assert!(
+            !body.contains("~/.amplifier/health"),
+            "hardcoded default must not appear when a path is threaded: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn with_run_context_pins_date_for_bodies() {
+        let t = KataTracker::with_run_context("proj", "~/d/learning-digest-2026-01-02.md", "2026-01-02");
+        assert_eq!(t.run_date(), "2026-01-02");
+        // Default constructor falls back to a live clock — just assert shape.
+        let d = KataTracker::new("proj").run_date();
+        assert_eq!(d.len(), 10, "fallback date must be YYYY-MM-DD: {}", d);
+    }
 
     #[test]
     fn reopen_fails_loud_when_kata_missing() {
