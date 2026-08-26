@@ -245,6 +245,12 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
                     return Err(e.into());
                 }
                 drop(f);
+                // Preserve the destination's permissions across the
+                // replace — a fresh temp file would otherwise reset a
+                // deliberately tightened mode to the umask default.
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let _ = std::fs::set_permissions(&tmp, meta.permissions());
+                }
                 if let Err(e) = std::fs::rename(&tmp, path) {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e.into());
@@ -311,13 +317,17 @@ impl RetrySessions {
                         }
                         Err(e) => {
                             // Keep the entry alive rather than dropping the
-                            // retry — stamped just inside the lookback cap,
-                            // so the discovery window still widens far
-                            // enough to rediscover an old transcript (a
-                            // "now" stamp would keep the entry pending but
-                            // never widen the window — fresheyes round 4).
+                            // retry — the real modified time is unknowable,
+                            // so assume the oldest age that still survives
+                            // GC (the cap is measured from the run's
+                            // `since`, which is at least "now" minus the
+                            // window): this widens discovery as far as the
+                            // cap allows, maximizing the chance the old
+                            // transcript is rediscovered (fresheyes rounds
+                            // 4-5; a "now" stamp never widened the window).
                             let assumed = chrono::Utc::now()
-                                - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS - 1);
+                                - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS)
+                                + chrono::Duration::minutes(5);
                             tracing::warn!(
                                 "retry-sessions: bad timestamp '{}' for {} — keeping entry, assuming modified {}: {}",
                                 ts, id, assumed.to_rfc3339(), e

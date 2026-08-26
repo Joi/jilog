@@ -1848,9 +1848,9 @@ mod tests {
         assert_eq!(akiko.input_tokens, 800);
         assert_eq!(akiko.cost_usd, Some(Decimal::from_str("1.5").unwrap()));
         // A session with messages but no detected signals must still appear
-        // in the rollup with its sessions and usage counted. (A session with
-        // NO messages and no events is skipped before stats are read — that
-        // early-return is pre-existing pipeline behavior.)
+        // in the rollup with its sessions and usage counted. (Sessions with
+        // NO messages/events but WITH stats are covered by the stats-only
+        // test below.)
         assert_eq!(akiko.sessions, 1);
 
         let body = fs::read_to_string(&report.digest_path).unwrap();
