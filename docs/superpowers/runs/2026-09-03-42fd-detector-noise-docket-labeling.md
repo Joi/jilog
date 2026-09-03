@@ -26,8 +26,8 @@ Pass 3 [code:chunks-1-2]: 0B/1S/0C/0R (fresheyes gpt, REASON=-) · fixed 4/4 pri
   code passes: 3 (cap) · elapsed: 44 min · the one S (present-null `returncode` treated as blank, spec says present ⇒ integer) fixed in one line + test; no round 4 (three-round cap per phase; the fix is in the emit direction and changes no production shape's outcome).
 
 ## Chunks
-- [x] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters) — Agency evaluator clean (92), built + committed; code review pending
-- [x] chunk 2 — jilog recurrence (kata tracker: closed_reason-aware dedup; never reopen non-done closes) — Agency evaluator clean (92), built + committed; code review pending
+- [x] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters) — Agency evaluator clean (92); review clean after 3 rounds (Stage 1 r3: "Ready to merge: Yes", 24-case harness + real tool sources); commits ec352f1 … 4f2bc7e
+- [x] chunk 2 — jilog recurrence (kata tracker: closed_reason-aware dedup; never reopen non-done closes) — Agency evaluator clean (92); review clean (same rounds); roborev #1854/#1855/#1856/#1858/#1861/#1863/#1865 all fixed + closed
 - [x] chunk 3 — amplifier-bundle-joi triager (decision target gating; close-proposed label; 7-day unchallenged auto-close phase) — built by subagent, commit 4a45379 in the 15ax worktree, test-gate PASSED (164s), Agency evaluator clean (90); code review pending
 Stage: code-review:chunks-1-2 ∥ code-review:chunk-3 (Stage 1 subagents + watchdogged fresheyes, both chunks in parallel)
 Chunks 1+2 are one crate and one commit; they take ONE combined Stage 1 ∥ Stage 2 review round (fresheyes is 5–15 min a pass; two separate rounds on a 600-line diff buys nothing).
