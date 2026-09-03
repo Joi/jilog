@@ -331,15 +331,16 @@ fn bare_timeout_regex() -> &'static regex::Regex {
 /// The error text of a failed result, classified.
 #[derive(Debug, PartialEq, Eq)]
 enum ErrText {
-    /// `error` null/absent and no top-level `message`.
+    /// `error` null/absent and no top-level `message` (a null `message`
+    /// counts as absent).
     Absent,
     /// A string at `error`, `error.message`, or top-level `message`.
     Text(String),
     /// An unrecognized shape; never suppressed. Either `error` is present
     /// but not a string and not an object with a string `message`, or a
     /// top-level `message` is not the text that was read (present and
-    /// non-null beside a non-null `error`, or present and non-string with
-    /// `error` absent).
+    /// non-null beside a non-null `error`, or present, non-null and
+    /// non-string with `error` absent).
     Unrecognized,
 }
 
@@ -1098,9 +1099,15 @@ mod tests {
         // jilog#6s9q signal and must be suppressed.
         let real = json!({"error": {"message": "Command timed out after 30 seconds"}, "output": "Command timed out after 30 seconds", "success": false});
         assert!(errors_for("bash", real).is_empty());
-        // An empty string output is equally content-free.
+        // An empty string output is equally content-free, and the string
+        // arm trims: whitespace-only, or the sentence padded with
+        // whitespace/newline, is still blank (roborev #1867).
         let empty = json!({"success": false, "error": "Command timed out after 30 seconds", "output": ""});
         assert!(errors_for("bash", empty).is_empty());
+        let ws = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "  \n"});
+        assert!(errors_for("bash", ws).is_empty());
+        let padded = json!({"error": {"message": "Command timed out after 30 seconds"}, "output": " Command timed out after 30 seconds\n", "success": false});
+        assert!(errors_for("bash", padded).is_empty());
     }
 
     #[test]
