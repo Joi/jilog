@@ -198,7 +198,7 @@
   <li>
     <span class="name err">Error</span>
     <div class="what">A tool call returned a structured failure</div>
-    <div class="how">A <code>role: tool</code> message whose JSON content has <code>success: false</code>.</div>
+    <div class="how">A <code>role: tool</code> message whose JSON content has <code>success: false</code> &mdash; except two ruled-expected shapes that are never emitted: a <code>mode</code> denial (<code>status: denied</code> / <code>*_denied</code>) and a content-free <code>bash</code> failure (the bare timeout sentence, or a nonzero exit with no output at all). Anything with stderr, stdout, or an error object still emits.</div>
   </li>
   <li>
     <span class="name wrk">Workaround</span>
@@ -244,7 +244,7 @@
 
 <span class="a">## Errors</span>
 - `0e91a2b4-…` / `bash`:
-    Command timed out after 30 seconds
+    cargo test: error[E0308]: mismatched types
 - `c5d76f02-…` / `read_file`:
     ~ was not expanded; use $HOME
 
@@ -258,7 +258,7 @@
 <pre>{
   <span class="k">"short_id"</span>: <span class="v">"jvd2"</span>,
   <span class="k">"title"</span>: <span class="v">"[jilog/error] bash:
-       Command timed out after 30 seconds"</span>,
+       cargo test: error[E0308]: mismatched types"</span>,
   <span class="k">"priority"</span>: <span class="v">1</span>,
   <span class="k">"status"</span>: <span class="v">"open"</span>,
   <span class="k">"labels"</span>: [<span class="v">"jilog"</span>, <span class="v">"jilog:error"</span>],
@@ -273,8 +273,8 @@
 
    ## Signal
    Tool: bash
-   Message: Command timed out
-   after 30 seconds"</span>
+   Message: cargo test: error[E0308]:
+   mismatched types"</span>
 }</pre>
 </div>
 

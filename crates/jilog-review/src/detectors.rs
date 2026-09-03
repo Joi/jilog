@@ -77,10 +77,6 @@ const DEFERRAL_LABELS: &[&str] = &[
     "circle back",
 ];
 
-/// Sub-agent session prefix (16 zeros). Sessions whose ID starts with
-/// this are excluded from P0 alert counting.
-const SUB_AGENT_PREFIX: &str = "0000000000000000";
-
 /// Threshold for the P0 alert: distinct root sessions per tool.
 const P0_DISTINCT_SESSION_THRESHOLD: usize = 3;
 
@@ -229,6 +225,13 @@ pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal>
         }
 
         let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
+        if is_expected_noise(&tool_name, &data) {
+            tracing::debug!(
+                "detect_errors: suppressed expected-noise result from `{}` in {} (jilog#42fd)",
+                tool_name, session_id
+            );
+            continue;
+        }
         let message = extract_error_message(&data);
 
         out.push(ErrorSignal {
@@ -270,6 +273,132 @@ fn value_as_string(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expected-noise filter (jilog#42fd)
+// ---------------------------------------------------------------------------
+//
+// Joi's 2026-09-01 ruling: a denied mode-switch prompt and a bare nonzero
+// exit code are not error signals. The filter is an ALLOWLIST of positively
+// identified noise shapes — never a denylist of "non-diagnostic" text. Any
+// result that does not match one of the shapes exactly (a non-string stdout,
+// a structured error object, an unfamiliar envelope) is emitted, so real
+// error detection is never weakened by a heuristic guess.
+
+/// True when a `success: false` result is one of the ruled-expected shapes
+/// and must not become an [`ErrorSignal`].
+fn is_expected_noise(tool_name: &str, data: &serde_json::Value) -> bool {
+    is_mode_denial(tool_name, data) || is_content_free_bash_failure(tool_name, data)
+}
+
+/// The `mode` tool refusing a switch/clear: `output.status == "denied"`, an
+/// `output.denied_mode` field, or an error code ending in `_denied`
+/// (`clear_denied`, `switch_denied`). A `mode` error that is not a denial
+/// (bad transition, internal failure) does not match and is emitted.
+fn is_mode_denial(tool_name: &str, data: &serde_json::Value) -> bool {
+    if tool_name != "mode" {
+        return false;
+    }
+    let output = data.get("output");
+    let status_denied = output
+        .and_then(|o| o.get("status"))
+        .and_then(|s| s.as_str())
+        == Some("denied");
+    let has_denied_mode = output
+        .and_then(|o| o.get("denied_mode"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let code_denied = [
+        data.get("error").and_then(|e| e.get("code")),
+        data.get("code"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|c| c.as_str())
+    .any(|c| c.ends_with("_denied"));
+    status_denied || has_denied_mode || code_denied
+}
+
+/// Regex for the bare timeout sentence the bash tool emits.
+fn bare_timeout_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^command timed out after \d+ seconds?\.?$")
+            .expect("bare timeout regex must compile")
+    })
+}
+
+/// The error text of a failed result, classified.
+#[derive(Debug, PartialEq, Eq)]
+enum ErrText {
+    /// `error` null/absent and no top-level `message`.
+    Absent,
+    /// A string at `error`, `error.message`, or top-level `message`.
+    Text(String),
+    /// `error` is present but not a string and not an object with a string
+    /// `message` — an unrecognized shape; never suppressed.
+    Unrecognized,
+}
+
+fn error_text(data: &serde_json::Value) -> ErrText {
+    match data.get("error") {
+        None | Some(serde_json::Value::Null) => match data.get("message") {
+            Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+            Some(_) => ErrText::Unrecognized,
+            None => ErrText::Absent,
+        },
+        Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+        Some(serde_json::Value::Object(map)) => match map.get("message") {
+            Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+            _ => ErrText::Unrecognized,
+        },
+        Some(_) => ErrText::Unrecognized,
+    }
+}
+
+/// `output.<key>` as text: `Some("")` when absent or null, `Some(s)` for a
+/// string, `None` for any other type — a structured stdout/stderr is an
+/// unrecognized shape and the caller must emit.
+fn output_text(data: &serde_json::Value, key: &str) -> Option<String> {
+    match data.get("output").and_then(|o| o.get(key)) {
+        None | Some(serde_json::Value::Null) => Some(String::new()),
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => None,
+    }
+}
+
+fn output_is_blank(data: &serde_json::Value) -> bool {
+    matches!(
+        (output_text(data, "stdout"), output_text(data, "stderr")),
+        (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
+    )
+}
+
+/// Shape 1: the timeout sentence with nothing else — no stdout, no stderr.
+fn is_bare_timeout(data: &serde_json::Value) -> bool {
+    match error_text(data) {
+        ErrText::Text(t) => bare_timeout_regex().is_match(t.trim()) && output_is_blank(data),
+        _ => false,
+    }
+}
+
+/// Shape 2: an integer nonzero `output.returncode`, no error text at all,
+/// and blank stdout and stderr. A banner-only stdout does NOT match: the
+/// only way to call it non-diagnostic would be a marker heuristic.
+fn is_bare_nonzero_exit(data: &serde_json::Value) -> bool {
+    let nonzero = data
+        .get("output")
+        .and_then(|o| o.get("returncode"))
+        .and_then(|r| r.as_i64())
+        .map(|r| r != 0)
+        .unwrap_or(false);
+    nonzero && error_text(data) == ErrText::Absent && output_is_blank(data)
+}
+
+/// The two content-free bash shapes (bare timeout, bare nonzero exit).
+fn is_content_free_bash_failure(tool_name: &str, data: &serde_json::Value) -> bool {
+    tool_name == "bash" && (is_bare_timeout(data) || is_bare_nonzero_exit(data))
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +523,7 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in errors {
-        if e.session_id.starts_with(SUB_AGENT_PREFIX) {
+        if crate::reader::is_sub_agent_session(&e.session_id) {
             continue;
         }
         by_tool
@@ -734,6 +863,165 @@ mod tests {
         };
         let out = detect_errors(&[msg], "s1");
         assert_eq!(out[0].tool_name, "unknown");
+    }
+
+    // ---------- expected-noise filter (jilog#42fd) ----------
+
+    fn errors_for(name: &str, content: serde_json::Value) -> Vec<ErrorSignal> {
+        detect_errors(&[tool(name, content)], "s1")
+    }
+
+    #[test]
+    fn errors_skip_mode_denial_status() {
+        // jilog#02j8 shape.
+        let c = json!({"error": null, "output": {"status": "denied", "user_instruction": "Inform the user: I'd like to clear the current mode"}, "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_denied_mode() {
+        // jilog#gahn shape.
+        let c = json!({"error": null, "output": {"denied_mode": "debug", "status": "denied"}, "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_clear_denied_code() {
+        // jilog#qryp shape: structured error with a *_denied code.
+        let c = json!({"success": false, "error": {"code": "clear_denied", "message": "Cannot clear mode while in 'debug'."}});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_flat_denied_code() {
+        let c = json!({"code": "switch_denied", "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_mode_non_denial() {
+        let c = json!({"success": false, "error": {"code": "invalid_transition", "message": "no such mode"}});
+        let out = errors_for("mode", c);
+        assert_eq!(out.len(), 1, "a mode error that is not a denial must still emit");
+        assert!(out[0].message.contains("invalid_transition"));
+    }
+
+    #[test]
+    fn errors_keep_denied_status_from_other_tool() {
+        // The denial filter is scoped to the `mode` tool.
+        let c = json!({"error": null, "output": {"status": "denied"}, "success": false});
+        assert_eq!(errors_for("delegate", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_skip_bash_bare_timeout() {
+        // jilog#6s9q shape (error object with message) and the string form.
+        let obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}});
+        assert!(errors_for("bash", obj).is_empty());
+        let s = json!({"success": false, "error": "Command timed out after 120 seconds."});
+        assert!(errors_for("bash", s).is_empty());
+        let top = json!({"success": false, "message": "Command timed out after 25 seconds"});
+        assert!(errors_for("bash", top).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_bash_bare_nonzero_exit() {
+        // jilog#dcpg shape: returncode 1, empty stdout and stderr.
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": ""}, "success": false});
+        assert!(errors_for("bash", c).is_empty());
+        // Whitespace-only counts as blank; absent fields count as blank.
+        let ws = json!({"error": null, "output": {"returncode": 2, "stderr": " \n", "stdout": "\n"}, "success": false});
+        assert!(errors_for("bash", ws).is_empty());
+        let absent = json!({"output": {"returncode": 127}, "success": false});
+        assert!(errors_for("bash", absent).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_bash_banner_stdout() {
+        // jilog#mg3p: stdout is only a heading — still emitted; no marker
+        // heuristic decides what is "not diagnostic".
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": "=== today's health report ===\n"}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_stderr() {
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "kata-dispatch: kata show failed", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_marker_free_stdout() {
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": "checksum mismatch: expected X, got Y"}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_structured_stdout_and_stderr() {
+        // Non-string stdout/stderr is an unrecognized shape: emit.
+        let obj = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": {"failed": ["a"]}}, "success": false});
+        assert_eq!(errors_for("bash", obj).len(), 1);
+        let arr = json!({"error": null, "output": {"returncode": 1, "stderr": ["boom"], "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_structured_error() {
+        // Error object without a string message, and an error array.
+        let obj = json!({"success": false, "error": {"code": "E1"}, "output": {"returncode": 1, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", obj).len(), 1);
+        let arr = json!({"success": false, "error": ["x"], "output": {"returncode": 1, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_timeout_with_output() {
+        let c = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"stdout": "partial build log", "stderr": ""}});
+        assert_eq!(errors_for("bash", c).len(), 1);
+        let e = json!({"success": false, "error": "Command timed out after 30 seconds", "output": {"stdout": "", "stderr": "warning: slow"}});
+        assert_eq!(errors_for("bash", e).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_other_error_text() {
+        let c = json!({"success": false, "error": "spawn failed"});
+        assert_eq!(errors_for("bash", c).len(), 1);
+        // Timeout sentence with extra words is not the bare sentence.
+        let d = json!({"success": false, "error": "Command timed out after 30 seconds while running cargo"});
+        assert_eq!(errors_for("bash", d).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_unknown_envelope() {
+        let c = json!({"success": false, "weird": 1});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_zero_or_non_integer_returncode() {
+        let zero = json!({"error": null, "output": {"returncode": 0, "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", zero).len(), 1);
+        let s = json!({"error": null, "output": {"returncode": "1", "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", s).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bare_shapes_from_other_tools() {
+        // The bash shapes are scoped to the `bash` tool.
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("python_check", c).len(), 1);
+    }
+
+    #[test]
+    fn error_text_classification() {
+        assert_eq!(error_text(&json!({})), ErrText::Absent);
+        assert_eq!(error_text(&json!({"error": null})), ErrText::Absent);
+        assert_eq!(error_text(&json!({"error": "x"})), ErrText::Text("x".into()));
+        assert_eq!(error_text(&json!({"error": {"message": "m"}})), ErrText::Text("m".into()));
+        assert_eq!(error_text(&json!({"message": "top"})), ErrText::Text("top".into()));
+        assert_eq!(error_text(&json!({"error": {"code": "c"}})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": 7})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"message": 7})), ErrText::Unrecognized);
     }
 
     // ---------- workarounds ----------

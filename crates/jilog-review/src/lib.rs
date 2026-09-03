@@ -27,7 +27,7 @@ pub mod trackers;
 
 pub use error::JilogReviewError;
 pub use signal::{Signal, Correction, ErrorSignal, Workaround, PatternSignal, DeferralSignal};
-pub use reader::{Reader, Message, TranscriptHandle, SessionEvent, SessionEventKind, SessionStats, ProcessedSessions, parse_session_role};
+pub use reader::{Reader, Message, TranscriptHandle, SessionEvent, SessionEventKind, SessionStats, ProcessedSessions, parse_session_role, is_sub_agent_session, SUB_AGENT_PREFIX};
 pub use tracker::{Tracker, IssueRef, signal_title};
 pub use detectors::{detect_corrections, detect_corrections_chat, detect_errors, detect_workarounds, detect_deferrals, detect_p0_alerts};
 pub use health::detect_health_patterns;

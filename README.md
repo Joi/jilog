@@ -181,7 +181,7 @@ Six signal types are detected today.
 | Signal        | What triggers it                                                    | Detector heuristic                                                                                       |
 |---------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | `Correction`  | User pushes back on an assistant turn in 15–200 chars               | `assistant → user → assistant` window with a short user message in the middle                            |
-| `Error`       | A tool call returned a structured failure                           | A `role: tool` message whose JSON content has `success: false`                                           |
+| `Error`       | A tool call returned a structured failure                           | A `role: tool` message whose JSON content has `success: false` — minus the ruled-expected `mode` denials and content-free `bash` failures (see the expected-noise filter below) |
 | `Workaround`  | Assistant text admits a temporary or hacky path                     | First-match across `for now`, `temporary`, `workaround`, `hardcoded`, `TODO`, `FIXME`, `quick fix`, `hack` |
 | `Deferral`    | Assistant text postpones work to a later session                    | First-match across `come back to`, `defer`, `punt on`, `leave for later`, `skipping for now`, `park for now`, `next session`, `circle back` |
 | `Pattern`     | The session's event stream shows a mechanical health problem       | Four detectors over `SessionEvent` streams — see the table below                                          |
@@ -204,9 +204,15 @@ Chat sessions also swap the correction heuristic: in a group chat, a short user 
 | `compaction_storm`  | ≥3 compaction events within a 10-minute window                    |
 | `stuck_loop`        | Same tool called with identical arguments ≥4 times consecutively  |
 | `resume_storm`      | ≥3 resumes of one session within 30 minutes                       |
-| `iteration_runaway` | ≥25 tool calls with no intervening user message                   |
+| `iteration_runaway` | ≥150 tool calls with no intervening user message; sub-agent sessions (`0000000000000000-…`) are exempt |
 
 Each `Pattern` carries an `evidence` string (e.g. `4 compactions 09:01-09:08`) that lands verbatim in the digest's Patterns section and in filed issues.
+
+The runaway bar sits above the observed normal on purpose: 25–100 tool calls without a user turn is what an agent doing its job looks like (ruled 2026-09-01, jilog#42fd), and a sub-agent's call count measures the task it was handed, not its health — `stuck_loop` still covers it.
+
+### Expected-noise filter
+
+`Error` signals come from `role: tool` messages whose JSON content has `success: false`. Two classes are ruled expected and never emitted (no digest line, no issue — jilog#42fd): the `mode` tool refusing a switch or clear (`output.status: "denied"`, an `output.denied_mode` field, or a `*_denied` error code), and two content-free `bash` shapes — the bare `Command timed out after N seconds` sentence with no stdout or stderr, and a nonzero `returncode` with no error text and blank stdout and stderr. The filter is an allowlist of those exact shapes: a `mode` error that is not a denial, a bash failure with any stderr or stdout (even a one-line banner), a structured error object, or an unfamiliar envelope is still emitted.
 
 ### Cost-weighted digests
 
@@ -317,11 +323,11 @@ The issue title is built by `signal_title()` (see `crates/jilog-review/src/track
 [jilog/deferral]   <session_id>: <truncated item>
 ```
 
-With `tracker.type = "kata"`, a run fetches the full open and closed listings once (`kata list --limit 0`, memoized for the run; kata >= 0.14.1 required for `--limit 0`), then shells out to `kata create` once per new signal. The digest reference in the body is the run's real digest file (the configured `--digest-dir`, tilde-contracted, with the same date as the digest filename; the CLI default without a config zone is `~/.jilog/digests`). This is the exact invocation jilog builds for the `bash` timeout error on a host whose digest dir is `~/.amplifier/health`:
+With `tracker.type = "kata"`, a run fetches the full open and closed listings once (`kata list --limit 0`, memoized for the run; kata >= 0.14.1 required for `--limit 0`), then shells out to `kata create` once per new signal. The digest reference in the body is the run's real digest file (the configured `--digest-dir`, tilde-contracted, with the same date as the digest filename; the CLI default without a config zone is `~/.jilog/digests`). This is the exact invocation jilog builds for a `bash` failure that printed to stderr, on a host whose digest dir is `~/.amplifier/health`:
 
 ```console
 $ kata --project jilog --json create \
-    "[jilog/error] bash: Command timed out after 30 seconds" \
+    "[jilog/error] bash: cargo test: error[E0308]: mismatched types" \
     --body "Detected by jilog review pipeline on 2026-05-09.
 
 ## Source
@@ -331,17 +337,17 @@ $ kata --project jilog --json create \
 
 ## Signal
 Tool: bash
-Message: Command timed out after 30 seconds" \
+Message: cargo test: error[E0308]: mismatched types" \
     --label jilog --label jilog:error \
-    --idempotency-key "[jilog/error]-bash:-Command-timed-out-after-30-seconds" \
+    --idempotency-key "[jilog/error]-bash:-cargo-test:-error[E0308]:-mismatched-types" \
     --priority 1
 ```
 
 Priorities are fixed per kind: errors file at priority 1, corrections and patterns at 2, workarounds and deferrals at 3. The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
 
-Recurrence reopens rather than duplicates: if a **closed** kata issue carries the same title, jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations).
+Recurrence reopens rather than duplicates — when the close was a completion claim. If a **closed** kata issue carries the same title and its `closed_reason` is `done` (or absent, on daemons that predate reasons), jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations). A match closed `wontfix`, `duplicate`, `superseded`, or `audit-no-change` is a recorded decision, not a claim that the problem went away: jilog returns that issue's ref untouched — no reopen, no comment, no label — and the digest links the signal to it (jilog#42fd).
 
-The next nightly run that observes the same `bash`-timeout cluster will see the existing `[jilog/error] bash: Command timed out after 30 seconds` issue in `list_open()` and **not** file a duplicate — it will return the same `IssueRef`, which is what the digest links back to.
+The next nightly run that observes the same `cargo test` failure will see the existing `[jilog/error] bash: cargo test: error[E0308]: mismatched types` issue in `list_open()` and **not** file a duplicate — it will return the same `IssueRef`, which is what the digest links back to.
 
 ---
 

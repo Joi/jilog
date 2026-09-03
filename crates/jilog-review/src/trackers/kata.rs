@@ -28,7 +28,7 @@
 //! | `list_open()`    | `kata --project <p> --json list --status open --limit 0` |
 //! | `list_closed()`  | `kata --project <p> --json list --status closed --limit 0` |
 //! | `is_resolved()`  | `kata --project <p> --json show <ref>` → status == "closed" |
-//! | `reopen()`       | `kata --project <p> --json reopen <ref>` + comment + label add |
+//! | `reopen()`       | `kata --project <p> --json reopen <ref>` + comment + label add — only when the closed match's `closed_reason` is `done` (or absent); `wontfix`/`duplicate`/`superseded`/`audit-no-change` matches are returned untouched (jilog#42fd) |
 //!
 //! `<ref>` is kata's short_id (e.g. `e3nj`), falling back to the full ULID
 //! or, for pre-0.15 daemons, the legacy issue number.
@@ -72,7 +72,31 @@ pub struct KataTracker {
     /// and is the single writer during the run, so the memo only needs the
     /// updates create()/reopen() apply themselves.
     open_cache: std::sync::Mutex<Option<Result<Vec<IssueRef>, String>>>,
-    closed_cache: std::sync::Mutex<Option<Result<Vec<IssueRef>, String>>>,
+    closed_cache: std::sync::Mutex<Option<Result<Vec<ClosedIssue>, String>>>,
+}
+
+/// A closed issue from the listing, with the reason it was closed. The
+/// reason decides whether a recurring title reopens it (see
+/// [`reopen_allowed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedIssue {
+    issue: IssueRef,
+    /// kata ≥0.15 `closed_reason`: `done`, `wontfix`, `duplicate`,
+    /// `superseded`, `audit-no-change`. None on older daemons.
+    closed_reason: Option<String>,
+}
+
+/// Whether a recurring signal may reopen a closed title match.
+///
+/// Only a `done` close (or one with no recorded reason, pre-reason daemons)
+/// is a claim that the problem went away — recurrence contradicts it, so
+/// reopening is right. Every other reason records a decision that the
+/// title is intentionally not open work: `wontfix` is the ruling itself,
+/// `duplicate`/`superseded` point at a canonical issue elsewhere,
+/// `audit-no-change` was reviewed. Reopening those fights the record
+/// (jilog#42fd: eight wontfix closes reopened overnight on 2026-09-02).
+pub(crate) fn reopen_allowed(closed_reason: Option<&str>) -> bool {
+    matches!(closed_reason, None | Some("done"))
 }
 
 impl KataTracker {
@@ -116,23 +140,49 @@ impl KataTracker {
         c
     }
 
-    /// List closed issues for this project (mirrors `list_open` with `--status closed`).
-    fn list_closed(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
+    /// Test-only constructor: pre-fill both listing memos so `create()` can
+    /// be exercised without a kata daemon (the listings never shell out;
+    /// only a reopen/create would).
+    #[cfg(test)]
+    fn with_seeded_listings(
+        project: impl Into<String>,
+        open: Vec<IssueRef>,
+        closed: Vec<ClosedIssue>,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            digest_path: None,
+            date: Some("2026-09-03".to_string()),
+            open_cache: std::sync::Mutex::new(Some(Ok(open))),
+            closed_cache: std::sync::Mutex::new(Some(Ok(closed))),
+        }
+    }
+
+    /// List closed issues for this project (mirrors `list_open` with
+    /// `--status closed`), each with its `closed_reason`.
+    fn list_closed(&self) -> Result<Vec<ClosedIssue>, JilogReviewError> {
         if let Some(cached) = self.closed_cache.lock().unwrap().as_ref() {
             return match cached {
                 Ok(v) => Ok(v.clone()),
                 Err(m) => Err(JilogReviewError::Tracker(m.clone())),
             };
         }
-        let res = self.fetch_list("closed");
+        let res = self.fetch_listing("closed");
         *self.closed_cache.lock().unwrap() =
             Some(res.as_ref().map(|v| v.clone()).map_err(|e| e.to_string()));
         res
     }
 
-    /// Fetch one full listing from the CLI (`--limit 0` = unlimited; needs
-    /// kata >= 0.14.1 — see the module doc's version note).
+    /// Fetch one full listing as bare refs (the open-listing path).
     fn fetch_list(&self, status: &str) -> Result<Vec<IssueRef>, JilogReviewError> {
+        self.fetch_listing(status)
+            .map(|v| v.into_iter().map(|c| c.issue).collect())
+    }
+
+    /// Fetch one full listing from the CLI (`--limit 0` = unlimited; needs
+    /// kata >= 0.14.1 — see the module doc's version note), keeping each
+    /// row's `closed_reason`.
+    fn fetch_listing(&self, status: &str) -> Result<Vec<ClosedIssue>, JilogReviewError> {
         let output = self
             .cmd()
             .args(["list", "--status", status, "--limit", "0"])
@@ -154,7 +204,7 @@ impl KataTracker {
             return Err(err);
         }
 
-        parse_list_response(&String::from_utf8_lossy(&output.stdout), status)
+        parse_listed_issues(&String::from_utf8_lossy(&output.stdout), status)
     }
 
     /// Reopen a closed issue, then annotate it with a recurrence comment and
@@ -228,6 +278,10 @@ struct KataIssue {
     /// would silently filter the row out of every listing (fresheyes
     /// 2026-08-26 on jilog#fx51).
     status: String,
+    /// Why a closed issue was closed (kata ≥0.15). Optional: older daemons
+    /// omit it, and an open row has none.
+    #[serde(default)]
+    closed_reason: Option<String>,
 }
 
 impl KataIssue {
@@ -296,22 +350,34 @@ impl Tracker for KataTracker {
         }
 
         // Dedup pass 2 (reopen-on-recurrence): if a closed issue has the same
-        // title, reopen it instead of filing a duplicate.
+        // title, reopen it instead of filing a duplicate — but only when it
+        // was closed `done`. A wontfix/duplicate/superseded/audit close is a
+        // recorded decision; the signal maps to that issue and nothing is
+        // mutated (jilog#42fd).
         let closed = self.list_closed()?;
-        if let Some(existing) = closed.iter().find(|i| i.title == title) {
-            let issue_ref = existing.id.trim_start_matches('#');
+        if let Some(existing) = closed.iter().find(|c| c.issue.title == title) {
+            if !reopen_allowed(existing.closed_reason.as_deref()) {
+                tracing::info!(
+                    "kata: '{}' matches {} closed {} — not reopening (jilog#42fd)",
+                    title,
+                    existing.issue.id,
+                    existing.closed_reason.as_deref().unwrap_or("?")
+                );
+                return Ok(existing.issue.clone());
+            }
+            let issue_ref = existing.issue.id.trim_start_matches('#');
             let comment = format!(
                 "Recurred on {} — closure may have been premature.",
                 self.run_date()
             );
             self.reopen(issue_ref, &comment)?;
             // Keep the per-run memo truthful: the issue moved closed -> open.
-            let reopened = existing.clone();
+            let reopened = existing.issue.clone();
             if let Some(Ok(open)) = self.open_cache.lock().unwrap().as_mut() {
                 open.push(reopened.clone());
             }
             if let Some(Ok(closed)) = self.closed_cache.lock().unwrap().as_mut() {
-                closed.retain(|i| i.id != reopened.id);
+                closed.retain(|c| c.issue.id != reopened.id);
             }
             return Ok(reopened);
         }
@@ -516,7 +582,15 @@ fn parse_create_response(stdout: &str) -> Result<String, JilogReviewError> {
 /// list here silently disables dedup and recurrence detection, and the
 /// resulting re-files surface only as opaque idempotency rejections
 /// (jilog#fx51, comment thread).
+#[cfg(test)]
 fn parse_list_response(stdout: &str, want_status: &str) -> Result<Vec<IssueRef>, JilogReviewError> {
+    parse_listed_issues(stdout, want_status)
+        .map(|v| v.into_iter().map(|c| c.issue).collect())
+}
+
+/// Parse a listing keeping each row's `closed_reason`. Same loud-failure
+/// contract as the bare-ref form above.
+fn parse_listed_issues(stdout: &str, want_status: &str) -> Result<Vec<ClosedIssue>, JilogReviewError> {
     let parsed: KataList = serde_json::from_str(stdout).map_err(|e| {
         JilogReviewError::Tracker(format!(
             "kata list JSON parse: {} (stdout: {})",
@@ -531,11 +605,14 @@ fn parse_list_response(stdout: &str, want_status: &str) -> Result<Vec<IssueRef>,
         .filter(|i| i.status == want_status)
         .map(|i| {
             let r = i.issue_ref()?;
-            Ok(IssueRef {
-                id: format!("#{}", r),
-                backend: "kata".to_string(),
-                url: None,
-                title: i.title,
+            Ok(ClosedIssue {
+                issue: IssueRef {
+                    id: format!("#{}", r),
+                    backend: "kata".to_string(),
+                    url: None,
+                    title: i.title,
+                },
+                closed_reason: i.closed_reason,
             })
         })
         .collect()
@@ -970,5 +1047,113 @@ mod tests {
         }
         // Test passes regardless — verifies no panic and errors surface rather
         // than being swallowed.
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#42fd — reason-aware recurrence
+    // -----------------------------------------------------------------------
+
+    fn sig(title_context: &str) -> Signal {
+        Signal::Error(ErrorSignal {
+            session_id: "sess-42fd".into(),
+            tool_name: "bash".into(),
+            message: title_context.into(),
+            ..Default::default()
+        })
+    }
+
+    fn closed(signal: &Signal, reason: Option<&str>) -> ClosedIssue {
+        ClosedIssue {
+            issue: IssueRef {
+                id: "#zz99".into(),
+                backend: "kata".into(),
+                url: None,
+                title: signal_title(signal),
+            },
+            closed_reason: reason.map(|r| r.to_string()),
+        }
+    }
+
+    #[test]
+    fn parse_listed_issues_carries_closed_reason() {
+        let stdout = r#"{"kata_api_version":1,"issues":[
+            {"id":1,"short_id":"ab12","title":"wontfixed","status":"closed","closed_reason":"wontfix"},
+            {"id":2,"short_id":"cd34","title":"legacy","status":"closed"},
+            {"id":3,"short_id":"ef56","title":"open one","status":"open"}
+        ]}"#;
+        let rows = parse_listed_issues(stdout, "closed").expect("must parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].issue.id, "#ab12");
+        assert_eq!(rows[0].closed_reason.as_deref(), Some("wontfix"));
+        assert_eq!(rows[1].closed_reason, None, "older daemons omit the field");
+        // The loud failures are unchanged.
+        assert!(parse_listed_issues("nope", "closed").is_err());
+        assert!(parse_listed_issues(r#"{"items":[]}"#, "closed").is_err());
+        assert!(parse_listed_issues(r#"{"issues":[{"short_id":"x","title":"t"}]}"#, "closed").is_err());
+        assert!(parse_listed_issues(r#"{"issues":[{"title":"t","status":"closed"}]}"#, "closed").is_err());
+    }
+
+    #[test]
+    fn reopen_allowed_only_for_done_or_absent() {
+        assert!(reopen_allowed(None));
+        assert!(reopen_allowed(Some("done")));
+        for r in ["wontfix", "duplicate", "superseded", "audit-no-change", "anything-else"] {
+            assert!(!reopen_allowed(Some(r)), "{} must not reopen", r);
+        }
+    }
+
+    #[test]
+    fn create_returns_wontfix_match_without_reopen() {
+        let s = sig("wontfix me");
+        let c = closed(&s, Some("wontfix"));
+        let t = KataTracker::with_seeded_listings("nonexistent-jilog-test-project", vec![], vec![c.clone()]);
+        // No shell-out happens on this path, so the result is deterministic
+        // whether or not kata is installed.
+        let got = t.create(&s).expect("wontfix match is returned, never an error");
+        assert_eq!(got, c.issue);
+        // Memos untouched: nothing moved closed -> open.
+        assert!(t.open_cache.lock().unwrap().as_ref().unwrap().as_ref().unwrap().is_empty());
+        assert_eq!(
+            t.closed_cache.lock().unwrap().as_ref().unwrap().as_ref().unwrap(),
+            &vec![c]
+        );
+        // Same for the other non-done reasons.
+        for r in ["duplicate", "superseded", "audit-no-change"] {
+            let t = KataTracker::with_seeded_listings("nonexistent-jilog-test-project", vec![], vec![closed(&s, Some(r))]);
+            assert!(t.create(&s).is_ok(), "{} must return the closed ref", r);
+        }
+    }
+
+    #[test]
+    fn create_takes_reopen_path_for_done_match() {
+        // A done (or reason-less) match goes down the reopen path, which
+        // shells out: with kata absent that is Err(Command), with kata
+        // present but the project missing it is Err(Tracker). Either way
+        // it is NOT the silent Ok(closed ref) the wontfix path returns.
+        let s = sig("done me");
+        for reason in [Some("done"), None] {
+            let t = KataTracker::with_seeded_listings(
+                "nonexistent-jilog-test-project",
+                vec![],
+                vec![closed(&s, reason)],
+            );
+            let res = t.create(&s);
+            assert!(res.is_err(), "reason {:?} must attempt the reopen: {:?}", reason, res);
+        }
+    }
+
+    #[test]
+    fn create_returns_open_match_first() {
+        let s = sig("already open");
+        let open = IssueRef {
+            id: "#op11".into(),
+            backend: "kata".into(),
+            url: None,
+            title: signal_title(&s),
+        };
+        // A closed wontfix twin exists too; the open one wins and nothing
+        // else is consulted.
+        let t = KataTracker::with_seeded_listings("p", vec![open.clone()], vec![closed(&s, Some("wontfix"))]);
+        assert_eq!(t.create(&s).unwrap(), open);
     }
 }

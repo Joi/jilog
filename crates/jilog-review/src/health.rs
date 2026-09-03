@@ -15,7 +15,7 @@
 //! | `compaction_storm`  | ≥3 compaction events within a 10-minute window |
 //! | `stuck_loop`        | same tool called with identical arguments ≥4 times consecutively |
 //! | `resume_storm`      | ≥3 resumes of one session within 30 minutes |
-//! | `iteration_runaway` | ≥25 tool calls with no intervening user message |
+//! | `iteration_runaway` | ≥150 tool calls with no intervening user message (sub-agent sessions exempt) |
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -40,7 +40,12 @@ pub const RESUME_STORM_MIN_EVENTS: usize = 3;
 pub const RESUME_STORM_WINDOW_MINUTES: i64 = 30;
 
 /// `iteration_runaway`: minimum tool calls with no intervening user message.
-pub const ITERATION_RUNAWAY_MIN_TOOL_CALLS: usize = 25;
+///
+/// 150, not the original 25: Joi ruled on 2026-09-01 that 25–100 calls
+/// without a user turn is what an agent doing its job looks like
+/// (jilog#42fd — #aptc 100, #z1dj 77, #5a9h 44 were all normal work). The
+/// bar sits above the observed normal so only a genuine runaway crosses it.
+pub const ITERATION_RUNAWAY_MIN_TOOL_CALLS: usize = 150;
 
 // ---------------------------------------------------------------------------
 // Aggregator
@@ -208,10 +213,17 @@ pub fn detect_stuck_loops(events: &[SessionEvent], session_id: &str) -> Vec<Patt
 /// Fire when >= [`ITERATION_RUNAWAY_MIN_TOOL_CALLS`] tool calls happen with
 /// no intervening user message. At most one signal per session, describing
 /// the longest stretch.
+///
+/// Sub-agent sessions never fire: a sub-agent is driven by its parent, so
+/// "tool calls between user messages" measures the size of the task it was
+/// handed, not its health (jilog#42fd). `stuck_loop` still covers them.
 pub fn detect_iteration_runaway(
     events: &[SessionEvent],
     session_id: &str,
 ) -> Option<PatternSignal> {
+    if crate::reader::is_sub_agent_session(session_id) {
+        return None;
+    }
     let mut best: Option<(usize, DateTime<Utc>, DateTime<Utc>)> = None;
     let mut count = 0;
     let mut stretch_start: Option<DateTime<Utc>> = None;
@@ -504,33 +516,59 @@ mod tests {
             .collect()
     }
 
+    const T: usize = ITERATION_RUNAWAY_MIN_TOOL_CALLS;
+
     #[test]
     fn iteration_runaway_fires_at_threshold() {
-        let events = n_tool_calls(25, 0);
-        let sig = detect_iteration_runaway(&events, "s1").expect("must fire at 25");
+        let events = n_tool_calls(T, 0);
+        let sig = detect_iteration_runaway(&events, "s1").expect("must fire at the threshold");
         assert_eq!(sig.pattern_kind, "iteration_runaway");
-        assert_eq!(sig.evidence, "25 tool calls without a user message 09:00-09:24");
+        assert!(
+            sig.evidence.starts_with(&format!("{} tool calls without a user message 09:00-", T)),
+            "evidence: {}",
+            sig.evidence
+        );
     }
 
     #[test]
     fn iteration_runaway_silent_below_threshold() {
-        let events = n_tool_calls(24, 0);
+        let events = n_tool_calls(T - 1, 0);
         assert!(detect_iteration_runaway(&events, "s1").is_none());
     }
 
     #[test]
+    fn iteration_runaway_root_session_fires_at_150() {
+        // The ruled-normal range (25–100) must stay silent; 150 is the bar.
+        assert_eq!(T, 150, "threshold pinned by jilog#42fd");
+        assert!(detect_iteration_runaway(&n_tool_calls(100, 0), "s1").is_none());
+        assert!(detect_iteration_runaway(&n_tool_calls(149, 0), "s1").is_none());
+        assert!(detect_iteration_runaway(&n_tool_calls(150, 0), "s1").is_some());
+    }
+
+    #[test]
+    fn iteration_runaway_exempts_sub_agent_sessions() {
+        let events = n_tool_calls(T + 50, 0);
+        assert!(
+            detect_iteration_runaway(&events, "0000000000000000-abc123_foundation-bug-hunter").is_none(),
+            "sub-agent sessions are parent-driven and never fire (jilog#42fd)"
+        );
+        // Same stream, root session id: fires.
+        assert!(detect_iteration_runaway(&events, "9fc65525-0074-44da-b2ca-22c11c58806d").is_some());
+    }
+
+    #[test]
     fn iteration_runaway_user_message_resets_count() {
-        // 24 calls, a user message, 24 more: never 25 uninterrupted.
-        let mut events = n_tool_calls(24, 0);
-        events.push(at(SessionEventKind::UserMessage, 24, 0));
-        events.extend(n_tool_calls(24, 25));
+        // T-1 calls, a user message, T-1 more: never T uninterrupted.
+        let mut events = n_tool_calls(T - 1, 0);
+        events.push(at(SessionEventKind::UserMessage, (T - 1) as i64, 0));
+        events.extend(n_tool_calls(T - 1, T as i64));
         assert!(detect_iteration_runaway(&events, "s1").is_none());
     }
 
     #[test]
     fn iteration_runaway_llm_responses_do_not_reset() {
         let mut events = Vec::new();
-        for i in 0..25 {
+        for i in 0..T {
             events.push(tool_call("bash", &format!(r#"{{"i":{}}}"#, i), i as i64));
             events.push(at(SessionEventKind::LlmResponse, i as i64, 30));
         }
@@ -539,12 +577,30 @@ mod tests {
 
     #[test]
     fn iteration_runaway_reports_longest_stretch() {
-        // 26-call stretch, user message, 30-call stretch: report the 30.
-        let mut events = n_tool_calls(26, 0);
-        events.push(at(SessionEventKind::UserMessage, 26, 0));
-        events.extend(n_tool_calls(30, 27));
+        // (T+1)-call stretch, user message, (T+5)-call stretch: report T+5.
+        let mut events = n_tool_calls(T + 1, 0);
+        events.push(at(SessionEventKind::UserMessage, (T + 1) as i64, 0));
+        events.extend(n_tool_calls(T + 5, (T + 2) as i64));
         let sig = detect_iteration_runaway(&events, "s1").unwrap();
-        assert!(sig.evidence.starts_with("30 tool calls"), "evidence: {}", sig.evidence);
+        assert!(
+            sig.evidence.starts_with(&format!("{} tool calls", T + 5)),
+            "evidence: {}",
+            sig.evidence
+        );
+    }
+
+    #[test]
+    fn detect_health_patterns_sub_agent_keeps_stuck_loop() {
+        // A sub-agent with a 4x identical-call run inside a T+10 stretch:
+        // stuck_loop still fires, iteration_runaway is exempt.
+        let mut events = n_tool_calls(T + 10, 0);
+        for i in 0..4 {
+            events.push(tool_call("bash", "{}", (T + 20 + i) as i64));
+        }
+        let sigs = detect_health_patterns(&events, "0000000000000000-abc123_self");
+        let kinds: Vec<&str> = sigs.iter().map(|s| s.pattern_kind.as_str()).collect();
+        assert!(kinds.contains(&"stuck_loop"), "kinds: {:?}", kinds);
+        assert!(!kinds.contains(&"iteration_runaway"), "kinds: {:?}", kinds);
     }
 
     // ---------- aggregator ----------
