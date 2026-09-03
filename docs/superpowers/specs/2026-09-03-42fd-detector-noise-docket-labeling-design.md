@@ -104,6 +104,19 @@ the signal when true. The predicate is the union of:
   - **Bare nonzero exit:** `output.returncode` is an integer ≠ 0, `error` is
     null or absent, `error_text` is `None`, and `blank(stdout)` and
     `blank(stderr)`.
+  Envelope allowlist (fresheyes code pass 1): a shape matches only when
+  every key is one the shape is defined over — top level `success`,
+  `error`, `output`, `message`; `output` object keys `returncode`, `stdout`,
+  `stderr`; `error` object key `message`. Any other key anywhere
+  (`output.message: "disk full"`, a sibling beside the timeout sentence, an
+  extra top-level field) is content the shape does not understand → emit.
+  `output` may also be a string, because the production timeout envelope
+  is `{"error":{"message":"Command timed out after N seconds"},"output":
+  "Command timed out after N seconds","success":false}` (tool_bash echoes
+  the sentence into `output`; Stage 1 review, 5/5 transcript samples): a
+  string `output` is blank iff it is empty or is itself the bare timeout
+  sentence; any other string text (a partial log, a traceback) is content
+  → emit; an array or number `output` is unrecognized → emit.
   Anything else is emitted: non-blank stderr, non-blank stdout (a banner, a
   checksum message, structured output — no marker list is consulted), any
   error text other than the timeout sentence, a structured error object, a
