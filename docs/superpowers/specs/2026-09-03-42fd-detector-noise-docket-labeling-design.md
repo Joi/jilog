@@ -36,10 +36,13 @@ The nightly `jilog review nightly --create-issues` run and the nightly
 - S2. `detect_errors` emits nothing for a `mode` tool result whose output has
   `status: "denied"` or a `denied_mode` field, or whose error code ends in
   `_denied`. It still emits for a `mode` error that is not a denial.
-- S3. `detect_errors` emits nothing for a `bash` result that is a bare timeout
-  or a nonzero exit with blank stderr and non-diagnostic stdout. It still emits
-  when stderr is non-blank, when stdout contains diagnostic markers, or when the
-  error text is anything other than the bare timeout sentence.
+- S3. `detect_errors` emits nothing for a `bash` result that exactly matches one
+  of two positively identified noise shapes: a bare timeout (the timeout
+  sentence with blank or absent stdout and stderr) or a bare nonzero exit
+  (integer `returncode` ≠ 0, blank stdout, blank stderr, no error text). Any
+  other failed bash result — non-blank stderr, non-blank stdout of any kind,
+  any error text other than the timeout sentence, a structured error object, or
+  an unfamiliar envelope — is still emitted. Unknown shapes default to emission.
 - S4. `KataTracker::create` reopens a closed title match only when the close
   reason is `done` (or absent, pre-reason daemons). A match closed `wontfix`,
   `duplicate`, `superseded`, or `audit-no-change` is returned as-is: no reopen,
@@ -52,8 +55,10 @@ The nightly `jilog review nightly --create-issues` run and the nightly
   sweep's expiry phase closes `close-proposed` issues `wontfix` once the
   proposal is 7+ days old and unchallenged; challenged or younger proposals are
   left alone and counted.
-- S7. Unit tests cover S1–S6; `cargo test --workspace` and the
-  amplifier-bundle-joi `pytest -q` suite pass.
+- S7. Unit tests cover S1–S6; `cargo test --workspace` passes in jilog and
+  `./scripts/test-gate.sh` (the marshal's hermetic gate) passes in
+  amplifier-bundle-joi. README and `docs/architecture.html` describe the new
+  threshold, the suppressed bash shapes, and the reason-aware reopen.
 - S8. The jilog change is tagged and installed on the active Mac (joimba) and
   jibotmac; the triager change is landed by the marshal and pulled on joimba.
   macazbd's rollout is recorded as pending on jilog#42fd (powered off until
@@ -80,20 +85,32 @@ the signal when true. The predicate is the union of:
 - `is_mode_denial`: `tool_name == "mode"` and (`output.status == "denied"`, or
   `output.denied_mode` present, or an error code string — at `error.code` or
   top-level `code` — ending in `_denied`).
-- `is_content_free_bash_failure`: `tool_name == "bash"` and no diagnostic
-  content, where diagnostic content means: `output.stderr` non-blank; or
-  `output.stdout` matching the diagnostic-marker regex (`error`, `fail(ed|ure)`,
-  `exception`, `traceback`, `panic`, `fatal`, `denied`, `not found`, `no such`,
-  `cannot`, `unable`, `invalid`, `refused`, `abort`, `permission`, `timed out`);
-  or an error text (`error` string, `error.message`, or top-level `message`)
-  that is anything other than the bare `Command timed out after N seconds`
-  sentence. So a bare timeout with no output, or a nonzero `returncode` with
-  blank stderr and marker-free stdout, is suppressed; everything else still
-  fires.
+- `is_content_free_bash_failure`: `tool_name == "bash"` and the result matches
+  one of exactly two positively identified shapes. Let `stdout`/`stderr` be
+  `output.stdout`/`output.stderr` read as strings (absent or null = empty) and
+  `blank(s)` = `s.trim().is_empty()`. Let `error_text` be `error` when it is a
+  string, else `error.message` when `error` is an object with a string
+  `message`, else top-level `message` when it is a string, else `None`; an
+  `error` value of any other non-null type (array, number, object without a
+  string `message`) makes the shape unrecognized.
+  - **Bare timeout:** `error_text` matches
+    `^Command timed out after \d+ seconds?\.?$` (trimmed, case-insensitive),
+    and `blank(stdout)` and `blank(stderr)`.
+  - **Bare nonzero exit:** `output.returncode` is an integer ≠ 0, `error` is
+    null or absent, `error_text` is `None`, and `blank(stdout)` and
+    `blank(stderr)`.
+  Anything else is emitted: non-blank stderr, non-blank stdout (a banner, a
+  checksum message, structured output — no marker list is consulted), any
+  error text other than the timeout sentence, a structured error object, a
+  timeout that also produced output, or an envelope with none of these fields.
+  The rule is an allowlist of noise shapes, never a denylist of diagnostics.
 
 Suppressed signals are not emitted anywhere (no digest line, no issue); a
 `tracing::debug` line records the drop. Real error detection is unchanged for
-every other tool and every diagnostic-bearing result.
+every other tool and every other result. Accepted residual: a nonzero exit
+whose stdout is only a heading (jilog#mg3p, `=== today's health report ===`)
+still emits, because deciding that a line is "not diagnostic" would require
+exactly the marker heuristics the lens forbids; that class is left to triage.
 
 ### B. jilog recurrence (`trackers/kata.rs`)
 
@@ -116,37 +133,68 @@ by A: those signals never leave the detector, so they neither file nor recur.
 
 ### C. Triager labeling (`amplifier-bundle-joi/src/amplifier_bundle_joi/jilog_triage.py`)
 
-- Verdict schema gains `decision_target` ("who or what must answer — a named
-  person, repo, or component"). `parse_verdict` cleans it (cap 120).
-- `decision` disposition: well-formed iff `question` contains `?` and
-  `decision_target` is non-empty. Well-formed → comment
-  `[jilog-triage] decision needed (for <target>): <question>`, `joi-decision`,
-  `jilog:triaged`; outcome `decision`. Malformed → comment
-  `[jilog-triage] decision requested without a concrete question and named
-  target — not stamped joi-decision`, `jilog:triaged`; outcome
-  `decision_unstamped` (new tally key). The label is never added without the
-  well-formed comment existing (this run or a prior one).
+- Verdict schema gains `decision_target` ("the named repo, component, script,
+  path, or person the question is about — never a placeholder like someone,
+  team, or TBD"). `parse_verdict` cleans it (cap 120).
+- `decision` disposition is **concrete** iff `decision_is_concrete(v)`:
+  `question` contains `?`, is ≥ 20 characters, and has ≥ 4 whitespace-separated
+  words; `decision_target` is ≥ 3 characters, contains an alphanumeric, and its
+  lowercase form is not in `PLACEHOLDER_TARGETS` (`someone`, `anyone`, `team`,
+  `human`, `user`, `operator`, `owner`, `tbd`, `n/a`, `none`, `null`,
+  `unknown`, `?`). Concrete → comment `[jilog-triage] decision needed (for
+  <target>): <question>`, `joi-decision`, `jilog:triaged`; outcome `decision`.
+  Not concrete → comment `[jilog-triage] decision requested without a concrete
+  question and named target — not stamped joi-decision`, `jilog:triaged`;
+  outcome `decision_unstamped` (new tally key). `joi-decision` is added only
+  when the concrete comment exists (written this run, or already present from
+  a prior run). Tests include the syntactically valid but empty values `"?"`
+  and `"someone"`.
 - `close` disposition: label `close-proposed` (constant `CLOSE_PROPOSED_LABEL`)
   instead of `joi-decision`; the proposal comment gains the trailer
   `— auto-closes wontfix after 7 days unless challenged`. `close-proposed` and
   `joi-decision` both stay in `LABEL_DENY` (the model never assigns them).
-- New phase `expire_close_proposals(run, fetch, mut, now, days=7, log)`, run by
-  `bin/jilog-triage` after the sweep (dry-run prints would-be closes). For each
-  open `close-proposed` issue: find the newest `[jilog-triage] close PROPOSED`
-  comment (its `created_at` is the proposal time; `fetch_issue_full` now keeps
+- New phase `expire_close_proposals(run, fetch, mut, now, days=7, budget_s,
+  max_items=50, log)`, run by `bin/jilog-triage` after the sweep (dry-run
+  prints would-be closes). It shares the sweep's absolute run deadline: the CLI
+  passes `budget_s = max(0, RUN_DEADLINE_S − elapsed)` and the phase stops at
+  the budget or after `max_items`, counting the remainder as
+  `expire_skipped_deadline` (they are re-evaluated the next night; nothing is
+  lost by waiting). For each open `close-proposed` issue (`kata list --project
+  jilog --status open --label close-proposed --limit 1000`): `fetch(ref)` and
+  find the newest `[jilog-triage] close PROPOSED` comment; its `created_at`
+  (RFC 3339, `Z` accepted) is the proposal time (`fetch_issue_full` now keeps
   `created_at` per comment). Challenged = issue has an owner, or carries
   `joi-decision`/`joi-ruled`, or any comment after the proposal whose body does
-  not start with `[jilog-triage]` or `Recurred on`. Unchallenged and ≥7 days →
+  not start with `[jilog-triage]` or `Recurred on`. **Fail closed:** a missing
+  marker, a missing or unparseable proposal timestamp, or a later comment with
+  a missing or unparseable timestamp is an `expire_errors` item and never
+  closes. Age < 7 days → `expire_pending`. Otherwise **refetch immediately
+  before closing** and re-run the same evaluation on the fresh snapshot (a
+  claim, label, or comment that landed since the first fetch counts as a
+  challenge); only then
   `kata close <ref> --reason wontfix --message "[jilog-triage] close proposal
   unchallenged for 7 days (proposed YYYY-MM-DD); closed per jilog#15ax —
-  reopen with a comment if this is real work"`. Tally keys: `expired`,
-  `expire_pending`, `expire_challenged`, `expire_errors`. Author-based
-  challenge detection is deliberately not used: the nightly job and Joi's
-  interactive sessions share `KATA_AUTHOR` on the same host.
+  reopen with a comment if this is real work" --project jilog --agent`
+  (the same explicit scope every existing mutation uses; asserted at argv
+  level in tests). kata offers no revision-guarded close, so the refetch
+  narrows the race to seconds — the same accepted residual `sweep` documents.
+  Tally keys: `expired`, `expire_pending`, `expire_challenged`,
+  `expire_skipped_deadline`, `expire_errors`, `expire_item_errors`.
+  Author-based challenge detection is deliberately not used: the nightly job
+  and Joi's interactive sessions share `KATA_AUTHOR` on the same host.
+- CLI contract: `merge_tallies(sweep_tally, expire_tally)` (pure, tested)
+  folds `expire_errors` into `errors` and `expire_item_errors` into
+  `item_errors`, so the existing exit-status rule (rc 1 when `errors > 0`) and
+  the `#ops-alerts` detail cover auto-close failures unchanged. A `KataError`
+  from the expiry listing itself is one `expire_errors` item (the sweep already
+  ran; rc 2 stays reserved for "could not run at all"). `tally_line` renders
+  the new keys with `.get(k, 0)`.
 - N = 7 days: one weekly docket cycle. The 2026-08-18 sweep spec rejected
   auto-close pending an evidence verifier; Joi's 2026-09-01 ruling replaces
   that with the unchallenged-window rule, and B guarantees an auto-closed
   (`wontfix`) issue is never reopened by recurrence.
+- `bundle.md` `bundle.version` is bumped (AGENTS.md: every behavioral change),
+  and the 2026-08-18 sweep spec's "Auto-close" rejection gets a superseded note.
 - Migration (rollout, not code): open jilog issues that carry `joi-decision`
   and a close-PROPOSED marker but no decision-needed marker are relabeled
   `close-proposed` by hand, with the command recorded on jilog#15ax.
@@ -161,9 +209,12 @@ by A: those signals never leave the detector, so they neither file nor recur.
 - **Suppress every `success: false` from `mode`.** Rejected: a non-denial mode
   error (bad transition, internal failure) is real; the brief forbids weakening
   real detection.
-- **Treat any non-empty stdout as diagnostic.** Rejected: #mg3p's stdout is a
-  report banner; the ruling names it noise. Marker matching keeps real failures
-  (stderr text, error words) while dropping banners.
+- **Classify stdout with a diagnostic-marker list (`error`, `failed`, …) and
+  suppress everything else.** Rejected (fresheyes pass 1, BLOCKER): a
+  marker-free diagnostic such as `checksum mismatch: expected X, got Y` would
+  vanish, and unknown failed envelopes would be suppressed by default. The
+  lens requires unknown shapes to emit, so the rule is a positive allowlist
+  of two noise shapes and #mg3p-style banner output stays emitted.
 - **Skip reopen only for `wontfix`.** Rejected: `duplicate`/`superseded` closes
   name a canonical issue elsewhere; reopening them files the same work twice.
 - **Filter noise classes in the tracker instead of the detector.** Rejected: a
@@ -177,12 +228,16 @@ by A: those signals never leave the detector, so they neither file nor recur.
 
 - jilog: `jilog-review` crate only. Public constant value change
   (`ITERATION_RUNAWAY_MIN_TOOL_CALLS`), new pub fn in `reader`, tracker
-  internals. No CLI or JSON schema change. Rollback: `cargo install --tag
-  v0.7.0`.
-- amplifier-bundle-joi: `jilog_triage.py`, `bin/jilog-triage`, tests. The plist
-  executes the working tree, so rollback is `git checkout` of the previous main
-  on the host. The expiry phase only touches issues labeled `close-proposed`,
-  which no issue carries before this change lands.
+  internals. No CLI or JSON schema change. Docs: README (health table row,
+  the bash-timeout example prose, the recurrence paragraph) and
+  `docs/architecture.html` (the timeout example) are updated to match.
+  Rollback: `cargo install --tag v0.7.0`.
+- amplifier-bundle-joi: `jilog_triage.py`, `bin/jilog-triage`, tests,
+  `bundle.md` (version bump), the 2026-08-18 spec note. The plist executes the
+  working tree, so rollback is `git checkout` of the previous main on the
+  host. The expiry phase only touches issues labeled `close-proposed`, which
+  no issue carries before this change lands, and only ever closes `wontfix`
+  (reversible with `kata reopen`).
 - Fleet: joimba (active) and jibotmac get the new jilog binary; macazbd pending.
 
 ## Open questions
