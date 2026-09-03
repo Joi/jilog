@@ -1,6 +1,6 @@
 # Run: 42fd-detector-noise-docket-labeling
 Instruction: start at medium. Task: jilog#42fd + jilog#15ax (brief in TASK-jilog#42fd.md at worktree root). (1) 42fd detectors: iteration-runaway exempts autonomous sessions (or threshold above the observed 100-call normal); mode-switch denials (clear_denied / denied_mode) are not emitted as error signals; content-free bash failures (bare timeout, bare nonzero exit with no diagnostic content) are not emitted. (2) 42fd recurrence: a recurring signal in a class ruled expected is not re-emitted, and recurrence never reopens or comment-flags an issue closed wontfix; done-closed issues may keep existing recurred behavior. (3) 15ax labeling: triager stamps joi-decision ONLY when it writes a decision-needed comment with a concrete question AND a named target; close-PROPOSED items get a close-proposed label with an N-day unchallenged auto-close (pick sensible N, document it). (4) Tests cover each new behavior; existing suite passes. Do not weaken real error detection. Repo is Rust workspace, not marshal-managed; after review, merge to main per repo convention and push, then roll out to active fleet Macs (macazbd is off until 2026-09-06 — record as pending).
-Stage: executing
+Stage: committing (jilog landed: release a51b995, merge 56e0a9d, tag v0.7.1, follow-up merge 2423326; installed joimba + jibotmac; macazbd pending; jilog#42fd closed 2026-09-03; watcher com.joi.jilog42fd-watcher armed, anchor jilog#s0kw. Chunk 3 in code-review round 3 → marshal-submit -i jilog#15ax)
 Rung: medium (start-floor medium: user-instructed floor "start at medium" — dispatched session, independent-model review required; evaluator dispatch skipped because the instruction fixed the floor)
 Lens: do not weaken real error detection — an exit code accompanied by diagnostic content, or a mode error that is not a denial, must still be emitted.
 Spec: docs/superpowers/specs/2026-09-03-42fd-detector-noise-docket-labeling-design.md   Plan: docs/superpowers/plans/2026-09-03-42fd-detector-noise-docket-labeling.md
@@ -24,6 +24,12 @@ Pass 2 [code:chunks-1-2]: 2B/2S/0C/0R (fresheyes gpt, REASON=-; Stage 1 r2 subag
 
 Pass 3 [code:chunks-1-2]: 0B/1S/0C/0R (fresheyes gpt, REASON=-) · fixed 4/4 prior · velocity ↓ (4→1, escalation no) · judge: n/a-medium
   code passes: 3 (cap) · elapsed: 44 min · the one S (present-null `returncode` treated as blank, spec says present ⇒ integer) fixed in one line + test; no round 4 (three-round cap per phase; the fix is in the emit direction and changes no production shape's outcome).
+
+Pass 2 [code:chunk-3]: 4B/0S/2C/0R (fresheyes gpt, REASON=-, on af94f8c) · fixed 13/13 prior · velocity ↓ (13→6, escalation no) · judge: n/a-medium
+  chunk-3 code passes: 2 · elapsed: 40 min · all sent to the builder: exemption reduced to jilog's exact recurrence line (every other later comment is a challenge); malformed-history check first + schema-drift KataError in fetch_issue_full; substantive close reason/evidence required; generic-target and question-token heuristics; bin docstring + 2026-08-18 schema. Round 3 (cap) follows.
+
+  Stage 1 r2 (subagent, on af94f8c): 0 Critical / 2 Important / 5 Minor — all 17 round-1 items confirmed with test names; Important: non-close verdict must remove close-proposed; on-deck/designed-ready as challenges + gate is a link not a label. Sent to the builder as the last batch before round 3.
+  Builder round 3 (935abe1, gate PASSED 78s, 141 tests): exemption reduced to the exact recurrence line with markers skipped by identity; malformed-first + schema-drift KataError; close_is_substantive; generic-target/question-token heuristics (builder added happen/happens/happened to the stoplist — accepted).
 
 ## Chunks
 - [x] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters) — Agency evaluator clean (92); review clean after 3 rounds (Stage 1 r3: "Ready to merge: Yes", 24-case harness + real tool sources); commits ec352f1 … 4f2bc7e
