@@ -335,8 +335,11 @@ enum ErrText {
     Absent,
     /// A string at `error`, `error.message`, or top-level `message`.
     Text(String),
-    /// `error` is present but not a string and not an object with a string
-    /// `message` — an unrecognized shape; never suppressed.
+    /// An unrecognized shape; never suppressed. Either `error` is present
+    /// but not a string and not an object with a string `message`, or a
+    /// top-level `message` is not the text that was read (present and
+    /// non-null beside a non-null `error`, or present and non-string with
+    /// `error` absent).
     Unrecognized,
 }
 
@@ -344,7 +347,9 @@ fn error_text(data: &serde_json::Value) -> ErrText {
     // A top-level `message` is only ever read when `error` is null/absent.
     // Beside a non-null `error` it would be an unread field that could carry
     // a diagnostic, so that combination is unrecognized (Stage 1 round 2).
-    let has_message = data.get("message").is_some();
+    // A null `message` is absent, like every other null in this filter
+    // (roborev #1865: serializers that emit all keys).
+    let has_message = data.get("message").is_some_and(|v| !v.is_null());
     match data.get("error") {
         None | Some(serde_json::Value::Null) => match data.get("message") {
             Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
@@ -415,8 +420,10 @@ fn envelope_is_bare(data: &serde_json::Value) -> bool {
 }
 
 /// True only when `output` carries nothing: absent/null; an object whose
-/// `stdout` and `stderr` are both absent, null, or whitespace-only strings;
-/// or a string that is empty or is itself the bare timeout sentence (the
+/// `stdout` and `stderr` are both absent, null, or whitespace-only strings
+/// and whose `returncode`, if present, is an integer (null included in
+/// "not an integer"); or a string that is empty or is itself the bare
+/// timeout sentence (the
 /// production timeout envelope echoes the sentence into `output` — Stage 1
 /// review, 5/5 transcript samples). A string with any other text (a partial
 /// log, a traceback) is content and is never blank; a non-string stream or
@@ -1174,6 +1181,9 @@ mod tests {
         assert_eq!(error_text(&json!({"message": 7})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"error": "x", "message": "y"})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"error": null, "message": "y"})), ErrText::Text("y".into()));
+        // A null message is absent (roborev #1865).
+        assert_eq!(error_text(&json!({"error": "x", "message": null})), ErrText::Text("x".into()));
+        assert!(errors_for("bash", json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "message": null, "output": ""})).is_empty());
     }
 
     // ---------- workarounds ----------

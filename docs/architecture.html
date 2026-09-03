@@ -198,7 +198,7 @@
   <li>
     <span class="name err">Error</span>
     <div class="what">A tool call returned a structured failure</div>
-    <div class="how">A <code>role: tool</code> message whose JSON content has <code>success: false</code> &mdash; except two ruled-expected classes that are never emitted: a <code>mode</code> denial (<code>status: denied</code>, a <code>denied_mode</code> field, or a <code>*_denied</code> code) and a content-free <code>bash</code> failure (exactly the bare timeout sentence, or exactly a nonzero exit with blank stdout and stderr, with no other field in the envelope). Every other failed result still emits: any stderr or stdout, any other error text, any structured error beyond the message-only timeout object, any extra or unreadable field, any unfamiliar envelope.</div>
+    <div class="how">A <code>role: tool</code> message whose JSON content has <code>success: false</code> &mdash; except two ruled-expected classes that are never emitted: a <code>mode</code> denial (<code>status: denied</code>, a <code>denied_mode</code> field, or a <code>*_denied</code> code) and a content-free <code>bash</code> failure (exactly the bare timeout sentence &mdash; which the bash tool also echoes into a string <code>output</code>, the one string output that counts as blank &mdash; or exactly a nonzero exit with blank stdout and stderr, with no other field in the envelope). Every other failed result still emits: any stderr or stdout, any other error text, any structured error beyond the message-only timeout object, any extra or unreadable field, any unfamiliar envelope.</div>
   </li>
   <li>
     <span class="name wrk">Pattern</span>
