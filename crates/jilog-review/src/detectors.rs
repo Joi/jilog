@@ -382,10 +382,15 @@ fn keys_within(map: &serde_json::Map<String, serde_json::Value>, allowed: &[&str
 
 /// True only when the envelope carries nothing but the fields the two bare
 /// shapes are defined over: top-level keys within [`BARE_TOP_KEYS`], `error`
-/// null/string/or an object with only `message`, and `output` absent/null or
-/// an object with only [`BARE_OUTPUT_KEYS`]. A string `output` (the pi and
-/// nanoclaw readers normalize tool results that way), an array, a number,
-/// or any unlisted key makes the envelope unrecognized (roborev #1858).
+/// null/string/or an object with only `message`, and `output` absent/null,
+/// a string, or an object with only [`BARE_OUTPUT_KEYS`]. An array or
+/// number `output`, or any unlisted key, makes the envelope unrecognized
+/// (roborev #1858). A string `output` is allowed here because the real
+/// Amplifier bash timeout envelope is
+/// `{"error":{"message":"Command timed out after 30 seconds"},"output":
+/// "Command timed out after 30 seconds","success":false}` (tool_bash sets
+/// `output = error_msg`); [`output_is_blank`] decides whether that string
+/// carries anything.
 fn envelope_is_bare(data: &serde_json::Value) -> bool {
     let Some(top) = data.as_object() else { return false };
     if !keys_within(top, BARE_TOP_KEYS) {
@@ -397,19 +402,27 @@ fn envelope_is_bare(data: &serde_json::Value) -> bool {
         Some(_) => false,
     };
     let output_ok = match top.get("output") {
-        None | Some(serde_json::Value::Null) => true,
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => true,
         Some(serde_json::Value::Object(o)) => keys_within(o, BARE_OUTPUT_KEYS),
         Some(_) => false,
     };
     error_ok && output_ok
 }
 
-/// True only when `output` is absent/null, or an object whose `stdout` and
-/// `stderr` are both absent, null, or whitespace-only strings. A
-/// non-object `output` or a non-string stream is never blank.
+/// True only when `output` carries nothing: absent/null; an object whose
+/// `stdout` and `stderr` are both absent, null, or whitespace-only strings;
+/// or a string that is empty or is itself the bare timeout sentence (the
+/// production timeout envelope echoes the sentence into `output` — Stage 1
+/// review, 5/5 transcript samples). A string with any other text (a partial
+/// log, a traceback) is content and is never blank; a non-string stream or
+/// a non-object, non-string `output` is never blank either.
 fn output_is_blank(data: &serde_json::Value) -> bool {
     match data.get("output") {
         None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            t.is_empty() || bare_timeout_regex().is_match(t)
+        }
         Some(serde_json::Value::Object(output)) => matches!(
             (output_text(output, "stdout"), output_text(output, "stderr")),
             (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
@@ -1038,19 +1051,35 @@ mod tests {
     }
 
     #[test]
-    fn errors_keep_bash_non_object_output() {
-        // `output` as a string (pi/nanoclaw normalize tool results this
-        // way), array, or number is an unrecognized envelope: emit. The
-        // timeout sentence with a string output was a real suppression
-        // hole (roborev #1858).
+    fn errors_skip_bash_production_timeout_envelope() {
+        // The shape tool_bash actually emits on a timeout: error.message
+        // AND output both carry the sentence (Stage 1 review verified
+        // against the tool source and 5/5 transcript samples). This is the
+        // jilog#6s9q signal and must be suppressed.
+        let real = json!({"error": {"message": "Command timed out after 30 seconds"}, "output": "Command timed out after 30 seconds", "success": false});
+        assert!(errors_for("bash", real).is_empty());
+        // An empty string output is equally content-free.
+        let empty = json!({"success": false, "error": "Command timed out after 30 seconds", "output": ""});
+        assert!(errors_for("bash", empty).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_bash_non_object_output_with_content() {
+        // A string output carrying anything but the timeout sentence is
+        // content (roborev #1858); an array or number output is an
+        // unrecognized envelope. All emit.
         let s = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "partial build log"});
         assert_eq!(errors_for("bash", s).len(), 1);
-        let empty = json!({"success": false, "error": "Command timed out after 30 seconds", "output": ""});
-        assert_eq!(errors_for("bash", empty).len(), 1, "even an empty string output is not the object shape");
+        let other_sentence = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "Command timed out after 30 seconds\nTraceback (most recent call last):"});
+        assert_eq!(errors_for("bash", other_sentence).len(), 1);
         let arr = json!({"success": false, "output": ["returncode", 1]});
         assert_eq!(errors_for("bash", arr).len(), 1);
         let n = json!({"success": false, "error": "Command timed out after 30 seconds", "output": 1});
         assert_eq!(errors_for("bash", n).len(), 1);
+        // A string output on the nonzero-exit shape has no returncode to
+        // read, so it can never match shape 2 either.
+        let s2 = json!({"success": false, "output": "exit status 1"});
+        assert_eq!(errors_for("bash", s2).len(), 1);
     }
 
     #[test]
