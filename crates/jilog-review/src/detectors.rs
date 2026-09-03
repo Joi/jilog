@@ -77,10 +77,6 @@ const DEFERRAL_LABELS: &[&str] = &[
     "circle back",
 ];
 
-/// Sub-agent session prefix (16 zeros). Sessions whose ID starts with
-/// this are excluded from P0 alert counting.
-const SUB_AGENT_PREFIX: &str = "0000000000000000";
-
 /// Threshold for the P0 alert: distinct root sessions per tool.
 const P0_DISTINCT_SESSION_THRESHOLD: usize = 3;
 
@@ -229,6 +225,13 @@ pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal>
         }
 
         let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
+        if is_expected_noise(&tool_name, &data) {
+            tracing::debug!(
+                "detect_errors: suppressed expected-noise result from `{}` in {} (jilog#42fd)",
+                tool_name, session_id
+            );
+            continue;
+        }
         let message = extract_error_message(&data);
 
         out.push(ErrorSignal {
@@ -270,6 +273,217 @@ fn value_as_string(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expected-noise filter (jilog#42fd)
+// ---------------------------------------------------------------------------
+//
+// Joi's 2026-09-01 ruling: a denied mode-switch prompt and a bare nonzero
+// exit code are not error signals. The filter is an ALLOWLIST of positively
+// identified noise shapes — never a denylist of "non-diagnostic" text. Any
+// result that does not match one of the shapes exactly (a non-string stdout,
+// a structured error object, an unfamiliar envelope) is emitted, so real
+// error detection is never weakened by a heuristic guess.
+
+/// True when a `success: false` result is one of the ruled-expected shapes
+/// and must not become an [`ErrorSignal`].
+fn is_expected_noise(tool_name: &str, data: &serde_json::Value) -> bool {
+    is_mode_denial(tool_name, data) || is_content_free_bash_failure(tool_name, data)
+}
+
+/// The `mode` tool refusing a switch/clear: `output.status == "denied"`, an
+/// `output.denied_mode` field, or an error code ending in `_denied`
+/// (`clear_denied`, `switch_denied`). A `mode` error that is not a denial
+/// (bad transition, internal failure) does not match and is emitted.
+fn is_mode_denial(tool_name: &str, data: &serde_json::Value) -> bool {
+    if tool_name != "mode" {
+        return false;
+    }
+    let output = data.get("output");
+    let status_denied = output
+        .and_then(|o| o.get("status"))
+        .and_then(|s| s.as_str())
+        == Some("denied");
+    // Presence of the field is the marker, whatever its value (a null
+    // denied_mode is still the tool reporting a denial).
+    let has_denied_mode = output.and_then(|o| o.get("denied_mode")).is_some();
+    let code_denied = [
+        data.get("error").and_then(|e| e.get("code")),
+        data.get("code"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|c| c.as_str())
+    .any(|c| c.ends_with("_denied"));
+    status_denied || has_denied_mode || code_denied
+}
+
+/// Regex for the bare timeout sentence the bash tool emits.
+fn bare_timeout_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^command timed out after \d+ seconds?\.?$")
+            .expect("bare timeout regex must compile")
+    })
+}
+
+/// The error text of a failed result, classified.
+#[derive(Debug, PartialEq, Eq)]
+enum ErrText {
+    /// `error` null/absent and no top-level `message`.
+    Absent,
+    /// A string at `error`, `error.message`, or top-level `message`.
+    Text(String),
+    /// An unrecognized shape; never suppressed. Either `error` is present
+    /// but not a string and not an object with a string `message`, or a
+    /// top-level `message` is not the text that was read (present and
+    /// non-null beside a non-null `error`, or present and non-string with
+    /// `error` absent).
+    Unrecognized,
+}
+
+fn error_text(data: &serde_json::Value) -> ErrText {
+    // A top-level `message` is only ever read when `error` is null/absent.
+    // Beside a non-null `error` it would be an unread field that could carry
+    // a diagnostic, so that combination is unrecognized (Stage 1 round 2).
+    // A null `message` is absent, like every other null in this filter
+    // (roborev #1865: serializers that emit all keys).
+    let has_message = data.get("message").is_some_and(|v| !v.is_null());
+    match data.get("error") {
+        None | Some(serde_json::Value::Null) => match data.get("message") {
+            Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+            Some(_) => ErrText::Unrecognized,
+            None => ErrText::Absent,
+        },
+        Some(_) if has_message => ErrText::Unrecognized,
+        Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+        Some(serde_json::Value::Object(map)) => match map.get("message") {
+            Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+            _ => ErrText::Unrecognized,
+        },
+        Some(_) => ErrText::Unrecognized,
+    }
+}
+
+/// `output.<key>` as text: `Some("")` when absent or null, `Some(s)` for a
+/// string, `None` for any other type — a structured stdout/stderr is an
+/// unrecognized shape and the caller must emit.
+fn output_text(output: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match output.get(key) {
+        None | Some(serde_json::Value::Null) => Some(String::new()),
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => None,
+    }
+}
+
+/// The only keys a recognized bash envelope may carry. Anything else —
+/// `output.message: "disk full"`, a sibling beside the timeout's
+/// `error.message`, an extra top-level field — is content the shape does
+/// not understand, so the shape does not match and the caller emits
+/// (fresheyes 2026-09-03 pass 1).
+const BARE_TOP_KEYS: &[&str] = &["success", "error", "output", "message"];
+const BARE_OUTPUT_KEYS: &[&str] = &["returncode", "stdout", "stderr"];
+const BARE_ERROR_KEYS: &[&str] = &["message"];
+
+fn keys_within(map: &serde_json::Map<String, serde_json::Value>, allowed: &[&str]) -> bool {
+    map.keys().all(|k| allowed.contains(&k.as_str()))
+}
+
+/// True only when the envelope carries nothing but the fields the two bare
+/// shapes are defined over: top-level keys within [`BARE_TOP_KEYS`], `error`
+/// null/string/or an object with only `message`, and `output` absent/null,
+/// a string, or an object with only [`BARE_OUTPUT_KEYS`]. An array or
+/// number `output`, or any unlisted key, makes the envelope unrecognized
+/// (roborev #1858). A string `output` is allowed here because the real
+/// Amplifier bash timeout envelope is
+/// `{"error":{"message":"Command timed out after 30 seconds"},"output":
+/// "Command timed out after 30 seconds","success":false}` (tool_bash sets
+/// `output = error_msg`); [`output_is_blank`] decides whether that string
+/// carries anything.
+fn envelope_is_bare(data: &serde_json::Value) -> bool {
+    let Some(top) = data.as_object() else { return false };
+    if !keys_within(top, BARE_TOP_KEYS) {
+        return false;
+    }
+    let error_ok = match top.get("error") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Object(e)) => keys_within(e, BARE_ERROR_KEYS),
+        Some(_) => false,
+    };
+    let output_ok = match top.get("output") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Object(o)) => keys_within(o, BARE_OUTPUT_KEYS),
+        Some(_) => false,
+    };
+    error_ok && output_ok
+}
+
+/// True only when `output` carries nothing: absent/null; an object whose
+/// `stdout` and `stderr` are both absent, null, or whitespace-only strings
+/// and whose `returncode`, if present, is an integer (null included in
+/// "not an integer"); or a string that is empty or is itself the bare
+/// timeout sentence (the
+/// production timeout envelope echoes the sentence into `output` — Stage 1
+/// review, 5/5 transcript samples). A string with any other text (a partial
+/// log, a traceback) is content and is never blank; a non-string stream or
+/// a non-object, non-string `output` is never blank either.
+fn output_is_blank(data: &serde_json::Value) -> bool {
+    match data.get("output") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            t.is_empty() || bare_timeout_regex().is_match(t)
+        }
+        Some(serde_json::Value::Object(output)) => {
+            // `returncode` is the only other allowed key; when present it
+            // must be an integer (null included — a present non-integer is
+            // a shape the filter does not read), else the output is not
+            // blank (fresheyes round 3).
+            let returncode_ok = match output.get("returncode") {
+                None => true,
+                Some(v) => v.as_i64().is_some(),
+            };
+            returncode_ok
+                && matches!(
+                    (output_text(output, "stdout"), output_text(output, "stderr")),
+                    (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
+                )
+        }
+        Some(_) => false,
+    }
+}
+
+/// Shape 1: the timeout sentence with nothing else — no stdout, no stderr,
+/// no other field anywhere in the envelope.
+fn is_bare_timeout(data: &serde_json::Value) -> bool {
+    envelope_is_bare(data)
+        && match error_text(data) {
+            ErrText::Text(t) => bare_timeout_regex().is_match(t.trim()) && output_is_blank(data),
+            _ => false,
+        }
+}
+
+/// Shape 2: an integer nonzero `output.returncode`, no error text at all,
+/// blank stdout and stderr, and no other field anywhere in the envelope. A
+/// banner-only stdout does NOT match: the only way to call it non-diagnostic
+/// would be a marker heuristic.
+fn is_bare_nonzero_exit(data: &serde_json::Value) -> bool {
+    let nonzero = data
+        .get("output")
+        .and_then(|o| o.get("returncode"))
+        .and_then(|r| r.as_i64())
+        .map(|r| r != 0)
+        .unwrap_or(false);
+    envelope_is_bare(data)
+        && nonzero
+        && error_text(data) == ErrText::Absent
+        && output_is_blank(data)
+}
+
+/// The two content-free bash shapes (bare timeout, bare nonzero exit).
+fn is_content_free_bash_failure(tool_name: &str, data: &serde_json::Value) -> bool {
+    tool_name == "bash" && (is_bare_timeout(data) || is_bare_nonzero_exit(data))
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +608,7 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in errors {
-        if e.session_id.starts_with(SUB_AGENT_PREFIX) {
+        if crate::reader::is_sub_agent_session(&e.session_id) {
             continue;
         }
         by_tool
@@ -734,6 +948,242 @@ mod tests {
         };
         let out = detect_errors(&[msg], "s1");
         assert_eq!(out[0].tool_name, "unknown");
+    }
+
+    // ---------- expected-noise filter (jilog#42fd) ----------
+
+    fn errors_for(name: &str, content: serde_json::Value) -> Vec<ErrorSignal> {
+        detect_errors(&[tool(name, content)], "s1")
+    }
+
+    #[test]
+    fn errors_skip_mode_denial_status() {
+        // jilog#02j8 shape.
+        let c = json!({"error": null, "output": {"status": "denied", "user_instruction": "Inform the user: I'd like to clear the current mode"}, "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_denied_mode() {
+        // jilog#gahn shape.
+        let c = json!({"error": null, "output": {"denied_mode": "debug", "status": "denied"}, "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_clear_denied_code() {
+        // jilog#qryp shape: structured error with a *_denied code.
+        let c = json!({"success": false, "error": {"code": "clear_denied", "message": "Cannot clear mode while in 'debug'."}});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_mode_flat_denied_code() {
+        let c = json!({"code": "switch_denied", "success": false});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_mode_non_denial() {
+        let c = json!({"success": false, "error": {"code": "invalid_transition", "message": "no such mode"}});
+        let out = errors_for("mode", c);
+        assert_eq!(out.len(), 1, "a mode error that is not a denial must still emit");
+        assert!(out[0].message.contains("invalid_transition"));
+    }
+
+    #[test]
+    fn errors_keep_denied_status_from_other_tool() {
+        // The denial filter is scoped to the `mode` tool.
+        let c = json!({"error": null, "output": {"status": "denied"}, "success": false});
+        assert_eq!(errors_for("delegate", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_skip_bash_bare_timeout() {
+        // jilog#6s9q shape (error object with message) and the string form.
+        let obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}});
+        assert!(errors_for("bash", obj).is_empty());
+        let s = json!({"success": false, "error": "Command timed out after 120 seconds."});
+        assert!(errors_for("bash", s).is_empty());
+        let top = json!({"success": false, "message": "Command timed out after 25 seconds"});
+        assert!(errors_for("bash", top).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_bash_bare_nonzero_exit() {
+        // jilog#dcpg shape: returncode 1, empty stdout and stderr.
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": ""}, "success": false});
+        assert!(errors_for("bash", c).is_empty());
+        // Whitespace-only counts as blank; absent fields count as blank.
+        let ws = json!({"error": null, "output": {"returncode": 2, "stderr": " \n", "stdout": "\n"}, "success": false});
+        assert!(errors_for("bash", ws).is_empty());
+        let absent = json!({"output": {"returncode": 127}, "success": false});
+        assert!(errors_for("bash", absent).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_bash_banner_stdout() {
+        // jilog#mg3p: stdout is only a heading — still emitted; no marker
+        // heuristic decides what is "not diagnostic".
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": "=== today's health report ===\n"}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_stderr() {
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "kata-dispatch: kata show failed", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_marker_free_stdout() {
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": "checksum mismatch: expected X, got Y"}, "success": false});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_structured_stdout_and_stderr() {
+        // Non-string stdout/stderr is an unrecognized shape: emit.
+        let obj = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": {"failed": ["a"]}}, "success": false});
+        assert_eq!(errors_for("bash", obj).len(), 1);
+        let arr = json!({"error": null, "output": {"returncode": 1, "stderr": ["boom"], "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_extra_fields_anywhere() {
+        // Diagnostic content in a field the shapes do not know about must
+        // never be discarded (fresheyes 2026-09-03 pass 1): a sibling in
+        // output, a sibling beside the timeout message, an extra top-level
+        // key. Each is an unrecognized envelope → emitted.
+        let in_output = json!({"success": false, "output": {"returncode": 1, "message": "disk full"}});
+        assert_eq!(errors_for("bash", in_output).len(), 1);
+        let beside_timeout = json!({"success": false, "error": {"message": "Command timed out after 30 seconds", "partial": "tail of log"}});
+        assert_eq!(errors_for("bash", beside_timeout).len(), 1);
+        let top_level = json!({"success": false, "error": null, "output": {"returncode": 1, "stdout": "", "stderr": ""}, "diagnostics": "oom"});
+        assert_eq!(errors_for("bash", top_level).len(), 1);
+        let timeout_top = json!({"success": false, "error": "Command timed out after 30 seconds", "stderr": "killed"});
+        assert_eq!(errors_for("bash", timeout_top).len(), 1);
+        // A top-level `message` beside a non-null `error` is an unread
+        // field (Stage 1 round 2): emit, whatever its type.
+        let msg_beside_error = json!({"success": false, "error": "Command timed out after 30 seconds", "message": "Traceback (most recent call last): ..."});
+        assert_eq!(errors_for("bash", msg_beside_error).len(), 1);
+        let msg_beside_error_obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "message": "disk full"});
+        assert_eq!(errors_for("bash", msg_beside_error_obj).len(), 1);
+        let msg_struct = json!({"success": false, "error": "Command timed out after 30 seconds", "message": {"detail": "disk full"}});
+        assert_eq!(errors_for("bash", msg_struct).len(), 1);
+        // A non-integer returncode beside a timeout is content in an
+        // allowed key the timeout shape never reads (fresheyes round 2).
+        let rc_text = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": "see log: disk full", "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", rc_text).len(), 1);
+        let rc_obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": {"signal": "SIGKILL"}}});
+        assert_eq!(errors_for("bash", rc_obj).len(), 1);
+        // Present-but-null returncode is "present and not an integer".
+        let rc_null = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": null, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", rc_null).len(), 1);
+    }
+
+    #[test]
+    fn errors_skip_mode_denied_mode_null_value() {
+        // Presence of the field is the marker, whatever its value.
+        let c = json!({"success": false, "output": {"denied_mode": null}});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_skip_bash_production_timeout_envelope() {
+        // The shape tool_bash actually emits on a timeout: error.message
+        // AND output both carry the sentence (Stage 1 review verified
+        // against the tool source and 5/5 transcript samples). This is the
+        // jilog#6s9q signal and must be suppressed.
+        let real = json!({"error": {"message": "Command timed out after 30 seconds"}, "output": "Command timed out after 30 seconds", "success": false});
+        assert!(errors_for("bash", real).is_empty());
+        // An empty string output is equally content-free.
+        let empty = json!({"success": false, "error": "Command timed out after 30 seconds", "output": ""});
+        assert!(errors_for("bash", empty).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_bash_non_object_output_with_content() {
+        // A string output carrying anything but the timeout sentence is
+        // content (roborev #1858); an array or number output is an
+        // unrecognized envelope. All emit.
+        let s = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "partial build log"});
+        assert_eq!(errors_for("bash", s).len(), 1);
+        let other_sentence = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "Command timed out after 30 seconds\nTraceback (most recent call last):"});
+        assert_eq!(errors_for("bash", other_sentence).len(), 1);
+        let arr = json!({"success": false, "output": ["returncode", 1]});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+        let n = json!({"success": false, "error": "Command timed out after 30 seconds", "output": 1});
+        assert_eq!(errors_for("bash", n).len(), 1);
+        // A string output on the nonzero-exit shape has no returncode to
+        // read, so it can never match shape 2 either.
+        let s2 = json!({"success": false, "output": "exit status 1"});
+        assert_eq!(errors_for("bash", s2).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_structured_error() {
+        // Error object without a string message, and an error array.
+        let obj = json!({"success": false, "error": {"code": "E1"}, "output": {"returncode": 1, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", obj).len(), 1);
+        let arr = json!({"success": false, "error": ["x"], "output": {"returncode": 1, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_timeout_with_output() {
+        let c = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"stdout": "partial build log", "stderr": ""}});
+        assert_eq!(errors_for("bash", c).len(), 1);
+        let e = json!({"success": false, "error": "Command timed out after 30 seconds", "output": {"stdout": "", "stderr": "warning: slow"}});
+        assert_eq!(errors_for("bash", e).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_other_error_text() {
+        let c = json!({"success": false, "error": "spawn failed"});
+        assert_eq!(errors_for("bash", c).len(), 1);
+        // Timeout sentence with extra words is not the bare sentence.
+        let d = json!({"success": false, "error": "Command timed out after 30 seconds while running cargo"});
+        assert_eq!(errors_for("bash", d).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_unknown_envelope() {
+        let c = json!({"success": false, "weird": 1});
+        assert_eq!(errors_for("bash", c).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_zero_or_non_integer_returncode() {
+        let zero = json!({"error": null, "output": {"returncode": 0, "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", zero).len(), 1);
+        let s = json!({"error": null, "output": {"returncode": "1", "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("bash", s).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bare_shapes_from_other_tools() {
+        // The bash shapes are scoped to the `bash` tool.
+        let c = json!({"error": null, "output": {"returncode": 1, "stderr": "", "stdout": ""}, "success": false});
+        assert_eq!(errors_for("python_check", c).len(), 1);
+    }
+
+    #[test]
+    fn error_text_classification() {
+        assert_eq!(error_text(&json!({})), ErrText::Absent);
+        assert_eq!(error_text(&json!({"error": null})), ErrText::Absent);
+        assert_eq!(error_text(&json!({"error": "x"})), ErrText::Text("x".into()));
+        assert_eq!(error_text(&json!({"error": {"message": "m"}})), ErrText::Text("m".into()));
+        assert_eq!(error_text(&json!({"message": "top"})), ErrText::Text("top".into()));
+        assert_eq!(error_text(&json!({"error": {"code": "c"}})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": 7})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"message": 7})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": "x", "message": "y"})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": null, "message": "y"})), ErrText::Text("y".into()));
+        // A null message is absent (roborev #1865).
+        assert_eq!(error_text(&json!({"error": "x", "message": null})), ErrText::Text("x".into()));
+        assert!(errors_for("bash", json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "message": null, "output": ""})).is_empty());
     }
 
     // ---------- workarounds ----------

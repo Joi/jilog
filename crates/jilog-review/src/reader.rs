@@ -90,6 +90,20 @@ pub fn parse_session_role(session_id: &str) -> Option<String> {
     }
 }
 
+/// Session-id prefix Amplifier gives sub-agent sessions
+/// (`0000000000000000-<hex>_<role>`). A session carrying it was spawned and
+/// driven by a parent agent, not by a person.
+pub const SUB_AGENT_PREFIX: &str = "0000000000000000";
+
+/// True for sub-agent (parent-driven) sessions — the only autonomy marker
+/// the transcripts carry. Prompt count is not one: an interactive root
+/// session with five user prompts produced a 44-call stretch Joi ruled
+/// normal (jilog#5a9h), so detectors that reason about "no user
+/// intervention" use this prefix, never the prompt count (jilog#42fd).
+pub fn is_sub_agent_session(session_id: &str) -> bool {
+    session_id.starts_with(SUB_AGENT_PREFIX)
+}
+
 // ---------------------------------------------------------------------------
 // TranscriptHandle — a discovered transcript file
 // ---------------------------------------------------------------------------
