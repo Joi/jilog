@@ -341,12 +341,17 @@ enum ErrText {
 }
 
 fn error_text(data: &serde_json::Value) -> ErrText {
+    // A top-level `message` is only ever read when `error` is null/absent.
+    // Beside a non-null `error` it would be an unread field that could carry
+    // a diagnostic, so that combination is unrecognized (Stage 1 round 2).
+    let has_message = data.get("message").is_some();
     match data.get("error") {
         None | Some(serde_json::Value::Null) => match data.get("message") {
             Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
             Some(_) => ErrText::Unrecognized,
             None => ErrText::Absent,
         },
+        Some(_) if has_message => ErrText::Unrecognized,
         Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
         Some(serde_json::Value::Object(map)) => match map.get("message") {
             Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
@@ -423,10 +428,20 @@ fn output_is_blank(data: &serde_json::Value) -> bool {
             let t = s.trim();
             t.is_empty() || bare_timeout_regex().is_match(t)
         }
-        Some(serde_json::Value::Object(output)) => matches!(
-            (output_text(output, "stdout"), output_text(output, "stderr")),
-            (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
-        ),
+        Some(serde_json::Value::Object(output)) => {
+            // `returncode` is the only other allowed key; anything but an
+            // integer (or null/absent) there is content of a shape the
+            // filter does not read, so the output is not blank.
+            let returncode_ok = match output.get("returncode") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(v) => v.as_i64().is_some(),
+            };
+            returncode_ok
+                && matches!(
+                    (output_text(output, "stdout"), output_text(output, "stderr")),
+                    (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
+                )
+        }
         Some(_) => false,
     }
 }
@@ -1041,6 +1056,20 @@ mod tests {
         assert_eq!(errors_for("bash", top_level).len(), 1);
         let timeout_top = json!({"success": false, "error": "Command timed out after 30 seconds", "stderr": "killed"});
         assert_eq!(errors_for("bash", timeout_top).len(), 1);
+        // A top-level `message` beside a non-null `error` is an unread
+        // field (Stage 1 round 2): emit, whatever its type.
+        let msg_beside_error = json!({"success": false, "error": "Command timed out after 30 seconds", "message": "Traceback (most recent call last): ..."});
+        assert_eq!(errors_for("bash", msg_beside_error).len(), 1);
+        let msg_beside_error_obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "message": "disk full"});
+        assert_eq!(errors_for("bash", msg_beside_error_obj).len(), 1);
+        let msg_struct = json!({"success": false, "error": "Command timed out after 30 seconds", "message": {"detail": "disk full"}});
+        assert_eq!(errors_for("bash", msg_struct).len(), 1);
+        // A non-integer returncode beside a timeout is content in an
+        // allowed key the timeout shape never reads (fresheyes round 2).
+        let rc_text = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": "see log: disk full", "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", rc_text).len(), 1);
+        let rc_obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": {"signal": "SIGKILL"}}});
+        assert_eq!(errors_for("bash", rc_obj).len(), 1);
     }
 
     #[test]
@@ -1139,6 +1168,8 @@ mod tests {
         assert_eq!(error_text(&json!({"error": {"code": "c"}})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"error": 7})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"message": 7})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": "x", "message": "y"})), ErrText::Unrecognized);
+        assert_eq!(error_text(&json!({"error": null, "message": "y"})), ErrText::Text("y".into()));
     }
 
     // ---------- workarounds ----------

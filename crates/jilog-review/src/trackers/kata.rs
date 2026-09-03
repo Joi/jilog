@@ -1122,7 +1122,11 @@ mod tests {
     /// and exits with `status`. Hermetic — the real `kata` is never run,
     /// and no project or issue can be touched.
     fn kata_stub(name: &str, status: i32) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join("jilog-test-kata-stub").join(name);
+        // Pid-scoped so two `cargo test` runs on one Mac (a dispatched
+        // worktree plus a gate) never share a recorder file.
+        let dir = std::env::temp_dir()
+            .join("jilog-test-kata-stub")
+            .join(format!("{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let calls = dir.join("calls");

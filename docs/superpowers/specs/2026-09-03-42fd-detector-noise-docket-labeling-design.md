@@ -97,7 +97,10 @@ the signal when true. The predicate is the union of:
   string, else `error.message` when `error` is an object with a string
   `message`, else top-level `message` when it is a string, else `None`; an
   `error` value of any other non-null type (array, number, object without a
-  string `message`) makes the shape unrecognized.
+  string `message`) makes the shape unrecognized, and so does a top-level
+  `message` of any type beside a non-null `error`, or an `output.returncode`
+  that is present but not an integer (an allowed key carrying content the
+  shape never reads — Stage 1 round 2 / fresheyes round 2).
   - **Bare timeout:** `error_text` matches
     `^Command timed out after \d+ seconds?\.?$` (trimmed, case-insensitive),
     and `blank(stdout)` and `blank(stderr)`.

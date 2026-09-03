@@ -212,7 +212,7 @@ The runaway bar sits above the observed normal on purpose: 25–100 tool calls w
 
 ### Expected-noise filter
 
-`Error` signals come from `role: tool` messages whose JSON content has `success: false`. Two classes are ruled expected and never emitted (no digest line, no issue — jilog#42fd): the `mode` tool refusing a switch or clear (`output.status: "denied"`, an `output.denied_mode` field, or a `*_denied` error code), and two content-free `bash` shapes — the bare `Command timed out after N seconds` sentence with no stdout or stderr, and a nonzero `returncode` with no error text and blank stdout and stderr. The filter is an allowlist of those exact shapes: a `mode` error that is not a denial, a bash failure with any stderr or stdout (even a one-line banner), a structured error object, or an unfamiliar envelope is still emitted.
+`Error` signals come from `role: tool` messages whose JSON content has `success: false`. Two classes are ruled expected and never emitted (no digest line, no issue — jilog#42fd): the `mode` tool refusing a switch or clear (`output.status: "denied"`, an `output.denied_mode` field, or a `*_denied` error code), and two content-free `bash` shapes — the bare `Command timed out after N seconds` sentence with no stdout or stderr, and a nonzero `returncode` with no error text and blank stdout and stderr. The filter is an allowlist of those exact shapes: a `mode` error that is not a denial, a bash failure with any stderr or stdout (even a one-line banner), a structured error other than the message-only timeout object (`{"message":"Command timed out after N seconds"}`, which is how the bash tool reports a timeout), a field the shapes do not read, or an unfamiliar envelope is still emitted.
 
 ### Cost-weighted digests
 
@@ -355,7 +355,7 @@ The next nightly run that observes the same `cargo test` failure will see the ex
 
 Examples of the kinds of things the pipeline tends to surface, drawn from real runs against Amplifier and Claude Code transcripts (paraphrased here to avoid leaking session content):
 
-- **`P0 ALERT bash`** — agents hitting the default 30-second timeout on long-running builds, tests, or `find`. The fix is invariably one of `timeout=`, `run_in_background=true`, or "scope this to a directory."
+- **`P0 ALERT bash`** — agents hitting the default 30-second timeout on long-running builds, tests, or `find`, when the timeout came with partial output (a bare timeout with no output is filtered before aggregation — see the expected-noise filter). The fix is invariably one of `timeout=`, `run_in_background=true`, or "scope this to a directory."
 - **`workaround [for now]`** — feature work that landed with a hardcoded config value waiting for an env-var or settings plumbing pass.
 - **`workaround [TODO]`** — error paths the assistant explicitly flagged as incomplete; these are the highest-signal source of follow-up tickets.
 - **`correction`** — short user pushbacks like *"wrong path"*, *"that's the old API"*, *"don't auto-resolve conflicts"*. Each one is a signal that some piece of context (a skill, an `AGENTS.md` note, a frontmatter convention) wasn't loaded or wasn't followed.

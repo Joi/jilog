@@ -160,24 +160,31 @@ File: `crates/jilog-review/src/trackers/kata.rs`.
       non-reopen branch. Update the module doc table row for `reopen()` and the
       `reopen` doc comment. The row type is `ListedIssue` (status-neutral;
       `closed_reason` is `None` for open rows).
-- [ ] 2.5 Testability: `#[cfg(test)] fn with_seeded_listings(project, open:
-      Vec<IssueRef>, closed: Vec<ClosedIssue>) -> Self` pre-fills both memos so
-      `create()` never shells out for listings. Tests:
+- [ ] 2.5 Testability: `KataTracker` gains a `kata_bin: PathBuf` field (`"kata"`
+      in production) used by `cmd()`, and `#[cfg(test)] fn
+      with_seeded_listings(project, open: Vec<IssueRef>, closed:
+      Vec<ListedIssue>, kata_bin: PathBuf) -> Self` pre-fills both memos so
+      `create()` never shells out for listings and every other shell-out hits
+      a recording stub (fresheyes code pass 1: the path must be asserted, not
+      inferred from an error). Tests:
       - `parse_listed_issues_carries_closed_reason` (row with
         `closed_reason: "wontfix"` → Some; row without → None; the four loud
         failures still `Err`);
-      - `reopen_allowed_only_for_done_or_absent`;
+      - `reopen_allowed_only_for_done` (`Some("done")` → true; `None` and every
+        other reason → false);
       - `create_returns_wontfix_match_without_reopen`: seeded open=[] and
         closed=[wontfix match for the signal's title] → `create` returns
-        `Ok(that IssueRef)`, and afterwards the open memo is still empty and the
-        closed memo still holds the entry (no mutation; no kata call — the test
-        passes with kata absent);
+        `Ok(that IssueRef)`, the recording stub logs NO call, and afterwards
+        the open memo is still empty and the closed memo still holds the
+        entry; the loop repeats for `duplicate`, `superseded`,
+        `audit-no-change`, and `None` (absent reason never reopens);
       - `create_takes_reopen_path_for_done_match`: same seeding with
-        `closed_reason: Some("done")` on project
-        `nonexistent-jilog-test-project` → `create` returns `Err` (the reopen
-        shell-out fails whether kata is absent or the project is missing),
-        proving the reopen path was taken and the closed ref was NOT returned
-        silently; same for `closed_reason: None`;
+        `closed_reason: Some("done")` and `kata_bin` pointed at a recording
+        `#!/bin/sh` stub (pid-scoped temp dir, exit 0) → `create` returns the
+        reopened ref and the stub's argv log is exactly `reopen zz99`, the
+        recurrence comment, `label add zz99 jilog:recurred`, with no `create`
+        call; a second test with an exit-3 stub asserts the reopen failure
+        surfaces as `Err` after exactly one call;
       - `create_returns_open_match_first`: seeded open=[match] → returns it
         without touching closed.
 - [ ] 2.6 Verify: `cargo test -p jilog-review`, `cargo test --workspace`.

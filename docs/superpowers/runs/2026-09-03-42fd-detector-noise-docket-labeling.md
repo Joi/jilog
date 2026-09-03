@@ -19,6 +19,9 @@ Pass 1 [code:chunks-1-2]: 4B/0S/0C/0R (fresheyes gpt, REASON=-) + roborev #1854/
 Pass 1 [code:chunk-3]: 11B/2S/0C/0R (fresheyes gpt, REASON=-) · fixed -/- · velocity = (—→13, escalation no) · judge: n/a-medium
   chunk-3 code passes: 1 · elapsed: 12 min · all 11B+2S sent to the chunk-3 builder as a single batch (always-fresh proposal marker; exact bot-comment shapes; malformed history → error; close verdicts need reason+evidence; token-based placeholder filter + question must end with ?; exact-body decision dedup; daily-health-check regex + fixture; elapsed measured in cli_main; shuffle + challenged → label rm + truncation guard; close intent logged before, refetch on client error; --max-expire and --max-items 0 skips expiry; local spec copy; NAME_RE dropped). A second Stage 1 ∥ fresheyes round follows because the fixes change behavior.
 
+Pass 2 [code:chunks-1-2]: 2B/2S/0C/0R (fresheyes gpt, REASON=-; Stage 1 r2 subagent: 0 Critical / 1 Important / 3 Minor, all seven round-1 items confirmed resolved) · fixed 4/4 prior · velocity = (4→4, escalation no) · judge: n/a-medium
+  code passes: 2 · elapsed: 31 min · fixed: top-level `message` beside a non-null `error` → Unrecognized (both reviewers); non-integer `output.returncode` → not blank; plan 2.5 rewritten to the absent-reason-never-reopens rule and the stub-asserted tests; README/architecture wording on the message-only timeout object; README P0 example; pid-scoped stub dir. A round-3 fresheyes on the small delta follows (cap 3 per phase) because the fixes change detector behavior.
+
 ## Chunks
 - [x] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters) — Agency evaluator clean (92), built + committed; code review pending
 - [x] chunk 2 — jilog recurrence (kata tracker: closed_reason-aware dedup; never reopen non-done closes) — Agency evaluator clean (92), built + committed; code review pending
