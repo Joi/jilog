@@ -353,8 +353,8 @@ fn error_text(data: &serde_json::Value) -> ErrText {
     match data.get("error") {
         None | Some(serde_json::Value::Null) => match data.get("message") {
             Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
+            None | Some(serde_json::Value::Null) => ErrText::Absent,
             Some(_) => ErrText::Unrecognized,
-            None => ErrText::Absent,
         },
         Some(_) if has_message => ErrText::Unrecognized,
         Some(serde_json::Value::String(s)) => ErrText::Text(s.clone()),
@@ -422,8 +422,8 @@ fn envelope_is_bare(data: &serde_json::Value) -> bool {
 /// True only when `output` carries nothing: absent/null; an object whose
 /// `stdout` and `stderr` are both absent, null, or whitespace-only strings
 /// and whose `returncode`, if present, is an integer (null included in
-/// "not an integer"); or a string that is empty or is itself the bare
-/// timeout sentence (the
+/// "not an integer"); or a string that, ignoring surrounding whitespace, is
+/// empty or is itself the bare timeout sentence (the
 /// production timeout envelope echoes the sentence into `output` — Stage 1
 /// review, 5/5 transcript samples). A string with any other text (a partial
 /// log, a traceback) is content and is never blank; a non-string stream or
@@ -1181,8 +1181,10 @@ mod tests {
         assert_eq!(error_text(&json!({"message": 7})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"error": "x", "message": "y"})), ErrText::Unrecognized);
         assert_eq!(error_text(&json!({"error": null, "message": "y"})), ErrText::Text("y".into()));
-        // A null message is absent (roborev #1865).
+        // A null message is absent in both branches (roborev #1865/#1866).
         assert_eq!(error_text(&json!({"error": "x", "message": null})), ErrText::Text("x".into()));
+        assert_eq!(error_text(&json!({"error": null, "message": null})), ErrText::Absent);
+        assert!(errors_for("bash", json!({"success": false, "error": null, "message": null, "output": {"returncode": 1, "stdout": "", "stderr": ""}})).is_empty());
         assert!(errors_for("bash", json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "message": null, "output": ""})).is_empty());
     }
 
