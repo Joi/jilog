@@ -156,30 +156,38 @@ by A: those signals never leave the detector, so they neither file nor recur.
 - New phase `expire_close_proposals(run, fetch, mut, now, days=7, budget_s,
   max_items=50, log)`, run by `bin/jilog-triage` after the sweep (dry-run
   prints would-be closes). It shares the sweep's absolute run deadline: the CLI
-  passes `budget_s = max(0, RUN_DEADLINE_S − elapsed)` and the phase stops at
-  the budget or after `max_items`, counting the remainder as
-  `expire_skipped_deadline` (they are re-evaluated the next night; nothing is
-  lost by waiting). For each open `close-proposed` issue (`kata list --project
-  jilog --status open --label close-proposed --limit 1000`): `fetch(ref)` and
-  find the newest `[jilog-triage] close PROPOSED` comment; its `created_at`
-  (RFC 3339, `Z` accepted) is the proposal time (`fetch_issue_full` now keeps
-  `created_at` per comment). Challenged = issue has an owner, or carries
-  `joi-decision`/`joi-ruled`, or any comment after the proposal whose body does
-  not start with `[jilog-triage]` or `Recurred on`. **Fail closed:** a missing
-  marker, a missing or unparseable proposal timestamp, or a later comment with
-  a missing or unparseable timestamp is an `expire_errors` item and never
-  closes. Age < 7 days → `expire_pending`. Otherwise **refetch immediately
-  before closing** and re-run the same evaluation on the fresh snapshot (a
-  claim, label, or comment that landed since the first fetch counts as a
-  challenge); only then
+  passes `budget_s = max(0, RUN_DEADLINE_S − elapsed)`; the budget is checked
+  before the listing, before each item, before the pre-close refetch, and
+  before the close itself (`elapsed >= budget` stops), counting the current
+  and remaining items as `expire_skipped_deadline`; items beyond `max_items`
+  are counted as `expire_skipped_cap` (both sets are re-evaluated the next
+  night; nothing is lost by waiting). For each open `close-proposed` issue
+  (`kata list --project jilog --status open --label close-proposed --limit
+  1000`, with the same schema-drift guard `gather_untriaged` applies):
+  `fetch(ref, run)` and find the newest `[jilog-triage] close PROPOSED`
+  comment; its `created_at` (RFC 3339, `Z` accepted) is the proposal time
+  (`fetch_issue_full` now keeps `created_at` per comment). Withdrawn = the
+  issue is no longer open or no longer carries `close-proposed` (a human
+  removing the label cancels the proposal). Challenged = issue has an owner,
+  or carries `joi-decision`/`joi-ruled`, or any comment after the proposal
+  whose body does not start with `[jilog-triage]` or `Recurred on`. **Fail
+  closed:** a missing marker, a missing or unparseable proposal timestamp, or
+  a later comment with a missing or unparseable timestamp is an
+  `expire_errors` item and never closes. Age < 7 days → `expire_pending`
+  (exactly 7 days is due). Otherwise **refetch immediately before closing**
+  and re-run the same evaluation on the fresh snapshot (a claim, label change,
+  or comment that landed since the first fetch counts as a challenge or
+  withdrawal); only then
   `kata close <ref> --reason wontfix --message "[jilog-triage] close proposal
   unchallenged for 7 days (proposed YYYY-MM-DD); closed per jilog#15ax —
   reopen with a comment if this is real work" --project jilog --agent`
   (the same explicit scope every existing mutation uses; asserted at argv
   level in tests). kata offers no revision-guarded close, so the refetch
   narrows the race to seconds — the same accepted residual `sweep` documents.
-  Tally keys: `expired`, `expire_pending`, `expire_challenged`,
-  `expire_skipped_deadline`, `expire_errors`, `expire_item_errors`.
+  Tally keys: `expired`, `expired_refs` (also logged one per line — the
+  reopen list for rollback), `expire_pending`, `expire_challenged`
+  (withdrawn counts here), `expire_skipped_deadline`, `expire_skipped_cap`,
+  `expire_errors`, `expire_item_errors`.
   Author-based challenge detection is deliberately not used: the nightly job
   and Joi's interactive sessions share `KATA_AUTHOR` on the same host.
 - CLI contract: `merge_tallies(sweep_tally, expire_tally)` (pure, tested)
