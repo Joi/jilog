@@ -429,11 +429,12 @@ fn output_is_blank(data: &serde_json::Value) -> bool {
             t.is_empty() || bare_timeout_regex().is_match(t)
         }
         Some(serde_json::Value::Object(output)) => {
-            // `returncode` is the only other allowed key; anything but an
-            // integer (or null/absent) there is content of a shape the
-            // filter does not read, so the output is not blank.
+            // `returncode` is the only other allowed key; when present it
+            // must be an integer (null included — a present non-integer is
+            // a shape the filter does not read), else the output is not
+            // blank (fresheyes round 3).
             let returncode_ok = match output.get("returncode") {
-                None | Some(serde_json::Value::Null) => true,
+                None => true,
                 Some(v) => v.as_i64().is_some(),
             };
             returncode_ok
@@ -1070,6 +1071,9 @@ mod tests {
         assert_eq!(errors_for("bash", rc_text).len(), 1);
         let rc_obj = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": {"signal": "SIGKILL"}}});
         assert_eq!(errors_for("bash", rc_obj).len(), 1);
+        // Present-but-null returncode is "present and not an integer".
+        let rc_null = json!({"success": false, "error": {"message": "Command timed out after 30 seconds"}, "output": {"returncode": null, "stdout": "", "stderr": ""}});
+        assert_eq!(errors_for("bash", rc_null).len(), 1);
     }
 
     #[test]
