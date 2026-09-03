@@ -258,8 +258,8 @@ _No P0 alerts._
 ## Errors
 
 - `0000000000000000-907abeae456d42fe_self` / `todo`: {"message":"Todo 0 missing required fields (content, status, activeForm)"}
-- `842c45ce-77b2-4d72-b995-f2a10466eb40` / `bash`: {"message":"Command timed out after 30 seconds"}
-- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` / `bash`: {"message":"Command timed out after 25 seconds"}
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` / `bash`: {"error":null,"output":{"returncode":101,"stderr":"error[E0308]: mismatched types","stdout":""},"success":false}
+- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` / `read_file`: ~ was not expanded; use $HOME
 
 ## Workarounds
 
@@ -271,8 +271,8 @@ _No P0 alerts._
 
 ## Patterns
 
-- `0000000000000000-cfa24544004845c7_self` kind=`iteration_runaway`: 53 tool calls without a user message 04:32-04:38
-- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` kind=`iteration_runaway`: 38 tool calls without a user message 01:35-01:54
+- `842c45ce-77b2-4d72-b995-f2a10466eb40` kind=`iteration_runaway`: 212 tool calls without a user message 04:02-05:38
+- `ee58d934-1049-4da0-b5b3-9a00f50efcc7` kind=`stuck_loop`: `bash` x6 identical arguments 01:35-01:54
 
 ## Spend
 
@@ -292,7 +292,7 @@ _No P0 alerts._
 - `claude-sonnet-5`: $1.88485200
 ````
 
-The frontmatter is machine-parseable. A common downstream check is "did yesterday's digest go silent on P0?" — `yq '.p0_count' learning-digest-*.md` gives a per-day series. The Patterns lines are the health detectors at work (two sub-agent runs blew past 25 tool calls without a user turn), and Spend is what those 347 sessions actually cost, split by sub-agent role and model.
+The frontmatter is machine-parseable. A common downstream check is "did yesterday's digest go silent on P0?" — `yq '.p0_count' learning-digest-*.md` gives a per-day series. The Patterns lines are the health detectors at work (a root session ran 212 tool calls without a user turn; another retried one `bash` call six times unchanged), and Spend is what those 347 sessions actually cost, split by sub-agent role and model.
 
 ---
 
@@ -345,7 +345,7 @@ Message: cargo test: error[E0308]: mismatched types" \
 
 Priorities are fixed per kind: errors file at priority 1, corrections and patterns at 2, workarounds and deferrals at 3. The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
 
-Recurrence reopens rather than duplicates — when the close was a completion claim. If a **closed** kata issue carries the same title and its `closed_reason` is `done` (or absent, on daemons that predate reasons), jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations). A match closed `wontfix`, `duplicate`, `superseded`, or `audit-no-change` is a recorded decision, not a claim that the problem went away: jilog returns that issue's ref untouched — no reopen, no comment, no label — and the digest links the signal to it (jilog#42fd).
+Recurrence reopens rather than duplicates — when the close was a completion claim. If a **closed** kata issue carries the same title and its `closed_reason` is `done`, jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations). A match closed `wontfix`, `duplicate`, `superseded`, or `audit-no-change` is a recorded decision, not a claim that the problem went away: jilog returns that issue's ref untouched — no reopen, no comment, no label — and the digest links the signal to it (jilog#42fd). A closed row with no `closed_reason` at all is treated the same way: every closed row on a kata ≥0.15 daemon carries the field, so its absence is schema drift, and drift must never turn back into a mass reopen.
 
 The next nightly run that observes the same `cargo test` failure will see the existing `[jilog/error] bash: cargo test: error[E0308]: mismatched types` issue in `list_open()` and **not** file a duplicate — it will return the same `IssueRef`, which is what the digest links back to.
 

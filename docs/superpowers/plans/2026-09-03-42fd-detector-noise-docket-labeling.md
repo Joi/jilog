@@ -122,9 +122,12 @@ Files: `crates/jilog-review/src/reader.rs`, `crates/jilog-review/src/health.rs`,
         `wontfix`/`duplicate`/`superseded`/`audit-no-change` return the closed
         ref untouched).
       - `docs/architecture.html` line 201 (error detector "how" line) gains the
-        suppression sentence; lines 247–276 example swapped to match README;
-        the health table/threshold text (search `25`) → 150 + exemption; the
-        recurrence paragraph gains the reason rule.
+        suppression sentence; lines 247–276 example swapped to match README.
+        The page has no health-pattern entry and no recurrence prose
+        (fresheyes code pass 1), so ADD a `Pattern` list item after `Error`
+        naming the four detectors with the 150 threshold + sub-agent
+        exemption, and extend the section-03 caption (line 361) with the
+        reason-aware reopen rule.
 
 Acceptance: S1, S2, S3, S7-docs of the spec; no other detector's output changes
 (existing tests untouched except literal-to-constant edits).
@@ -151,9 +154,12 @@ File: `crates/jilog-review/src/trackers/kata.rs`.
       closed_reason.as_deref()) { tracing::info!(...); return Ok(existing.issue.
       clone()); }` before the reopen; the reopen branch then uses
       `existing.issue`. `pub(crate) fn reopen_allowed(reason: Option<&str>) ->
-      bool` = `matches!(reason, None | Some("done"))`. Memo untouched in the
+      bool` = `matches!(reason, Some("done"))` — an ABSENT reason does not
+      reopen (roborev #1854/#1855/#1856/#1858: every live closed row carries
+      the field, so `None` is drift and must fail safe). Memo untouched in the
       non-reopen branch. Update the module doc table row for `reopen()` and the
-      `reopen` doc comment.
+      `reopen` doc comment. The row type is `ListedIssue` (status-neutral;
+      `closed_reason` is `None` for open rows).
 - [ ] 2.5 Testability: `#[cfg(test)] fn with_seeded_listings(project, open:
       Vec<IssueRef>, closed: Vec<ClosedIssue>) -> Self` pre-fills both memos so
       `create()` never shells out for listings. Tests:
@@ -350,6 +356,8 @@ Acceptance: S5, S6, gate green.
       --stat Cargo.lock`); commit `release v0.7.1: …`; merge branch into main
       per repo convention (linear history; fast-forward), push main, tag
       `v0.7.1`, push tag.
+- [ ] L2a Keep the old binary for the L8 comparison: `cp ~/.cargo/bin/jilog
+      ~/.cargo/bin/jilog.v070` on joimba (remove it after L8).
 - [ ] L2 Install on joimba: `cargo install --git https://github.com/Joi/jilog
       --tag v0.7.1 jilog`; `jilog --version` → 0.7.1.
 - [ ] L3 Install on jibotmac (user jibot, `~/.local/bin/jilog`, arm64, no cargo,
@@ -358,14 +366,25 @@ Acceptance: S5, S6, gate green.
       jibotmac 'mv ~/.local/bin/jilog.new ~/.local/bin/jilog && ~/.local/bin/
       jilog --version'`.
 - [ ] L4 macazbd: pending (off until 2026-09-06) — comment on jilog#42fd with the
-      exact install command.
+      exact install command AND the constraint: macazbd's
+      `com.amplifier.nightly-learning` (the only job there that runs `jilog
+      review nightly --create-issues`) is behind `active-mac-guard.sh`, so it
+      stays silent while joimba is active; v0.7.1 must be installed there
+      before any cutover makes macazbd active, or its first v0.7.0 night
+      would reopen the L7 re-closed set.
 - [ ] L5 amplifier-bundle-joi: push branch, `marshal-submit -r amplifier-bundle-joi
       -p amplifier-bundle-joi -i jilog#15ax` after the 15ax evidence comment;
       when landed, `git pull` in `~/repos/amplifier-bundle-joi` on joimba (the
       plist execs the working tree) and `amplifier update -y` per AGENTS.md.
-- [ ] L6 Migration: relabel open jilog issues carrying `joi-decision` + a
-      close-PROPOSED marker and no decision-needed marker → remove
-      `joi-decision`, add `close-proposed`; record the command and the refs.
+- [ ] L6 Migration (re-proposal, not a bare relabel — roborev #1854/#1855):
+      for each open jilog issue carrying `joi-decision` + a close-PROPOSED
+      marker and no decision-needed marker, in this order: (1) `kata comment
+      <ref> --body "[jilog-triage] close PROPOSED: <original proposal text,
+      trimmed> (re-proposed on migration 2026-09-03) — auto-closes wontfix
+      after 7 days unless challenged" --project jilog`, (2) `kata label rm
+      <ref> joi-decision`, (3) `kata label add <ref> close-proposed`. The fresh
+      comment is the newest marker, so each migrated item gets a full 7-day
+      window from today. Record the refs on jilog#15ax.
 - [ ] L7 Re-close the recurrence-reopened set (`kata list --project jilog
       --label jilog:recurred --status open`, the wontfix-on-09-01 subset)
       `--reason wontfix` citing the ruling and the v0.7.1 commit.

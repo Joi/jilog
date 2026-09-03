@@ -30,9 +30,11 @@ The nightly `jilog review nightly --create-issues` run and the nightly
 
 ## Success criteria
 
-- S1. `detect_iteration_runaway` does not fire for a sub-agent session
-  (`0000000000000000-` prefix) at any count, and does not fire below 150 tool
-  calls for any session. It still fires at 150+ for a root session.
+- S1. `detect_iteration_runaway` does not fire for a sub-agent session (id
+  starting with the sixteen-zero prefix `0000000000000000`, the exact value
+  of the existing `SUB_AGENT_PREFIX`; such ids continue `-<hex>_<role>`) at
+  any count, and does not fire below 150 tool calls for any session. It
+  still fires at 150+ for a root session.
 - S2. `detect_errors` emits nothing for a `mode` tool result whose output has
   `status: "denied"` or a `denied_mode` field, or whose error code ends in
   `_denied`. It still emits for a `mode` error that is not a denial.
@@ -44,9 +46,12 @@ The nightly `jilog review nightly --create-issues` run and the nightly
   any error text other than the timeout sentence, a structured error object, or
   an unfamiliar envelope — is still emitted. Unknown shapes default to emission.
 - S4. `KataTracker::create` reopens a closed title match only when the close
-  reason is `done` (or absent, pre-reason daemons). A match closed `wontfix`,
-  `duplicate`, `superseded`, or `audit-no-change` is returned as-is: no reopen,
-  no comment, no `jilog:recurred` label.
+  reason is exactly `done`. A match closed `wontfix`, `duplicate`,
+  `superseded`, or `audit-no-change` — or one whose `closed_reason` is absent
+  — is returned as-is: no reopen, no comment, no `jilog:recurred` label. An
+  absent reason is schema drift (every closed row on the live daemon carries
+  the field), and drift must fail toward "do not reopen", never toward the
+  mass reopen this change exists to stop (roborev #1854/#1858).
 - S5. The triager stamps `joi-decision` only alongside a
   `[jilog-triage] decision needed` comment that carries a question (contains
   `?`) and a named target. A `decision` verdict missing either is recorded with
@@ -118,15 +123,20 @@ exactly the marker heuristics the lens forbids; that class is left to triage.
 Option<String> }>` parsed from kata's `closed_reason` field (kata ≥0.15 emits
 it; older JSON yields `None`). In `create`, dedup pass 2 branches on the reason:
 
-- `done` or `None` → existing behavior (reopen + comment + `jilog:recurred`).
-- anything else → return the closed `IssueRef` unchanged, `tracing::info` the
-  skip. The caller records it in `created_issues`, so the digest annotation
-  still links the signal to the issue that holds the ruling.
+- `done` → existing behavior (reopen + comment + `jilog:recurred`).
+- anything else, including `None` → return the closed `IssueRef` unchanged,
+  `tracing::info` the skip. The caller records it in `created_issues`, so the
+  digest annotation still links the signal to the issue that holds the ruling.
 
 Non-done reasons all mean "this title is intentionally not open work":
 `wontfix` is the ruling, `duplicate`/`superseded` point elsewhere,
 `audit-no-change` was reviewed. Reopening any of them contradicts a recorded
-decision. The per-run memo keeps its shape (closed cache holds `ClosedIssue`).
+decision. `None` is not a legacy case worth a permissive default: the live
+daemon emits `closed_reason` on every closed row, so `None` only ever means
+the field was renamed or dropped, and the safe miss (one signal linked to the
+closed ref) is cheaper than a silent mass reopen. The per-run memo keeps its
+shape (closed cache holds `ListedIssue`, a status-neutral row type whose
+`closed_reason` is `None` for open rows).
 
 "A recurring signal in a class ruled expected is not re-emitted" is satisfied
 by A: those signals never leave the detector, so they neither file nor recur.
@@ -204,8 +214,20 @@ by A: those signals never leave the detector, so they neither file nor recur.
 - `bundle.md` `bundle.version` is bumped (AGENTS.md: every behavioral change),
   and the 2026-08-18 sweep spec's "Auto-close" rejection gets a superseded note.
 - Migration (rollout, not code): open jilog issues that carry `joi-decision`
-  and a close-PROPOSED marker but no decision-needed marker are relabeled
-  `close-proposed` by hand, with the command recorded on jilog#15ax.
+  and a close-PROPOSED marker but no decision-needed marker are re-proposed
+  by hand: for each, post a fresh `[jilog-triage] close PROPOSED: <the
+  original proposal text> (re-proposed on migration) — auto-closes wontfix
+  after 7 days unless challenged` comment FIRST, then remove `joi-decision`
+  and add `close-proposed`. The fresh comment is the newest marker, so the
+  7-day window starts at migration; without it the existing markers (already
+  0–6 days old, roborev #1854/#1855) would expire migrated items within days
+  of landing with none of the notice the rule promises. The commands and
+  refs are recorded on jilog#15ax. The migrated set is therefore the first
+  `close-proposed` population and the first batch the expiry phase can
+  close, one week after migration, capped at `MAX_EXPIRE_ITEMS` per night.
+  kata's close-burst throttle is off on the daemon (no `[close.throttle]`
+  section in its config, checked 2026-09-03), and each close message names
+  its own proposal date.
 
 ## Alternatives considered
 
@@ -243,9 +265,17 @@ by A: those signals never leave the detector, so they neither file nor recur.
 - amplifier-bundle-joi: `jilog_triage.py`, `bin/jilog-triage`, tests,
   `bundle.md` (version bump), the 2026-08-18 spec note. The plist executes the
   working tree, so rollback is `git checkout` of the previous main on the
-  host. The expiry phase only touches issues labeled `close-proposed`, which
-  no issue carries before this change lands, and only ever closes `wontfix`
-  (reversible with `kata reopen`).
+  host. The expiry phase only touches issues labeled `close-proposed`. The
+  first population is the migrated backlog (re-proposed at migration, so its
+  window starts then); after that, only the sweep's own close verdicts. It
+  only ever closes `wontfix` (reversible with `kata reopen`; every expired
+  ref is logged).
+- Fleet: the reopen gate lives in the client binary, so it holds only on
+  hosts running v0.7.1. macazbd stays on v0.7.0 until 2026-09-06; its
+  `com.amplifier.nightly-learning` job is wrapped in `active-mac-guard.sh`
+  and does not fire while joimba is the active Mac, so it cannot reopen the
+  re-closed set — but v0.7.1 must be installed on macazbd before any cutover
+  makes it active again.
 - Fleet: joimba (active) and jibotmac get the new jilog binary; macazbd pending.
 
 ## Open questions

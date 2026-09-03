@@ -14,9 +14,11 @@ Pass 1 [plan]: 7B/10S/0C/0R · fixed -/- · velocity = (—→17, escalation no)
   plan passes: 1 · elapsed: 10 min · fresheyes gpt, REASON=- · all 7B+10S folded into plan rev 2: non-string stdout/stderr = unrecognized shape (emit); parse_listed_issues returns Result; create() tested via seeded memos (wontfix → returned untouched, done → reopen path); concrete-only decision dedup marker; placeholder filter widened (+ article strip, NAME_RE); withdrawn state (status/label re-check on refetch); explicit expire signature (fetch(ref, run), close_message, MAX_EXPIRE_ITEMS); budget checked at 4 points with >=; cap counted as expire_skipped_cap; listing drift guard; 7-day-exact + newest-marker tests; cli_main extracted and tested; elapsed_s from last clock read (existing 3-tick test preserved); docs rows (README error row, architecture.html:201, module docstring); cargo update flag fixed (cargo check); non-vacuous rollout check (fresh --processed-file, old-vs-new compare); rollback lists expired refs + kata reopen.
 
 ## Chunks
-- [ ] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters)
-- [ ] chunk 2 — jilog recurrence (kata tracker: closed_reason-aware dedup; never reopen non-done closes)
-- [ ] chunk 3 — amplifier-bundle-joi triager (decision target gating; close-proposed label; 7-day unchallenged auto-close phase)
+- [x] chunk 1 — jilog detectors (health.rs runaway threshold + sub-agent exemption; detectors.rs mode-denial and content-free bash filters) — Agency evaluator clean (92), built + committed; code review pending
+- [x] chunk 2 — jilog recurrence (kata tracker: closed_reason-aware dedup; never reopen non-done closes) — Agency evaluator clean (92), built + committed; code review pending
+- [x] chunk 3 — amplifier-bundle-joi triager (decision target gating; close-proposed label; 7-day unchallenged auto-close phase) — built by subagent, commit 4a45379 in the 15ax worktree, test-gate PASSED (164s), Agency evaluator clean (90); code review pending
+Stage: code-review:chunks-1-2 ∥ code-review:chunk-3 (Stage 1 subagents + watchdogged fresheyes, both chunks in parallel)
+Chunks 1+2 are one crate and one commit; they take ONE combined Stage 1 ∥ Stage 2 review round (fresheyes is 5–15 min a pass; two separate rounds on a 600-line diff buys nothing).
 
 ## Notes
 - Two repos: jilog (this worktree, not marshal-managed) and amplifier-bundle-joi (marshal-managed, slug `amplifier-bundle-joi`, project `amplifier-bundle-joi`, gate `./scripts/test-gate.sh`). The 15ax code path (`src/amplifier_bundle_joi/jilog_triage.py`) lives in amplifier-bundle-joi, not jilog — the brief's "Repo: jilog" covers 42fd only. Chunk 3 is built in a kwt worktree of amplifier-bundle-joi and lands via marshal-submit -i jilog#15ax.

@@ -305,10 +305,9 @@ fn is_mode_denial(tool_name: &str, data: &serde_json::Value) -> bool {
         .and_then(|o| o.get("status"))
         .and_then(|s| s.as_str())
         == Some("denied");
-    let has_denied_mode = output
-        .and_then(|o| o.get("denied_mode"))
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    // Presence of the field is the marker, whatever its value (a null
+    // denied_mode is still the tool reporting a denial).
+    let has_denied_mode = output.and_then(|o| o.get("denied_mode")).is_some();
     let code_denied = [
         data.get("error").and_then(|e| e.get("code")),
         data.get("code"),
@@ -360,32 +359,79 @@ fn error_text(data: &serde_json::Value) -> ErrText {
 /// `output.<key>` as text: `Some("")` when absent or null, `Some(s)` for a
 /// string, `None` for any other type — a structured stdout/stderr is an
 /// unrecognized shape and the caller must emit.
-fn output_text(data: &serde_json::Value, key: &str) -> Option<String> {
-    match data.get("output").and_then(|o| o.get(key)) {
+fn output_text(output: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match output.get(key) {
         None | Some(serde_json::Value::Null) => Some(String::new()),
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(_) => None,
     }
 }
 
-fn output_is_blank(data: &serde_json::Value) -> bool {
-    matches!(
-        (output_text(data, "stdout"), output_text(data, "stderr")),
-        (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
-    )
+/// The only keys a recognized bash envelope may carry. Anything else —
+/// `output.message: "disk full"`, a sibling beside the timeout's
+/// `error.message`, an extra top-level field — is content the shape does
+/// not understand, so the shape does not match and the caller emits
+/// (fresheyes 2026-09-03 pass 1).
+const BARE_TOP_KEYS: &[&str] = &["success", "error", "output", "message"];
+const BARE_OUTPUT_KEYS: &[&str] = &["returncode", "stdout", "stderr"];
+const BARE_ERROR_KEYS: &[&str] = &["message"];
+
+fn keys_within(map: &serde_json::Map<String, serde_json::Value>, allowed: &[&str]) -> bool {
+    map.keys().all(|k| allowed.contains(&k.as_str()))
 }
 
-/// Shape 1: the timeout sentence with nothing else — no stdout, no stderr.
-fn is_bare_timeout(data: &serde_json::Value) -> bool {
-    match error_text(data) {
-        ErrText::Text(t) => bare_timeout_regex().is_match(t.trim()) && output_is_blank(data),
-        _ => false,
+/// True only when the envelope carries nothing but the fields the two bare
+/// shapes are defined over: top-level keys within [`BARE_TOP_KEYS`], `error`
+/// null/string/or an object with only `message`, and `output` absent/null or
+/// an object with only [`BARE_OUTPUT_KEYS`]. A string `output` (the pi and
+/// nanoclaw readers normalize tool results that way), an array, a number,
+/// or any unlisted key makes the envelope unrecognized (roborev #1858).
+fn envelope_is_bare(data: &serde_json::Value) -> bool {
+    let Some(top) = data.as_object() else { return false };
+    if !keys_within(top, BARE_TOP_KEYS) {
+        return false;
+    }
+    let error_ok = match top.get("error") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Object(e)) => keys_within(e, BARE_ERROR_KEYS),
+        Some(_) => false,
+    };
+    let output_ok = match top.get("output") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(o)) => keys_within(o, BARE_OUTPUT_KEYS),
+        Some(_) => false,
+    };
+    error_ok && output_ok
+}
+
+/// True only when `output` is absent/null, or an object whose `stdout` and
+/// `stderr` are both absent, null, or whitespace-only strings. A
+/// non-object `output` or a non-string stream is never blank.
+fn output_is_blank(data: &serde_json::Value) -> bool {
+    match data.get("output") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(output)) => matches!(
+            (output_text(output, "stdout"), output_text(output, "stderr")),
+            (Some(out), Some(err)) if out.trim().is_empty() && err.trim().is_empty()
+        ),
+        Some(_) => false,
     }
 }
 
+/// Shape 1: the timeout sentence with nothing else — no stdout, no stderr,
+/// no other field anywhere in the envelope.
+fn is_bare_timeout(data: &serde_json::Value) -> bool {
+    envelope_is_bare(data)
+        && match error_text(data) {
+            ErrText::Text(t) => bare_timeout_regex().is_match(t.trim()) && output_is_blank(data),
+            _ => false,
+        }
+}
+
 /// Shape 2: an integer nonzero `output.returncode`, no error text at all,
-/// and blank stdout and stderr. A banner-only stdout does NOT match: the
-/// only way to call it non-diagnostic would be a marker heuristic.
+/// blank stdout and stderr, and no other field anywhere in the envelope. A
+/// banner-only stdout does NOT match: the only way to call it non-diagnostic
+/// would be a marker heuristic.
 fn is_bare_nonzero_exit(data: &serde_json::Value) -> bool {
     let nonzero = data
         .get("output")
@@ -393,7 +439,10 @@ fn is_bare_nonzero_exit(data: &serde_json::Value) -> bool {
         .and_then(|r| r.as_i64())
         .map(|r| r != 0)
         .unwrap_or(false);
-    nonzero && error_text(data) == ErrText::Absent && output_is_blank(data)
+    envelope_is_bare(data)
+        && nonzero
+        && error_text(data) == ErrText::Absent
+        && output_is_blank(data)
 }
 
 /// The two content-free bash shapes (bare timeout, bare nonzero exit).
@@ -963,6 +1012,45 @@ mod tests {
         assert_eq!(errors_for("bash", obj).len(), 1);
         let arr = json!({"error": null, "output": {"returncode": 1, "stderr": ["boom"], "stdout": ""}, "success": false});
         assert_eq!(errors_for("bash", arr).len(), 1);
+    }
+
+    #[test]
+    fn errors_keep_bash_extra_fields_anywhere() {
+        // Diagnostic content in a field the shapes do not know about must
+        // never be discarded (fresheyes 2026-09-03 pass 1): a sibling in
+        // output, a sibling beside the timeout message, an extra top-level
+        // key. Each is an unrecognized envelope → emitted.
+        let in_output = json!({"success": false, "output": {"returncode": 1, "message": "disk full"}});
+        assert_eq!(errors_for("bash", in_output).len(), 1);
+        let beside_timeout = json!({"success": false, "error": {"message": "Command timed out after 30 seconds", "partial": "tail of log"}});
+        assert_eq!(errors_for("bash", beside_timeout).len(), 1);
+        let top_level = json!({"success": false, "error": null, "output": {"returncode": 1, "stdout": "", "stderr": ""}, "diagnostics": "oom"});
+        assert_eq!(errors_for("bash", top_level).len(), 1);
+        let timeout_top = json!({"success": false, "error": "Command timed out after 30 seconds", "stderr": "killed"});
+        assert_eq!(errors_for("bash", timeout_top).len(), 1);
+    }
+
+    #[test]
+    fn errors_skip_mode_denied_mode_null_value() {
+        // Presence of the field is the marker, whatever its value.
+        let c = json!({"success": false, "output": {"denied_mode": null}});
+        assert!(errors_for("mode", c).is_empty());
+    }
+
+    #[test]
+    fn errors_keep_bash_non_object_output() {
+        // `output` as a string (pi/nanoclaw normalize tool results this
+        // way), array, or number is an unrecognized envelope: emit. The
+        // timeout sentence with a string output was a real suppression
+        // hole (roborev #1858).
+        let s = json!({"success": false, "error": "Command timed out after 30 seconds", "output": "partial build log"});
+        assert_eq!(errors_for("bash", s).len(), 1);
+        let empty = json!({"success": false, "error": "Command timed out after 30 seconds", "output": ""});
+        assert_eq!(errors_for("bash", empty).len(), 1, "even an empty string output is not the object shape");
+        let arr = json!({"success": false, "output": ["returncode", 1]});
+        assert_eq!(errors_for("bash", arr).len(), 1);
+        let n = json!({"success": false, "error": "Command timed out after 30 seconds", "output": 1});
+        assert_eq!(errors_for("bash", n).len(), 1);
     }
 
     #[test]
