@@ -340,10 +340,10 @@ Tool: bash
 Message: cargo test: error[E0308]: mismatched types" \
     --label jilog --label jilog:error \
     --idempotency-key "[jilog/error]-bash:-cargo-test:-error[E0308]:-mismatched-types" \
-    --priority 1
+    --priority 3
 ```
 
-Priorities are fixed per kind: errors file at priority 1, corrections and patterns at 2, workarounds and deferrals at 3. The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
+Priorities are fixed per kind: corrections and patterns file at priority 2; errors, workarounds and deferrals at 3. Errors are not P1 because an auto-filed error signal is unreviewed — most are one-off session failures — and a P1 is the triager's call after reading the issue, never the detector's (jilog#vs28). The idempotency key is the whitespace-slugged title, so re-filing the same signal is a no-op at the kata daemon even if the `list_open()` dedup pass misses.
 
 Recurrence reopens rather than duplicates — when the close was a completion claim. If a **closed** kata issue carries the same title and its `closed_reason` is `done`, jilog reopens it, then adds a `Recurred on <date> — closure may have been premature.` comment and the `jilog:recurred` label. The reopen is fail-loud; the comment and label are advisory best-effort (a failure there is logged as a warning, never re-queued — retrying would hit the open-title dedup before ever reaching the annotations). A match closed `wontfix`, `duplicate`, `superseded`, or `audit-no-change` is a recorded decision, not a claim that the problem went away: jilog returns that issue's ref untouched — no reopen, no comment, no label — and the digest links the signal to it (jilog#42fd). A closed row with no `closed_reason` at all is treated the same way: every closed row on a kata ≥0.15 daemon carries the field, so its absence is schema drift, and drift must never turn back into a mass reopen.
 
