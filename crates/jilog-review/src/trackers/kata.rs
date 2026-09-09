@@ -513,12 +513,16 @@ fn idempotency_key(title: &str) -> String {
 ///
 /// | Priority | Signals |
 /// |----------|---------|
-/// | 1        | Error (active tool failures — investigate immediately) |
 /// | 2        | Correction, Pattern (behavioural issues worth fixing soon) |
-/// | 3        | Workaround, Deferral (lower-urgency, deferred work) |
+/// | 3        | Error, Workaround, Deferral (unreviewed or lower-urgency work) |
+///
+/// Errors file at 3, not 1: an auto-filed error signal is unreviewed. Most are
+/// one-off session failures, and at P1 they sit unowned above real work on the
+/// dashboard. A P1 is Joi's or the triager's call after looking at the issue,
+/// never a detector's. Companion to the class filters in jilog#42fd (jilog#vs28).
 fn signal_priority(signal: &Signal) -> u8 {
     match signal {
-        Signal::Error(_) => 1,
+        Signal::Error(_) => 3,
         Signal::Correction(_) => 2,
         Signal::Pattern(_) => 2,
         Signal::Workaround(_) => 3,
@@ -785,7 +789,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(signal_priority(&error), 1, "Error must be priority 1");
+        assert_eq!(signal_priority(&error), 3, "Error must be priority 3: unreviewed, triager promotes");
         assert_eq!(signal_priority(&correction), 2, "Correction must be priority 2");
         assert_eq!(signal_priority(&pattern), 2, "Pattern must be priority 2");
         assert_eq!(signal_priority(&workaround), 3, "Workaround must be priority 3");
