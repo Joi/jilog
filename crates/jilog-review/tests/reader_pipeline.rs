@@ -343,3 +343,98 @@ esac
     );
     assert_eq!(report.errors[0].tool_name, "same_model_review");
 }
+
+#[cfg(unix)]
+#[test]
+fn missing_hook_state_flows_through_the_reader() {
+    use jilog_review::readers::WorkerSignalsReader;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("kata-fixture");
+    fs::write(
+        &bin,
+        r#"#!/bin/sh
+case "$1" in
+list) cat "$(dirname "$0")/list.json" ;;
+show) cat "$(dirname "$0")/show.json" ;;
+*) exit 9 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let worktree = dir.path().join("worktree");
+    let state_dir = dir.path().join("state");
+    let seat = dir.path().join("pool/profiles/codex-01");
+    let day = seat.join("sessions/2026/09/13");
+    for path in [&worktree, &state_dir, &day] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::write(
+        seat.join("config.toml"),
+        "[hooks.state.\"h:session_start:0:0\"]\ntrusted_hash = \"sha256:a\"\n",
+    )
+    .unwrap();
+    let rollout = [
+        json!({"timestamp":"2026-09-13T00:00:30Z","type":"session_meta",
+               "payload":{"cwd": worktree, "timestamp":"2026-09-13T00:00:30Z"}})
+        .to_string(),
+        json!({"timestamp":"2026-09-13T00:01:00Z","type":"response_item","payload":{
+               "type":"message","role":"assistant",
+               "content":[{"type":"output_text","text":"working"}]}})
+        .to_string(),
+    ]
+    .join("\n");
+    fs::write(day.join("rollout-2026-09-13T00-00-30-s1.jsonl"), rollout).unwrap();
+
+    let issue = json!({"uid":"issue-uid", "qualified_id":"jilog#4nd2", "metadata": {
+        "dispatch":{"id":"dispatch-1","harness":"codex","seat":"codex-01","host":"macazbd",
+            "pane":"%542","tmux_socket":"default","worktree": worktree,
+            "dispatched_at":"2026-09-13T00:00:00Z"}
+    }});
+    fs::write(
+        dir.path().join("list.json"),
+        json!({"issues":[issue.clone()]}).to_string(),
+    )
+    .unwrap();
+    // `kata show --json` does not echo qualified_id; the reader must carry the
+    // reference it listed, because the hook's filename slug comes from it.
+    let mut shown = issue.clone();
+    shown.as_object_mut().unwrap().remove("qualified_id");
+    fs::write(
+        dir.path().join("show.json"),
+        json!({"issue": shown, "comments": []}).to_string(),
+    )
+    .unwrap();
+
+    let mut reader = WorkerSignalsReader::default();
+    reader.kata_bin = bin;
+    reader.pool_dir = dir.path().join("pool");
+    reader.state_dir = state_dir.clone();
+    reader.codex_home = dir.path().join(".codex");
+    reader.host = Some("macazbd".into());
+    let readers: Vec<Box<dyn Reader>> = vec![Box::new(reader)];
+    let args = |name: &str| ReviewArgs {
+        since: chrono::DateTime::parse_from_rfc3339("2026-09-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+        digest_dir: dir.path().join("digest"),
+        processed_file: Some(dir.path().join(name)),
+        date: NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
+        dry_run: false,
+        create_issues: false,
+    };
+    let report = run_review(&readers, &NoneTracker, &args("processed-1")).unwrap();
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].tool_name, "codex_missing_hook_state");
+    assert_eq!(report.errors[0].seat.as_deref(), Some("codex-01"));
+
+    // The hook's own file, once present, retires the finding.
+    fs::write(state_dir.join("jilog-4nd2-default-542.json"), "{}").unwrap();
+    assert!(run_review(&readers, &NoneTracker, &args("processed-2"))
+        .unwrap()
+        .errors
+        .is_empty());
+}

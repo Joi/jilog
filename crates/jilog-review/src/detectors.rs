@@ -613,7 +613,10 @@ pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<Stri
         // of a failing tool service (jibot-code#2qet).
         if matches!(
             e.tool_name.as_str(),
-            "codex_trust_prompt" | "same_model_review" | "codex_fallback_main"
+            "codex_trust_prompt"
+                | "same_model_review"
+                | "codex_fallback_main"
+                | "codex_missing_hook_state"
         ) {
             continue;
         }
@@ -1416,6 +1419,7 @@ mod tests {
             "codex_trust_prompt",
             "same_model_review",
             "codex_fallback_main",
+            "codex_missing_hook_state",
         ] {
             let errors: Vec<_> = (0..4)
                 .map(|i| ErrorSignal {

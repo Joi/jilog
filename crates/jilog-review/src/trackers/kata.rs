@@ -431,7 +431,7 @@ impl Tracker for KataTracker {
         // Kata's fuzzy title gate otherwise conflates distinct IDs/dates;
         // --force-new bypasses only that gate, retaining idempotency-key safety.
         if matches!(signal, Signal::Error(e)
-            if matches!(e.tool_name.as_str(), "codex_trust_prompt" | "same_model_review" | "codex_fallback_main")
+            if matches!(e.tool_name.as_str(), "codex_trust_prompt" | "same_model_review" | "codex_fallback_main" | "codex_missing_hook_state")
                 && e.session_id.strip_suffix(&format!(":{}", e.tool_name)).is_some_and(|id| !id.is_empty()))
         {
             command.arg("--force-new");
@@ -1276,6 +1276,7 @@ printf '%s\n' '{"issue":{"short_id":"new1","title":"created","status":"open"}}'
             "codex_trust_prompt",
             "same_model_review",
             "codex_fallback_main",
+            "codex_missing_hook_state",
         ] {
             let s = Signal::Error(ErrorSignal {
                 session_id: format!("dispatch-b:{kind}"),
