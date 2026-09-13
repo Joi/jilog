@@ -411,22 +411,32 @@ impl Tracker for KataTracker {
 
         let priority = signal_priority(signal).to_string();
 
-        let output = self
-            .cmd()
-            .args([
-                "create",
-                &title,
-                "--body",
-                &body,
-                "--label",
-                "jilog",
-                "--label",
-                &kind_label,
-                "--idempotency-key",
-                &idem,
-                "--priority",
-                &priority,
-            ])
+        let mut command = self.cmd();
+        command.args([
+            "create",
+            &title,
+            "--body",
+            &body,
+            "--label",
+            "jilog",
+            "--label",
+            &kind_label,
+            "--idempotency-key",
+            &idem,
+            "--priority",
+            &priority,
+        ]);
+        // These diagnostics have stable dispatch/kind or host/day identities.
+        // Both exact-title listings above have already ruled out recurrence.
+        // Kata's fuzzy title gate otherwise conflates distinct IDs/dates;
+        // --force-new bypasses only that gate, retaining idempotency-key safety.
+        if matches!(signal, Signal::Error(e)
+            if matches!(e.tool_name.as_str(), "codex_trust_prompt" | "same_model_review" | "codex_fallback_main")
+                && e.session_id.strip_suffix(&format!(":{}", e.tool_name)).is_some_and(|id| !id.is_empty()))
+        {
+            command.arg("--force-new");
+        }
+        let output = command
             .output()
             .map_err(|e| JilogReviewError::Command(format!("kata create failed: {}", e)))?;
 
@@ -1243,5 +1253,81 @@ mod tests {
         let body = build_body(&signal, "2026-09-13", None);
         assert!(body.contains("- Seat: codex-01 extra\n"));
         assert!(!body.contains("\nextra"));
+    }
+    #[test]
+    fn identified_worker_errors_bypass_fuzzy_gate_but_keep_exact_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("kata");
+        let calls = dir.path().join("calls");
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+printf '%s\n' '{"issue":{"short_id":"new1","title":"created","status":"open"}}'
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for kind in [
+            "codex_trust_prompt",
+            "same_model_review",
+            "codex_fallback_main",
+        ] {
+            let s = Signal::Error(ErrorSignal {
+                session_id: format!("dispatch-b:{kind}"),
+                tool_name: kind.into(),
+                message: "dispatch-b: same diagnostic text".into(),
+                ..Default::default()
+            });
+            let near = IssueRef {
+                id: "#old1".into(),
+                backend: "kata".into(),
+                url: None,
+                title: format!("[jilog/error] {kind}: dispatch-a: same diagnostic text"),
+            };
+            let t = KataTracker::with_seeded_listings("proj", vec![near], vec![], stub.clone());
+            let got = t.create(&s).unwrap();
+            let first = recorded_calls(&calls);
+            assert!(first.contains("--force-new"));
+            assert!(first.contains("--idempotency-key"));
+            assert!(first.contains("--priority 3"));
+            assert_eq!(t.create(&s).unwrap(), got);
+            assert_eq!(
+                recorded_calls(&calls),
+                first,
+                "exact repeat must not call create"
+            );
+            std::fs::write(&calls, "").unwrap();
+            let t = KataTracker::with_seeded_listings(
+                "proj",
+                vec![],
+                vec![closed(&s, Some("wontfix"))],
+                stub.clone(),
+            );
+            assert!(t.create(&s).is_ok());
+            assert!(
+                recorded_calls(&calls).is_empty(),
+                "closed decisions must remain authoritative"
+            );
+        }
+        for (kind, id) in [
+            ("bash", "dispatch:bash"),
+            ("same_model_review", "no-kind-suffix"),
+        ] {
+            let s = Signal::Error(ErrorSignal {
+                session_id: id.into(),
+                tool_name: kind.into(),
+                message: "failure".into(),
+                ..Default::default()
+            });
+            let t = KataTracker::with_seeded_listings("proj", vec![], vec![], stub.clone());
+            t.create(&s).unwrap();
+            assert!(!recorded_calls(&calls).contains("--force-new"));
+            std::fs::write(&calls, "").unwrap();
+        }
     }
 }

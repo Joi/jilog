@@ -52,3 +52,9 @@ For direct acceptance, run `jilog --config <config> review nightly` with the two
 reader entries above and an isolated digest directory and processed file.
 
 Deferred implementation: jilog#4nd2 (hook state), opsctl#2kpx (nightly wiring).
+
+Kata's fuzzy title check treats different dispatch IDs or dates with identical
+error wording as near duplicates. After exact open/closed-title deduplication,
+these three diagnostics use `--force-new` to allow distinct stable identities.
+The idempotency key still prevents repeated creation. Ordinary transcript
+errors and closed exact-match decisions keep the existing behavior.
