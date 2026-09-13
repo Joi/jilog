@@ -1,4 +1,4 @@
-//! CodexReader — scans `~/.codex/sessions/**/rollout-*.jsonl`.
+//! CodexReader scans main and pooled Codex session roots at discovery time.
 //!
 //! Codex CLI writes session rollouts under a date-partitioned tree:
 //!
@@ -24,17 +24,49 @@ use crate::util::expand_tilde;
 
 /// Reader for Codex CLI session rollouts.
 pub struct CodexReader {
-    pub sessions_dir: PathBuf,
+    pub roots: Vec<PathBuf>,
+    pub pool_profiles: Option<PathBuf>,
 }
 
 impl CodexReader {
+    /// Explicit roots replace defaults and do not implicitly scan the pool.
     pub fn new(sessions_dir: impl Into<PathBuf>) -> Self {
-        Self { sessions_dir: sessions_dir.into() }
+        Self::from_roots(vec![sessions_dir.into()])
     }
 
-    /// Use the default Codex sessions directory: `~/.codex/sessions`.
+    pub fn from_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            roots,
+            pool_profiles: None,
+        }
+    }
+
     pub fn from_default() -> Self {
-        Self::new(expand_tilde("~/.codex/sessions"))
+        Self {
+            roots: vec![expand_tilde("~/.codex/sessions")],
+            pool_profiles: Some(expand_tilde("~/.codex-pool/profiles")),
+        }
+    }
+
+    fn scan_roots(&self) -> Result<Vec<PathBuf>, JilogReviewError> {
+        let mut roots = self.roots.clone();
+        if let Some(pool) = &self.pool_profiles {
+            match std::fs::read_dir(pool) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let sessions = entry?.path().join("sessions");
+                        if sessions.is_dir() {
+                            roots.push(sessions);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
     }
 }
 
@@ -46,59 +78,78 @@ impl Reader for CodexReader {
     fn discover(&self, since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
         let mut handles = Vec::new();
 
-        if !self.sessions_dir.exists() {
-            return Ok(handles);
-        }
-
-        let pattern = format!("{}/**/rollout-*.jsonl", self.sessions_dir.display());
-        let entries = match glob::glob(&pattern) {
-            Ok(e) => e,
-            Err(err) => {
-                return Err(JilogReviewError::Reader(format!(
-                    "codex: glob error: {}",
-                    err
-                )));
-            }
-        };
-
-        for entry in entries.flatten() {
-            if entry.is_dir() {
+        let mut seen = std::collections::HashSet::new();
+        for root in self.scan_roots()? {
+            if !root.is_dir() {
                 continue;
             }
-
-            let session_id = entry
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| entry.display().to_string());
-
-            let modified = match entry.metadata().and_then(|m| m.modified()) {
-                Ok(st) => {
-                    let secs = st
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    Utc.timestamp_opt(secs as i64, 0).single().unwrap_or(Utc::now())
+            let pattern = format!(
+                "{}/**/rollout-*.jsonl",
+                glob::Pattern::escape(&root.to_string_lossy())
+            );
+            let entries = match glob::glob(&pattern) {
+                Ok(e) => e,
+                Err(err) => {
+                    return Err(JilogReviewError::Reader(format!(
+                        "codex: glob error: {}",
+                        err
+                    )));
                 }
-                Err(_) => Utc::now(),
             };
 
-            if modified < since {
-                continue;
-            }
+            for entry in entries.flatten() {
+                if entry.is_dir() || !seen.insert(std::fs::canonicalize(&entry)?) {
+                    continue;
+                }
 
-            handles.push(TranscriptHandle {
-                session_id,
-                path: entry,
-                modified,
-                reader_name: self.name().to_string(),
-                persona: None,
-                channel: None,
-            });
+                let session_id = entry
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| entry.display().to_string());
+
+                let modified = match entry.metadata().and_then(|m| m.modified()) {
+                    Ok(st) => {
+                        let secs = st
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Utc.timestamp_opt(secs as i64, 0)
+                            .single()
+                            .unwrap_or(Utc::now())
+                    }
+                    Err(_) => Utc::now(),
+                };
+
+                if modified < since {
+                    continue;
+                }
+
+                handles.push(TranscriptHandle {
+                    session_id,
+                    path: entry,
+                    modified,
+                    reader_name: self.name().to_string(),
+                    persona: None,
+                    channel: None,
+                });
+            }
         }
 
         handles.sort_by_key(|h| h.path.clone());
         Ok(handles)
+    }
+
+    fn seat(&self, handle: &TranscriptHandle) -> Option<String> {
+        // Use the sessions root, not a date directory or rollout filename.
+        handle
+            .path
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "sessions"))
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|n| if n == ".codex" { "main" } else { n }.to_string())
     }
 
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
@@ -171,13 +222,11 @@ fn extract_codex_text(content: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use chrono::Duration;
+    use std::fs;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("jilog-test-codex")
-            .join(name);
+        let dir = std::env::temp_dir().join("jilog-test-codex").join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -188,7 +237,8 @@ mod tests {
         let root = test_dir("discover");
         let day = root.join("2026").join("03").join("24");
         fs::create_dir_all(&day).unwrap();
-        let file = day.join("rollout-2026-03-24T09-02-55-00000000-0000-4000-8000-000000000001.jsonl");
+        let file =
+            day.join("rollout-2026-03-24T09-02-55-00000000-0000-4000-8000-000000000001.jsonl");
         fs::write(&file, "").unwrap();
 
         let reader = CodexReader::new(&root);
@@ -225,8 +275,49 @@ mod tests {
         let msgs = reader.load(&handles[0]).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
-        assert_eq!(msgs[0].content.as_ref().and_then(|c| c.as_str()), Some("hi codex"));
+        assert_eq!(
+            msgs[0].content.as_ref().and_then(|c| c.as_str()),
+            Some("hi codex")
+        );
         assert_eq!(msgs[1].role.as_deref(), Some("assistant"));
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn pool_discovery_is_dynamic_and_deduplicates_roots() {
+        let tree = tempfile::tempdir().unwrap();
+        let main = tree.path().join(".codex/sessions");
+        let pool = tree.path().join(".codex-pool/profiles");
+        fs::create_dir_all(&main).unwrap();
+        fs::write(main.join("rollout-main.jsonl"), "").unwrap();
+        let reader = CodexReader {
+            roots: vec![main.clone(), main],
+            pool_profiles: Some(pool.clone()),
+        };
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(reader.seat(&handles[0]).as_deref(), Some("main"));
+        for seat in ["codex-01", "codex-02"] {
+            let root = pool.join(seat).join("sessions/2026/09/13");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(format!("rollout-{seat}.jsonl")), "").unwrap();
+        }
+        fs::create_dir_all(pool.join("unused")).unwrap();
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 3);
+        assert!(handles
+            .iter()
+            .any(|h| reader.seat(h).as_deref() == Some("codex-02")));
+        assert_eq!(
+            CodexReader::from_roots(vec![])
+                .discover(since)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(reader
+            .discover(Utc::now() + Duration::days(1))
+            .unwrap()
+            .is_empty());
     }
 }

@@ -356,6 +356,13 @@ pub fn run_review(
             let mut deferrals = detect_deferrals(&messages, &handle.session_id);
             let mut patterns = detect_health_patterns(&events, &handle.session_id);
 
+            let seat = reader.seat(&handle);
+            for signal in &mut corrections { signal.seat.clone_from(&seat); }
+            for signal in &mut errors { signal.seat.clone_from(&seat); }
+            for signal in &mut workarounds { signal.seat.clone_from(&seat); }
+            for signal in &mut deferrals { signal.seat.clone_from(&seat); }
+            for signal in &mut patterns { signal.seat.clone_from(&seat); }
+
             // Stamp fleet dimensions onto this session's signals and fold
             // counts into the persona rollup.
             if let Some(persona) = handle.persona.clone() {
@@ -694,7 +701,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` — {}{}\n",
-                dims_prefix(&c.persona, &c.channel),
+                dims_prefix(&c.persona, &c.channel, &c.seat),
                 c.session_id,
                 python_repr(&c.context),
                 annotation
@@ -717,7 +724,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` / `{}`: {}{}\n",
-                dims_prefix(&e.persona, &e.channel),
+                dims_prefix(&e.persona, &e.channel, &e.seat),
                 e.session_id,
                 e.tool_name,
                 msg,
@@ -740,7 +747,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` pattern=`{}`: {}{}\n",
-                dims_prefix(&w.persona, &w.channel),
+                dims_prefix(&w.persona, &w.channel, &w.seat),
                 w.session_id,
                 w.pattern,
                 python_repr(&w.context),
@@ -758,7 +765,7 @@ pub fn render_digest(
         for d in deferrals {
             buf.push_str(&format!(
                 "- {}`{}` pattern=`{}`\n",
-                dims_prefix(&d.persona, &d.channel),
+                dims_prefix(&d.persona, &d.channel, &d.seat),
                 d.session_id,
                 d.item
             ));
@@ -779,7 +786,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` kind=`{}`: {}{}\n",
-                dims_prefix(&p.persona, &p.channel),
+                dims_prefix(&p.persona, &p.channel, &p.seat),
                 p.session_id,
                 p.pattern_kind,
                 p.evidence,
@@ -912,7 +919,10 @@ pub fn write_digest(
 /// Fleet-dimension bullet prefix: `` `persona@channel` `` (with trailing
 /// space) when the signal carries a persona, empty otherwise — so
 /// coding-session lines stay byte-identical to the pre-dims format.
-fn dims_prefix(persona: &Option<String>, channel: &Option<String>) -> String {
+fn dims_prefix(persona: &Option<String>, channel: &Option<String>, seat: &Option<String>) -> String {
+    if let Some(seat) = seat {
+        return format!("`seat:{}` ", seat.replace(['`', '\n', '\r'], " "));
+    }
     match persona_key(persona, channel) {
         Some(key) => format!("`{}` ", key),
         None => String::new(),
@@ -1608,6 +1618,7 @@ mod tests {
             context: "no, wrong channel entirely".into(),
             persona: Some("jibot".into()),
             channel: Some("vibez`\ninjected".into()),
+            seat: None,
         };
         let key = persona_key(&correction.persona, &correction.channel).unwrap();
         assert_eq!(key, "jibot@vibez' injected");

@@ -149,6 +149,9 @@ pub trait Reader: Send + Sync {
     /// Implementations MUST silently skip unparseable lines.
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError>;
 
+    /// Codex profile that produced this transcript, when known.
+    fn seat(&self, _handle: &TranscriptHandle) -> Option<String> { None }
+
     /// Optional richer event stream for health-pattern detection.
     ///
     /// Default: `Ok(None)` — the reader has messages only, and health

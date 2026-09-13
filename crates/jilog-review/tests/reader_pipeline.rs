@@ -11,7 +11,7 @@ use chrono::{Duration, NaiveDate, Utc};
 
 use jilog_review::readers::{AmplifierReader, ContextIntelligenceReader};
 use jilog_review::trackers::NoneTracker;
-use jilog_review::{Reader, ReviewArgs, run_review};
+use jilog_review::{run_review, Reader, ReviewArgs};
 
 fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("jilog-test-pipeline").join(name);
@@ -53,7 +53,10 @@ fn run_pipeline(reader: Box<dyn Reader>, digest_dir: &Path) -> String {
         create_issues: false,
     };
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
-    assert_eq!(report.sessions_scanned, 1, "fixture session must be scanned");
+    assert_eq!(
+        report.sessions_scanned, 1,
+        "fixture session must be scanned"
+    );
     fs::read_to_string(&report.digest_path).unwrap()
 }
 
@@ -74,7 +77,9 @@ fn amplifier_events_fixture_produces_pattern_section() {
         body
     );
     assert!(
-        body.contains("- `sess-storm` kind=`stuck_loop`: `bash` x4 identical arguments 09:10-09:13"),
+        body.contains(
+            "- `sess-storm` kind=`stuck_loop`: `bash` x4 identical arguments 09:10-09:13"
+        ),
         "digest:\n{}",
         body
     );
@@ -84,7 +89,11 @@ fn amplifier_events_fixture_produces_pattern_section() {
         "digest:\n{}",
         body
     );
-    assert!(body.contains("- `claude-opus-4-8`: $0.42"), "digest:\n{}", body);
+    assert!(
+        body.contains("- `claude-opus-4-8`: $0.42"),
+        "digest:\n{}",
+        body
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -114,7 +123,9 @@ fn context_intelligence_events_fixture_produces_pattern_section() {
         body
     );
     assert!(
-        body.contains("- `sess-ci-storm` kind=`stuck_loop`: `bash` x4 identical arguments 09:10-09:13"),
+        body.contains(
+            "- `sess-ci-storm` kind=`stuck_loop`: `bash` x4 identical arguments 09:10-09:13"
+        ),
         "digest:\n{}",
         body
     );
@@ -126,7 +137,11 @@ fn context_intelligence_events_fixture_produces_pattern_section() {
         "digest:\n{}",
         body
     );
-    assert!(body.contains("- **Tokens**: 1000 in / 100 out"), "digest:\n{}", body);
+    assert!(
+        body.contains("- **Tokens**: 1000 in / 100 out"),
+        "digest:\n{}",
+        body
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -203,6 +218,104 @@ fn nanoclaw_cell_fixture_produces_dims_and_pattern_section() {
         body
     );
     // Token-only spend (cells carry no cost field).
-    assert!(body.contains("- **Tokens**: 40 in / 20 out"), "digest:\n{}", body);
+    assert!(
+        body.contains("- **Tokens**: 40 in / 20 out"),
+        "digest:\n{}",
+        body
+    );
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pooled_codex_seat_reaches_signals_without_chat_heuristics() {
+    use jilog_review::readers::CodexReader;
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("profiles/codex-17/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("rollout-seat-test.jsonl"), concat!(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A temporary workaround is in place.\"}]}}\n"
+    )).unwrap();
+    let args = ReviewArgs {
+        since: Utc::now() - Duration::days(1),
+        digest_dir: dir.path().join("digest"),
+        processed_file: Some(dir.path().join("processed")),
+        date: Utc::now().date_naive(),
+        dry_run: false,
+        create_issues: false,
+    };
+    let readers: Vec<Box<dyn Reader>> = vec![Box::new(CodexReader::new(sessions))];
+    let report = run_review(&readers, &NoneTracker, &args).unwrap();
+    assert!(!report.workarounds.is_empty());
+    assert!(report
+        .workarounds
+        .iter()
+        .all(|s| s.seat.as_deref() == Some("codex-17") && s.persona.is_none()));
+    assert!(fs::read_to_string(&report.digest_path)
+        .unwrap()
+        .contains("seat:codex-17"));
+    assert!(report.personas.is_empty());
+    assert_eq!(
+        run_review(&readers, &NoneTracker, &args)
+            .unwrap()
+            .sessions_scanned,
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_evidence_flows_through_errors_and_dedup() {
+    use jilog_review::readers::WorkerSignalsReader;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("kata-fixture");
+    fs::write(&bin, "#!/bin/sh\ncase \"$1\" in\nlist) cat \"$(dirname \"$0\")/list.json\" ;;\nshow) cat \"$(dirname \"$0\")/show.json\" ;;\n*) exit 9 ;;\nesac\n").unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    let issue = json!({"uid":"fixture-uid", "metadata": {
+        "dispatch":{"id":"fixture-dispatch", "harness":"codex", "seat":"codex-01", "dispatched_at":"2026-09-13T00:00:00Z"},
+        "kickoff":{"id":"fixture-dispatch", "state":"failed", "detail":"dialog:dir-trust: wait", "at":"2026-09-13T00:01:00Z"}
+    }});
+    fs::write(
+        dir.path().join("list.json"),
+        json!({"issues":[issue.clone()]}).to_string(),
+    )
+    .unwrap();
+    let mut full = json!({"issue":issue, "comments":[]});
+    fs::write(dir.path().join("show.json"), full.to_string()).unwrap();
+    let mut reader = WorkerSignalsReader::default();
+    reader.kata_bin = bin;
+    reader.pool_dir = dir.path().join("pool");
+    let readers: Vec<Box<dyn Reader>> = vec![Box::new(reader)];
+    let args = ReviewArgs {
+        since: chrono::DateTime::parse_from_rfc3339("2026-09-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+        digest_dir: dir.path().join("digest"),
+        processed_file: Some(dir.path().join("processed")),
+        date: NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
+        dry_run: false,
+        create_issues: false,
+    };
+    let report = run_review(&readers, &NoneTracker, &args).unwrap();
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].tool_name, "codex_trust_prompt");
+    assert_eq!(report.errors[0].seat.as_deref(), Some("codex-01"));
+    assert_eq!(
+        run_review(&readers, &NoneTracker, &args)
+            .unwrap()
+            .errors
+            .len(),
+        0
+    );
+    full["comments"] =
+        json!([{"body":"review: fresheyes --gpt", "created_at":"2026-09-13T00:02:00Z"}]);
+    fs::write(dir.path().join("show.json"), full.to_string()).unwrap();
+    let report = run_review(&readers, &NoneTracker, &args).unwrap();
+    assert_eq!(
+        report.errors.len(),
+        1,
+        "new kind after first scan must survive dispatch dedup"
+    );
+    assert_eq!(report.errors[0].tool_name, "same_model_review");
 }

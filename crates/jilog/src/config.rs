@@ -42,6 +42,8 @@ pub enum ReaderConfig {
     Codex {
         #[serde(default)]
         path: Option<String>,
+        #[serde(default)]
+        paths: Option<Vec<String>>,
     },
     /// Amplifier context-intelligence event streams
     /// (`<projects>/<proj>/sessions/<sess>/context-intelligence/events.jsonl`).
@@ -71,6 +73,7 @@ pub enum ReaderConfig {
     },
     /// pi coding agent (pi.dev) session files
     /// (`~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl`).
+    WorkerSignals,
     Pi {
         #[serde(default)]
         path: Option<String>,
@@ -286,12 +289,14 @@ impl JilogConfig {
                             .unwrap_or_else(|| expand_tilde("~/.claude/projects"));
                         Box::new(ClaudeCodeReader::new(dir))
                     }
-                    ReaderConfig::Codex { path } => {
-                        let dir = path
-                            .as_deref()
-                            .map(expand_tilde)
-                            .unwrap_or_else(|| expand_tilde("~/.codex/sessions"));
-                        Box::new(CodexReader::new(dir))
+                    ReaderConfig::Codex { path, paths } => {
+                        if let Some(paths) = paths {
+                            Box::new(CodexReader::from_roots(paths.iter().map(|p| expand_tilde(p)).collect()))
+                        } else if let Some(path) = path {
+                            Box::new(CodexReader::new(expand_tilde(path)))
+                        } else {
+                            Box::new(CodexReader::from_default())
+                        }
                     }
                     ReaderConfig::ContextIntelligence { path } => {
                         let dir = path
@@ -319,6 +324,7 @@ impl JilogConfig {
                         }
                         Box::new(reader)
                     }
+                    ReaderConfig::WorkerSignals => Box::new(jilog_review::readers::WorkerSignalsReader::default()),
                     ReaderConfig::Pi { path } => {
                         let dir = path
                             .as_deref()
@@ -577,4 +583,24 @@ mod tests {
         let cfg = JilogConfig::from_toml_str("").unwrap();
         assert!(matches!(cfg.tracker, TrackerConfig::None));
     }
+    #[test]
+    fn codex_root_overrides_and_worker_reader_parse() {
+        let config: JilogConfig = toml::from_str(r#"
+[[reader]]
+type = "codex"
+paths = []
+[[reader]]
+type = "worker-signals"
+"#).unwrap();
+        let readers = config.into_readers();
+        assert_eq!(readers.len(), 2);
+        assert!(readers[0].discover(chrono::Utc::now()).unwrap().is_empty());
+        assert_eq!(readers[1].name(), "worker-signals");
+        let config: JilogConfig = toml::from_str(r#"[[reader]]
+type = "codex"
+path = "/missing/sessions"
+"#).unwrap();
+        assert_eq!(config.into_readers()[0].name(), "codex");
+    }
+
 }

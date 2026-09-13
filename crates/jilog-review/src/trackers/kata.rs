@@ -554,6 +554,7 @@ fn signal_priority(signal: &Signal) -> u8 {
 fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String {
     let session_id = signal.session_id();
     let kind = signal.kind();
+    let seat_line = signal.seat().map(|s| format!("- Seat: {}\n", s.replace(['\n', '\r'], " "))).unwrap_or_default();
     let digest_path = match digest_path {
         Some(p) => p.to_string(),
         None => format!("~/.amplifier/health/learning-digest-{}.md", date),
@@ -572,6 +573,7 @@ fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String 
 ## Source\n\
 - Session: {session_id}\n\
 - Kind: {kind}\n\
+{seat_line}\
 - See `{digest_path}` for the full digest window this signal came from.\n\n\
 ## Signal\n\
 {kind_specific}"

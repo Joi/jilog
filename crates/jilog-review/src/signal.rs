@@ -26,6 +26,16 @@ impl Signal {
         }
     }
 
+    pub fn seat(&self) -> Option<&str> {
+        match self {
+            Self::Correction(s) => s.seat.as_deref(),
+            Self::Error(s) => s.seat.as_deref(),
+            Self::Workaround(s) => s.seat.as_deref(),
+            Self::Pattern(s) => s.seat.as_deref(),
+            Self::Deferral(s) => s.seat.as_deref(),
+        }
+    }
+
     /// Returns a stable lowercase kind string matching the serde tag.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -43,6 +53,9 @@ impl Signal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Correction {
     pub session_id: String,
+    /// Codex profile name; independent of fleet persona and channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     /// The short user message following an assistant turn.
     pub context: String,
     /// Which bot ran the session (fleet sessions only; see
@@ -59,6 +72,9 @@ pub struct Correction {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorSignal {
     pub session_id: String,
+    /// Codex profile name; independent of fleet persona and channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     pub tool_name: String,
     pub message: String,
     /// Which bot ran the session (fleet sessions only).
@@ -73,6 +89,9 @@ pub struct ErrorSignal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Workaround {
     pub session_id: String,
+    /// Codex profile name; independent of fleet persona and channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     /// Human-readable pattern label (e.g. "for now", "TODO", "hack").
     pub pattern: String,
     /// First 200 chars of the matching assistant text.
@@ -94,6 +113,9 @@ pub struct Workaround {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PatternSignal {
     pub session_id: String,
+    /// Codex profile name; independent of fleet persona and channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     /// Human-readable one-line summary (used in issue titles).
     pub description: String,
     /// Stable snake_case detector id, e.g. "compaction_storm".
@@ -114,6 +136,9 @@ pub struct PatternSignal {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeferralSignal {
     pub session_id: String,
+    /// Codex profile name; independent of fleet persona and channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     pub item: String,
     /// Which bot ran the session (fleet sessions only).
     #[serde(default, skip_serializing_if = "Option::is_none")]

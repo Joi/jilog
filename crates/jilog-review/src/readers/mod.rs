@@ -17,3 +17,6 @@ pub use copilot::CopilotReader;
 pub use generic::{GenericReader, SessionIdSource};
 pub use nanoclaw::NanoclawReader;
 pub use pi::PiReader;
+
+pub mod worker_signals;
+pub use worker_signals::WorkerSignalsReader;

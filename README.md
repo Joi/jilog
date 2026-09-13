@@ -127,11 +127,29 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 | `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | — | ✅ built-in |
 | `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ (events.jsonl sessions) | ✅ built-in |
 | `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ | ✅ built-in |
-| `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (Codex CLI rollouts; user + assistant `response_item` messages) | — | ✅ built-in |
+| `codex` | Main `~/.codex/sessions` and every `~/.codex-pool/profiles/*/sessions` discovered at scan time; user + assistant rollout messages, tagged with `seat` | — | ✅ built-in |
+| `worker-signals` | Kata dispatch/kickoff/review records and the local Codex pool allocation log | Trust prompt, same-model review, fallback to main (P3 errors) | ✅ built-in |
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
 | `pi` | `~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl` ([pi.dev](https://pi.dev) coding agent, session format v3; user + assistant + toolResult messages, per-call usage/cost → spend section) | ✅ | ✅ built-in |
 | `generic` | Any JSONL of `{"role","content","name"}` lines at a configured glob (`path`, `~` ok) with `session_id_from = "parent_dir" \| "file_stem"`; an optional first line `{"_jilog": {"persona": …, "channel": …}}` stamps the fleet dimensions (Personas rollup + chat-tuned corrections) — how Hermes profiles on jibotmac reach jilog (cell-fleet `scripts/hermes-jilog-export.py`) | — | ✅ built-in |
 | `nanoclaw` | `<data>/v2-sessions/<agent-id>/.claude-shared/projects/**/*.jsonl` (NanoClaw cell agent sessions — Claude Code format plus queue-operation entries; persona + channel mapped from the cell's `v2.db`, trust-tier `include`/`exclude` allowlist; run on-cell or against a read-only mirror) | ✅ | ✅ built-in |
+
+Configure pooled Codex scanning and dispatch evidence together:
+
+```toml
+[[reader]]
+type = "codex"
+# Optional override: paths = ["/archive/main/sessions", "/archive/codex-01/sessions"]
+# Legacy path = "/one/sessions" still selects one root. paths takes precedence.
+
+[[reader]]
+type = "worker-signals"
+```
+
+Explicit `path` or `paths` replaces automatic root discovery; an empty `paths`
+list scans nothing. Seat tags appear on signals, digest lines, and Kata issue
+bodies without changing coding-session correction heuristics. See
+[Codex worker signals](docs/codex-worker-signals.md) for evidence and rollout limits.
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
 
