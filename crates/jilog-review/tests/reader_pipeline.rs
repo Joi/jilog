@@ -410,10 +410,9 @@ esac
         let mut command = std::process::Command::new("tmux");
         command.args(["-L", &socket]).args(args).output()
     };
-    if tmux(&["new-session", "-d", "-c", &worktree.to_string_lossy(), "sh"]).is_err() {
-        eprintln!("skipping: tmux unavailable");
-        return;
-    }
+    let started = tmux(&["new-session", "-d", "-c", &worktree.to_string_lossy(), "sh"])
+        .expect("tmux must be installed: this test covers the reader's live pane probe");
+    assert!(started.status.success(), "tmux new-session: {started:?}");
     let pane = String::from_utf8(
         tmux(&["display-message", "-p", "-t", "0", "#{pane_id}"])
             .unwrap()
@@ -425,12 +424,17 @@ esac
     assert!(pane.starts_with('%'), "tmux pane id: {pane}");
     let hook_file = format!("jilog-4nd2-{socket}-{}.json", pane.trim_start_matches('%'));
 
-    let issue = json!({"uid":"issue-uid", "qualified_id":"jilog#4nd2", "status":"open", "metadata": {
+    // Every Kata timestamp predates the scan window: a long-running dispatch
+    // nobody has commented on. Its evidence is the rollout's first assistant
+    // turn, which is inside the window, so the candidate filter must not drop
+    // it the way it drops a finished issue.
+    let issue = json!({"uid":"issue-uid", "qualified_id":"jilog#4nd2", "status":"open",
+      "updated_at":"2026-09-10T00:00:00Z", "metadata": {
         "dispatch":{"id":"dispatch-1","harness":"codex","seat":"codex-01","host":"macazbd",
             "pane": pane, "tmux_socket": socket, "worktree": worktree,
-            "dispatched_at":"2026-09-13T00:00:00Z"},
+            "dispatched_at":"2026-09-10T00:00:00Z"},
         "kickoff":{"id":"dispatch-1","state":"accepted","session_observed":"s1",
-            "at":"2026-09-13T00:00:20Z"}
+            "at":"2026-09-10T00:00:20Z"}
     }});
     fs::write(
         dir.path().join("list.json"),

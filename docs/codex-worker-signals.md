@@ -14,7 +14,9 @@ Configure `[[reader]] type = "worker-signals"` in the jilog CLI configuration to
 read operational evidence. It uses read-only `kata list --all --status all
 --meta dispatch --limit 0 --json` and `kata show <project>#<short_id> --json`, including closed
 issues so completed dispatches still contribute failures. Issue update, dispatch, and kickoff timestamps filter the candidate set before
-fetching full records. Kata updates updated_at when comments are appended.
+fetching full records — except for an open codex dispatch, which is always a
+candidate, because its missing-hook evidence is a rollout turn that can fall
+inside the window long after the issue's own timestamps left it. Kata updates updated_at when comments are appended.
 Comments are then filtered by their own timestamp and current dispatch start.
 Per-source failures warn and preserve other readable evidence.
 Only explicit first-line `review: fresheyes --gpt` or `--claude` commands count.
@@ -80,7 +82,9 @@ host:
   `#{pane_dead}` alongside `#{pane_current_path}` so a pane kept by
   `remain-on-exit` does not read as live. The probe is bounded at 15 seconds:
   an unattended nightly must not be held open by an unresponsive tmux server,
-  and a timeout reads as "could not confirm". Directories are compared
+  and a timeout reads as "could not confirm". A server that fails to answer is
+  not asked again during that scan, so one unresponsive server costs the scan
+  one timeout rather than one per candidate. Directories are compared
   resolved, so a symlinked component is not "the pane left the worktree";
 - no hook state file has appeared since the scan opened. Both live checks run
   last, against the world as it is, because both cost a process or a syscall

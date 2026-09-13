@@ -660,10 +660,17 @@ fn run_bounded(mut command: Command, limit: Duration) -> Option<std::process::Ou
 /// The live probe: tmux for the pane, the hook state directory for the files.
 struct LiveHookProbe {
     state_dir: PathBuf,
+    /// tmux servers that already failed to answer inside the timeout. One
+    /// unresponsive server must cost the scan one timeout, not one per
+    /// candidate — `kata list --limit 0` has no bound on candidates.
+    unresponsive: Mutex<BTreeSet<String>>,
 }
 
 impl HookProbe for LiveHookProbe {
     fn pane_cwd(&self, socket: &str, pane: &str) -> Option<String> {
+        if self.unresponsive.lock().unwrap().contains(socket) {
+            return None;
+        }
         let mut command = Command::new("tmux");
         command.args([
             "-L",
@@ -676,7 +683,10 @@ impl HookProbe for LiveHookProbe {
             // directory, so ask whether it is dead in the same breath.
             "#{pane_dead}\n#{pane_current_path}",
         ]);
-        let output = run_bounded(command, Duration::from_secs(15))?;
+        let Some(output) = run_bounded(command, Duration::from_secs(15)) else {
+            self.unresponsive.lock().unwrap().insert(socket.to_owned());
+            return None;
+        };
         if !output.status.success() {
             return None;
         }
@@ -799,11 +809,18 @@ impl Reader for WorkerSignalsReader {
         let mut trust: BTreeMap<String, bool> = BTreeMap::new();
         let probe = LiveHookProbe {
             state_dir: self.state_dir.clone(),
+            unresponsive: Mutex::new(BTreeSet::new()),
         };
         for issue in listed["issues"].as_array().into_iter().flatten() {
+            // An open codex dispatch is always a candidate: its evidence is
+            // the rollout's first assistant turn, which can fall inside the
+            // window long after the issue's own timestamps left it.
+            let live_codex = issue["status"].as_str() == Some("open")
+                && issue["metadata"]["dispatch"]["harness"].as_str() == Some("codex");
             // Kata updates updated_at when a comment is appended. Keep
             // missing timestamps eligible rather than silently losing data.
-            if timestamp(&issue["updated_at"]).is_some_and(|t| t < since)
+            if !live_codex
+                && timestamp(&issue["updated_at"]).is_some_and(|t| t < since)
                 && timestamp(&issue["metadata"]["dispatch"]["dispatched_at"])
                     .map_or(true, |t| t < since)
                 && timestamp(&issue["metadata"]["kickoff"]["at"]).map_or(true, |t| t < since)
