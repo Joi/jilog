@@ -232,9 +232,9 @@ fn pooled_codex_seat_reaches_signals_without_chat_heuristics() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("profiles/codex-17/sessions");
     fs::create_dir_all(&sessions).unwrap();
-    fs::write(sessions.join("rollout-seat-test.jsonl"), concat!(
+    fs::write(sessions.join("rollout-seat-test.jsonl"),
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A temporary workaround is in place.\"}]}}\n"
-    )).unwrap();
+    ).unwrap();
     let args = ReviewArgs {
         since: Utc::now() - Duration::days(1),
         digest_dir: dir.path().join("digest"),
@@ -270,15 +270,35 @@ fn worker_evidence_flows_through_errors_and_dedup() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("kata-fixture");
-    fs::write(&bin, "#!/bin/sh\ncase \"$1\" in\nlist) cat \"$(dirname \"$0\")/list.json\" ;;\nshow) cat \"$(dirname \"$0\")/show.json\" ;;\n*) exit 9 ;;\nesac\n").unwrap();
+    fs::write(
+        &bin,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+case "$1" in
+list) [ "$*" = "list --all --status all --meta dispatch --limit 0 --json" ] || exit 9
+      cat "$(dirname "$0")/list.json" ;;
+show) [ "$*" = "show fixture#abcd --json" ] || exit 4
+      cat "$(dirname "$0")/show.json" ;;
+*) exit 9 ;;
+esac
+"#,
+    )
+    .unwrap();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
-    let issue = json!({"uid":"fixture-uid", "metadata": {
+    let issue = json!({"uid":"fixture-uid", "qualified_id":"fixture#abcd", "metadata": {
         "dispatch":{"id":"fixture-dispatch", "harness":"codex", "seat":"codex-01", "dispatched_at":"2026-09-13T00:00:00Z"},
         "kickoff":{"id":"fixture-dispatch", "state":"failed", "detail":"dialog:dir-trust: wait", "at":"2026-09-13T00:01:00Z"}
     }});
+    let mut old = issue.clone();
+    old["qualified_id"] = json!("fixture#old");
+    old["updated_at"] = json!("2020-01-01T00:00:00Z");
+    old["metadata"]["dispatch"]["dispatched_at"] = json!("2020-01-01T00:00:00Z");
+    old["metadata"]["kickoff"]["at"] = json!("2020-01-01T00:00:00Z");
+    let mut unavailable = issue.clone();
+    unavailable["qualified_id"] = json!("fixture#gone");
     fs::write(
         dir.path().join("list.json"),
-        json!({"issues":[issue.clone()]}).to_string(),
+        json!({"issues":[old, unavailable, issue.clone()]}).to_string(),
     )
     .unwrap();
     let mut full = json!({"issue":issue, "comments":[]});
@@ -300,6 +320,10 @@ fn worker_evidence_flows_through_errors_and_dedup() {
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].tool_name, "codex_trust_prompt");
+    let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
+    assert!(calls.contains("show fixture#abcd --json"));
+    assert!(calls.contains("show fixture#gone --json"));
+    assert!(!calls.contains("fixture#old"));
     assert_eq!(report.errors[0].seat.as_deref(), Some("codex-01"));
     assert_eq!(
         run_review(&readers, &NoneTracker, &args)

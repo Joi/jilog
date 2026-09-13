@@ -63,6 +63,9 @@ pub fn signal_title(signal: &Signal) -> String {
             c.session_id,
             truncate_chars(&c.context, 80)
         ),
+        Signal::Error(e) if e.tool_name == "codex_fallback_main" => {
+            format!("[jilog/error] {}: {}", e.tool_name, e.session_id)
+        }
         Signal::Error(e) => format!(
             "[jilog/error] {}: {}",
             e.tool_name,
@@ -83,5 +86,23 @@ pub fn signal_title(signal: &Signal) -> String {
             d.session_id,
             truncate_chars(&d.item, 80)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_allocation_title_is_stable_as_daily_count_grows() {
+        let mut error = crate::signal::ErrorSignal {
+            session_id: "allocation:host:2026-09-13:codex_fallback_main".into(),
+            tool_name: "codex_fallback_main".into(),
+            message: "1 row".into(),
+            ..Default::default()
+        };
+        let first = signal_title(&Signal::Error(error.clone()));
+        error.message = "25 rows".into();
+        assert_eq!(first, signal_title(&Signal::Error(error)));
     }
 }

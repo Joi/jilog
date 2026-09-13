@@ -554,7 +554,10 @@ fn signal_priority(signal: &Signal) -> u8 {
 fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String {
     let session_id = signal.session_id();
     let kind = signal.kind();
-    let seat_line = signal.seat().map(|s| format!("- Seat: {}\n", s.replace(['\n', '\r'], " "))).unwrap_or_default();
+    let seat_line = signal
+        .seat()
+        .map(|s| format!("- Seat: {}\n", s.replace(['\n', '\r'], " ")))
+        .unwrap_or_default();
     let digest_path = match digest_path {
         Some(p) => p.to_string(),
         None => format!("~/.amplifier/health/learning-digest-{}.md", date),
@@ -1227,5 +1230,18 @@ mod tests {
         let t = KataTracker::with_seeded_listings("p", vec![open.clone()], vec![closed(&s, Some("wontfix"))], stub);
         assert_eq!(t.create(&s).unwrap(), open);
         assert_eq!(recorded_calls(&calls), "");
+    }
+    #[test]
+    fn issue_body_includes_seat_without_multiline_injection() {
+        let signal = Signal::Error(ErrorSignal {
+            session_id: "dispatch".into(),
+            seat: Some("codex-01\nextra".into()),
+            tool_name: "same_model_review".into(),
+            message: "recorded command".into(),
+            ..Default::default()
+        });
+        let body = build_body(&signal, "2026-09-13", None);
+        assert!(body.contains("- Seat: codex-01 extra\n"));
+        assert!(!body.contains("\nextra"));
     }
 }

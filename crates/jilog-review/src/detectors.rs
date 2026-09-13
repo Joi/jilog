@@ -609,6 +609,14 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in errors {
+        // Operational diagnostics are explicitly P3 findings, not evidence
+        // of a failing tool service (jibot-code#2qet).
+        if matches!(
+            e.tool_name.as_str(),
+            "codex_trust_prompt" | "same_model_review" | "codex_fallback_main"
+        ) {
+            continue;
+        }
         if crate::reader::is_sub_agent_session(&e.session_id) {
             continue;
         }
@@ -1401,5 +1409,22 @@ mod tests {
         ]);
         let out = extract_assistant_text(&Some(content));
         assert_eq!(out, "hello\nworld");
+    }
+    #[test]
+    fn worker_diagnostics_do_not_raise_p0() {
+        for kind in [
+            "codex_trust_prompt",
+            "same_model_review",
+            "codex_fallback_main",
+        ] {
+            let errors: Vec<_> = (0..4)
+                .map(|i| ErrorSignal {
+                    session_id: format!("dispatch-{i}"),
+                    tool_name: kind.into(),
+                    ..Default::default()
+                })
+                .collect();
+            assert!(detect_p0_alerts(&errors).is_empty());
+        }
     }
 }

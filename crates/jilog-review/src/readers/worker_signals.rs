@@ -62,13 +62,13 @@ fn record(
             modified: at,
             reader_name: "worker-signals".into(),
             persona: None,
-            channel: seat.map(str::to_owned),
+            channel: None,
         },
         Message {
             role: Some("tool".into()),
             name: Some(kind.into()),
             content: Some(
-                serde_json::json!({"success": false, "error": format!("{id}: {detail}")}),
+                serde_json::json!({"success": false, "error": format!("{id}: {detail}"), "seat": seat}),
             ),
         },
     )
@@ -153,7 +153,7 @@ fn allocation_records(
     if !seats_exist {
         return vec![];
     }
-    let mut out = Vec::new();
+    let mut groups = std::collections::BTreeMap::<(String, String), (DateTime<Utc>, usize)>::new();
     for line in log.lines() {
         let fields: Vec<_> = line.split('\t').collect();
         if fields.len() < 4 || fields[2] != "exec" || fields[3] != "main" {
@@ -169,22 +169,31 @@ fn allocation_records(
                     .and_then(|t| Local.from_local_datetime(&t).single())
                     .map(|t| t.with_timezone(&Utc))
             });
-        let Some(at) = at.filter(|t| *t >= since) else {
+        let Some(at) = at else {
+            tracing::warn!(
+                "worker-signals: invalid or ambiguous allocation timestamp {}; row skipped",
+                fields[0]
+            );
             continue;
         };
-        // Allocation logs have no dispatch id. Preserve their actual identity;
-        // do not manufacture a link to an unrelated concurrent dispatch.
-        let id = format!("allocation:{}:{}", fields[1], fields[0]);
-        out.push(record(
-            &id,
-            "codex_fallback_main",
-            "exec selected main while pool profiles exist; allocation log has no dispatch id",
-            at,
-            path.to_owned(),
-            Some("main"),
-        ));
+        if at < since {
+            continue;
+        }
+        let date = fields[0].get(..10).unwrap_or(fields[0]).to_string();
+        let entry = groups
+            .entry((fields[1].to_owned(), date))
+            .or_insert((at, 0));
+        entry.0 = entry.0.max(at);
+        entry.1 += 1;
     }
-    out
+    groups.into_iter().map(|((host, date), (at, count))| {
+        // The requested main-usage signal includes scored selections. The
+        // log has no dispatch ID, so preserve host/day and the source path.
+        let id = format!("allocation:{host}:{date}");
+        record(&id, "codex_fallback_main",
+            &format!("main selected while pool profiles exist; {count} exec row(s); last timestamp {}; source {}; allocation log has no dispatch id", at.to_rfc3339(), path.display()),
+            at, path.to_owned(), Some("main"))
+    }).collect()
 }
 
 impl Reader for WorkerSignalsReader {
@@ -192,39 +201,65 @@ impl Reader for WorkerSignalsReader {
         "worker-signals"
     }
     fn discover(&self, since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
-        let listed = kata(
+        let listed_result = kata(
             &self.kata_bin,
             &[
                 "list", "--all", "--status", "all", "--meta", "dispatch", "--limit", "0", "--json",
             ],
-        )?;
-        let issues = listed["issues"].as_array().ok_or_else(|| {
-            JilogReviewError::Reader("worker-signals: missing issues array".into())
-        })?;
+        );
+        let listed = match listed_result {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("worker-signals: {error}; continuing with allocation evidence");
+                serde_json::json!({"issues": []})
+            }
+        };
+        if !listed["issues"].is_array() {
+            tracing::warn!(
+                "worker-signals: missing issues array; continuing with allocation evidence"
+            );
+        }
         let mut records = Vec::new();
-        for issue in issues {
+        for issue in listed["issues"].as_array().into_iter().flatten() {
+            // Kata updates updated_at when a comment is appended. Keep
+            // missing timestamps eligible rather than silently losing data.
+            if timestamp(&issue["updated_at"]).is_some_and(|t| t < since)
+                && timestamp(&issue["metadata"]["dispatch"]["dispatched_at"])
+                    .map_or(true, |t| t < since)
+                && timestamp(&issue["metadata"]["kickoff"]["at"]).map_or(true, |t| t < since)
+            {
+                continue;
+            }
             let harness = issue["metadata"]["dispatch"]["harness"]
                 .as_str()
                 .unwrap_or("");
             if !matches!(harness, "codex" | "claude") {
                 continue;
             }
-            let Some(uid) = issue["uid"].as_str() else {
+            let Some(qualified) = issue["qualified_id"].as_str() else {
+                tracing::warn!("worker-signals: missing qualified issue reference; skipping issue");
                 continue;
             };
-            let full = kata(&self.kata_bin, &["show", uid, "--json"])?;
-            records.extend(dispatch_records(&full, since));
+            match kata(&self.kata_bin, &["show", qualified, "--json"]) {
+                Ok(full) => records.extend(dispatch_records(&full, since)),
+                Err(error) => tracing::warn!(
+                    "worker-signals: {qualified}: {error}; continuing with other evidence"
+                ),
+            }
         }
         let log_path = self.pool_dir.join("log/allocation.log");
         let seats_exist = match std::fs::read_dir(self.pool_dir.join("profiles")) {
             Ok(mut entries) => entries.any(|e| e.is_ok_and(|e| e.path().is_dir())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                tracing::warn!("worker-signals: cannot inspect pool profiles: {e}");
+                false
+            }
         };
         match std::fs::read_to_string(&log_path) {
             Ok(log) => records.extend(allocation_records(&log, &log_path, seats_exist, since)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => tracing::warn!("worker-signals: cannot read allocation log: {e}"),
         }
         records.sort_by(|a, b| a.0.session_id.cmp(&b.0.session_id));
         records.dedup_by(|a, b| a.0.session_id == b.0.session_id);
@@ -243,7 +278,15 @@ impl Reader for WorkerSignalsReader {
             .collect())
     }
     fn seat(&self, handle: &TranscriptHandle) -> Option<String> {
-        handle.channel.clone()
+        self.evidence
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.0.session_id == handle.session_id)
+            .and_then(|r| r.1.content.as_ref())
+            .and_then(|v| v.get("seat"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
 }
 
@@ -273,7 +316,10 @@ mod tests {
         let since = timestamp(&json!("2026-09-12T00:00:00Z")).unwrap();
         let records = dispatch_records(&full, since);
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].0.channel.as_deref(), Some("codex-01"));
+        assert_eq!(
+            records[0].1.content.as_ref().unwrap()["seat"].as_str(),
+            Some("codex-01")
+        );
         full["issue"]["metadata"]["kickoff"]["id"] = json!("old-dispatch");
         full["comments"][0]["created_at"] = json!("2026-09-12T23:59:59Z");
         assert!(dispatch_records(&full, since).is_empty());
@@ -285,9 +331,17 @@ mod tests {
         assert!(allocation_records(log, std::path::Path::new("log"), false, since).is_empty());
         let records = allocation_records(log, std::path::Path::new("log"), true, since);
         assert_eq!(records.len(), 1);
+        let twice = allocation_records(
+            &format!("{log}{log}"),
+            std::path::Path::new("log"),
+            true,
+            since,
+        );
+        assert_eq!(twice.len(), 1);
+        assert_eq!(twice[0].0.session_id, records[0].0.session_id);
         assert_eq!(
             records[0].0.session_id,
-            "allocation:host:2026-09-13T00:00:00Z:codex_fallback_main"
+            "allocation:host:2026-09-13:codex_fallback_main"
         );
     }
 }

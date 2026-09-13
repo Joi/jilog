@@ -12,9 +12,11 @@ The `seat` field is the sessions directory's parent name (`.codex` becomes
 
 Configure `[[reader]] type = "worker-signals"` in the jilog CLI configuration to
 read operational evidence. It uses read-only `kata list --all --status all
---meta dispatch --limit 0 --json` and `kata show <uid> --json`, including closed
-issues so completed dispatches still contribute failures. Comments are filtered
-by their own timestamp and the current dispatch start, not the issue update time.
+--meta dispatch --limit 0 --json` and `kata show <project>#<short_id> --json`, including closed
+issues so completed dispatches still contribute failures. Issue update, dispatch, and kickoff timestamps filter the candidate set before
+fetching full records. Kata updates updated_at when comments are appended.
+Comments are then filtered by their own timestamp and current dispatch start.
+Per-source failures warn and preserve other readable evidence.
 Only explicit first-line `review: fresheyes --gpt` or `--claude` commands count.
 Commands containing both provider flags do not establish which provider ran.
 
@@ -25,11 +27,17 @@ Silence alone does not establish a trust failure. Each dispatch/kind pair has
 one stable processed-session identity and follows existing P3 error filing,
 tracker deduplication, and retry behavior.
 
-Fallback evidence comes from `~/.codex-pool/log/allocation.log`: only `exec`
-rows selecting `main` while profile directories exist count. The launcher logs
+Main-usage evidence comes from `~/.codex-pool/log/allocation.log`: only `exec`
+rows selecting `main` while profile directories exist count, as requested in the
+brief. This includes normal scored main selections. The launcher calls its
+no-usable-seat path `pass`, a different condition not detected by this rule.
+Main-use rows are grouped into one signal per host/local date. The title and
+processed identity stay stable as that day gains rows; the first successful
+scan records that day. These operational diagnostics never trigger P0 alerts.
+The launcher logs
 host-local timestamps without a timezone; scan the log on its originating host.
 The log does not record dispatch IDs. Such signals explicitly use allocation
-host/timestamp identity rather than asserting an unverified dispatch link.
+host/date identity rather than asserting an unverified dispatch link.
 Profile existence is observed at scan time, not proven historically.
 
 Missing-hook detection is deferred. A missing pane file after teardown does not
@@ -42,3 +50,5 @@ reader. Updating this jilog library alone does not add Codex readers to that
 wrapper. Wiring its readers is an opsctl follow-up; no LaunchAgent is changed.
 For direct acceptance, run `jilog --config <config> review nightly` with the two
 reader entries above and an isolated digest directory and processed file.
+
+Deferred implementation: jilog#4nd2 (hook state), opsctl#2kpx (nightly wiring).

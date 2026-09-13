@@ -150,7 +150,9 @@ pub trait Reader: Send + Sync {
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError>;
 
     /// Codex profile that produced this transcript, when known.
-    fn seat(&self, _handle: &TranscriptHandle) -> Option<String> { None }
+    fn seat(&self, _handle: &TranscriptHandle) -> Option<String> {
+        None
+    }
 
     /// Optional richer event stream for health-pattern detection.
     ///

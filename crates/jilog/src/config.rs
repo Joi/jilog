@@ -71,9 +71,10 @@ pub enum ReaderConfig {
         #[serde(default)]
         exclude: Vec<String>,
     },
+    /// Recorded dispatch failures and local Codex pool allocation failures.
+    WorkerSignals,
     /// pi coding agent (pi.dev) session files
     /// (`~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl`).
-    WorkerSignals,
     Pi {
         #[serde(default)]
         path: Option<String>,
@@ -291,7 +292,9 @@ impl JilogConfig {
                     }
                     ReaderConfig::Codex { path, paths } => {
                         if let Some(paths) = paths {
-                            Box::new(CodexReader::from_roots(paths.iter().map(|p| expand_tilde(p)).collect()))
+                            Box::new(CodexReader::from_roots(
+                                paths.iter().map(|p| expand_tilde(p)).collect(),
+                            ))
                         } else if let Some(path) = path {
                             Box::new(CodexReader::new(expand_tilde(path)))
                         } else {
@@ -324,7 +327,9 @@ impl JilogConfig {
                         }
                         Box::new(reader)
                     }
-                    ReaderConfig::WorkerSignals => Box::new(jilog_review::readers::WorkerSignalsReader::default()),
+                    ReaderConfig::WorkerSignals => {
+                        Box::new(jilog_review::readers::WorkerSignalsReader::default())
+                    }
                     ReaderConfig::Pi { path } => {
                         let dir = path
                             .as_deref()
@@ -585,22 +590,27 @@ mod tests {
     }
     #[test]
     fn codex_root_overrides_and_worker_reader_parse() {
-        let config: JilogConfig = toml::from_str(r#"
+        let config: JilogConfig = toml::from_str(
+            r#"
 [[reader]]
 type = "codex"
 paths = []
 [[reader]]
 type = "worker-signals"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let readers = config.into_readers();
         assert_eq!(readers.len(), 2);
         assert!(readers[0].discover(chrono::Utc::now()).unwrap().is_empty());
         assert_eq!(readers[1].name(), "worker-signals");
-        let config: JilogConfig = toml::from_str(r#"[[reader]]
+        let config: JilogConfig = toml::from_str(
+            r#"[[reader]]
 type = "codex"
 path = "/missing/sessions"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert_eq!(config.into_readers()[0].name(), "codex");
     }
-
 }

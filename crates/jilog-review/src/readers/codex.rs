@@ -54,7 +54,14 @@ impl CodexReader {
             match std::fs::read_dir(pool) {
                 Ok(entries) => {
                     for entry in entries {
-                        let sessions = entry?.path().join("sessions");
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                tracing::warn!("codex: profile entry: {error}");
+                                continue;
+                            }
+                        };
+                        let sessions = entry.path().join("sessions");
                         if sessions.is_dir() {
                             roots.push(sessions);
                         }
@@ -98,7 +105,17 @@ impl Reader for CodexReader {
             };
 
             for entry in entries.flatten() {
-                if entry.is_dir() || !seen.insert(std::fs::canonicalize(&entry)?) {
+                if entry.is_dir() {
+                    continue;
+                }
+                let canonical = match std::fs::canonicalize(&entry) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::warn!("codex: {}: {error}", entry.display());
+                        continue;
+                    }
+                };
+                if !seen.insert(canonical) {
                     continue;
                 }
 

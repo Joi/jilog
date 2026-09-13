@@ -357,11 +357,21 @@ pub fn run_review(
             let mut patterns = detect_health_patterns(&events, &handle.session_id);
 
             let seat = reader.seat(&handle);
-            for signal in &mut corrections { signal.seat.clone_from(&seat); }
-            for signal in &mut errors { signal.seat.clone_from(&seat); }
-            for signal in &mut workarounds { signal.seat.clone_from(&seat); }
-            for signal in &mut deferrals { signal.seat.clone_from(&seat); }
-            for signal in &mut patterns { signal.seat.clone_from(&seat); }
+            for signal in &mut corrections {
+                signal.seat.clone_from(&seat);
+            }
+            for signal in &mut errors {
+                signal.seat.clone_from(&seat);
+            }
+            for signal in &mut workarounds {
+                signal.seat.clone_from(&seat);
+            }
+            for signal in &mut deferrals {
+                signal.seat.clone_from(&seat);
+            }
+            for signal in &mut patterns {
+                signal.seat.clone_from(&seat);
+            }
 
             // Stamp fleet dimensions onto this session's signals and fold
             // counts into the persona rollup.
@@ -919,14 +929,19 @@ pub fn write_digest(
 /// Fleet-dimension bullet prefix: `` `persona@channel` `` (with trailing
 /// space) when the signal carries a persona, empty otherwise — so
 /// coding-session lines stay byte-identical to the pre-dims format.
-fn dims_prefix(persona: &Option<String>, channel: &Option<String>, seat: &Option<String>) -> String {
-    if let Some(seat) = seat {
-        return format!("`seat:{}` ", seat.replace(['`', '\n', '\r'], " "));
-    }
-    match persona_key(persona, channel) {
+fn dims_prefix(
+    persona: &Option<String>,
+    channel: &Option<String>,
+    seat: &Option<String>,
+) -> String {
+    let mut prefix = match persona_key(persona, channel) {
         Some(key) => format!("`{}` ", key),
         None => String::new(),
+    };
+    if let Some(seat) = seat {
+        prefix.push_str(&format!("`seat:{}` ", sanitize_display(seat)));
     }
+    prefix
 }
 
 /// Build the `(→ backend#N)` annotation suffix for a digest bullet line.
@@ -2282,5 +2297,16 @@ mod tests {
             digest
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn seat_prefix_preserves_fleet_dimensions_and_sanitizes() {
+        assert_eq!(
+            dims_prefix(
+                &Some("bot".into()),
+                &Some("chat".into()),
+                &Some("seat`\t\n01".into())
+            ),
+            "`bot@chat` `seat:seat'  01` "
+        );
     }
 }
