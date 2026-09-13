@@ -374,12 +374,13 @@ esac
     }
     fs::write(
         seat.join("config.toml"),
-        "[hooks.state.\"h:session_start:0:0\"]\ntrusted_hash = \"sha256:a\"\n",
+        "[hooks.state.\"/h.json:session_start:0:0\"]\ntrusted_hash = \"sha256:a\"\n",
     )
     .unwrap();
     let rollout = [
         json!({"timestamp":"2026-09-13T00:00:30Z","type":"session_meta",
-               "payload":{"cwd": worktree, "timestamp":"2026-09-13T00:00:30Z"}})
+               "payload":{"session_id":"s1","cwd": worktree,
+                          "timestamp":"2026-09-13T00:00:30Z"}})
         .to_string(),
         json!({"timestamp":"2026-09-13T00:01:00Z","type":"response_item","payload":{
                "type":"message","role":"assistant",
@@ -389,10 +390,34 @@ esac
     .join("\n");
     fs::write(day.join("rollout-2026-09-13T00-00-30-s1.jsonl"), rollout).unwrap();
 
-    let issue = json!({"uid":"issue-uid", "qualified_id":"jilog#4nd2", "metadata": {
+    // A real tmux pane sitting in the worktree, on its own server, so the
+    // reader's own liveness probe runs instead of a stub.
+    let socket = format!("jilog-test-{}", std::process::id());
+    let tmux = |args: &[&str]| {
+        let mut command = std::process::Command::new("tmux");
+        command.args(["-L", &socket]).args(args).output()
+    };
+    if tmux(&["new-session", "-d", "-c", &worktree.to_string_lossy(), "sh"]).is_err() {
+        eprintln!("skipping: tmux unavailable");
+        return;
+    }
+    let pane = String::from_utf8(
+        tmux(&["display-message", "-p", "-t", "0", "#{pane_id}"])
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert!(pane.starts_with('%'), "tmux pane id: {pane}");
+    let hook_file = format!("jilog-4nd2-{socket}-{}.json", pane.trim_start_matches('%'));
+
+    let issue = json!({"uid":"issue-uid", "qualified_id":"jilog#4nd2", "status":"open", "metadata": {
         "dispatch":{"id":"dispatch-1","harness":"codex","seat":"codex-01","host":"macazbd",
-            "pane":"%542","tmux_socket":"default","worktree": worktree,
-            "dispatched_at":"2026-09-13T00:00:00Z"}
+            "pane": pane, "tmux_socket": socket, "worktree": worktree,
+            "dispatched_at":"2026-09-13T00:00:00Z"},
+        "kickoff":{"id":"dispatch-1","state":"accepted","session_observed":"s1",
+            "at":"2026-09-13T00:00:20Z"}
     }});
     fs::write(
         dir.path().join("list.json"),
@@ -432,9 +457,22 @@ esac
     assert_eq!(report.errors[0].seat.as_deref(), Some("codex-01"));
 
     // The hook's own file, once present, retires the finding.
-    fs::write(state_dir.join("jilog-4nd2-default-542.json"), "{}").unwrap();
-    assert!(run_review(&readers, &NoneTracker, &args("processed-2"))
+    fs::write(state_dir.join(&hook_file), "{}").unwrap();
+    let retired = run_review(&readers, &NoneTracker, &args("processed-2"))
         .unwrap()
         .errors
-        .is_empty());
+        .is_empty();
+
+    // …and so does a pane that is gone, with the file removed again.
+    fs::remove_file(state_dir.join(&hook_file)).unwrap();
+    let _ = tmux(&["kill-server"]);
+    let dead = run_review(&readers, &NoneTracker, &args("processed-3"))
+        .unwrap()
+        .errors
+        .is_empty();
+    assert!(
+        retired,
+        "an existing hook state file must retire the finding"
+    );
+    assert!(dead, "a pane that is gone leaves no identity to confirm");
 }

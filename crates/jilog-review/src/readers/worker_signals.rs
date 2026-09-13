@@ -256,10 +256,12 @@ fn sanitize(value: &str) -> String {
         .collect()
 }
 
-/// The pane number the hook writes: a tmux pane id without its `%`.
+/// The pane number the hook writes: a tmux pane id without its `%`. Anything
+/// that is not a run of digits is not a pane — kata-dispatch writes the
+/// literal `-` as a placeholder in a phase-1 record that never got a pane.
 fn pane_number(pane: &str) -> Option<String> {
-    let number = sanitize(pane.strip_prefix('%').unwrap_or(pane));
-    (!number.is_empty()).then_some(number)
+    let number = pane.strip_prefix('%').unwrap_or(pane);
+    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then(|| number.to_owned())
 }
 
 /// Hook state file names for one pane identity. The hook dual-writes the
@@ -283,13 +285,23 @@ fn ended_marker_present(names: &[String], files: &BTreeSet<String>) -> bool {
     })
 }
 
-/// A codex seat trusts its hooks once the harness has stored a hash for them.
-/// Without a stored hash the pane stops at the hook-review dialog and writes
-/// nothing, which is a different, already-visible condition.
+/// Whether the seat has trusted the SessionStart hooks — the group the
+/// dispatch-state hook belongs to. Trust is stored per hook entry under
+/// `[hooks.state."<hooks.json>:<event>:<i>:<j>"]`, so a hash for some other
+/// event says nothing: only a `trusted_hash` under a `session_start` key
+/// counts. Untrusted hooks stop the pane at the hook-review dialog, a
+/// different and already-visible condition.
 fn codex_hooks_trusted(config_toml: &str) -> bool {
-    config_toml
-        .lines()
-        .any(|line| line.trim_start().starts_with("trusted_hash"))
+    let mut session_start = false;
+    for line in config_toml.lines().map(str::trim) {
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            session_start =
+                header.starts_with("hooks.state.") && header.contains(":session_start:");
+        } else if session_start && line.starts_with("trusted_hash") {
+            return true;
+        }
+    }
+    false
 }
 
 /// The newest dispatch recorded for each `(host, socket, pane)` identity,
@@ -324,11 +336,16 @@ fn newest_pane_dispatches(
     newest
 }
 
-/// One Codex rollout: where it ran and when it started.
+/// One Codex rollout: which session it is, where it ran, when it started, and
+/// how it was launched.
 struct Rollout {
     path: PathBuf,
+    session_id: Option<String>,
     cwd: String,
     started: DateTime<Utc>,
+    /// `session_meta.payload.originator`; `codex_exec` marks a non-interactive
+    /// run (a review pass, a scripted call) that never carries dispatch markers.
+    originator: Option<String>,
 }
 
 /// The first line of a rollout is its `session_meta`, carrying the working
@@ -341,13 +358,18 @@ fn rollout_meta(path: &Path) -> Option<Rollout> {
     if value["type"].as_str() != Some("session_meta") {
         return None;
     }
-    let cwd = value["payload"]["cwd"].as_str()?.to_owned();
-    let started =
-        timestamp(&value["payload"]["timestamp"]).or_else(|| timestamp(&value["timestamp"]))?;
+    let payload = &value["payload"];
+    let cwd = payload["cwd"].as_str()?.to_owned();
+    let started = timestamp(&payload["timestamp"]).or_else(|| timestamp(&value["timestamp"]))?;
     Some(Rollout {
         path: path.to_owned(),
+        session_id: payload["session_id"]
+            .as_str()
+            .or_else(|| payload["id"].as_str())
+            .map(str::to_owned),
         cwd,
         started,
+        originator: payload["originator"].as_str().map(str::to_owned),
     })
 }
 
@@ -424,12 +446,41 @@ struct HookEvidence<'a> {
     rollouts: &'a BTreeMap<String, Vec<Rollout>>,
     /// Whether the dispatch's codex seat has trusted its hooks.
     hooks_trusted: bool,
+    /// Live probes, run only for a candidate that has passed every other
+    /// condition. Both touch the world, so neither runs per issue.
+    probe: &'a dyn HookProbe,
 }
 
-/// The missing-hook-state record for one issue. `reference` is the
-/// project-qualified id kata-dispatch was invoked with — the hook derives its
-/// filename slug from it, and `kata show` does not echo it back. The record is
-/// produced only when every identity condition holds. Any unconfirmed condition returns `None` — silence is the correct
+/// The two checks that must be made against the world as it is now, not
+/// against the snapshot the scan opened with.
+trait HookProbe {
+    /// The pane's current directory on the recorded tmux server — the liveness
+    /// watcher's own probe. `None` when the pane is gone or tmux cannot answer.
+    fn pane_cwd(&self, socket: &str, pane: &str) -> Option<String>;
+    /// Whether any of these hook state files, or a terminal marker for one,
+    /// exists right now. A scan that opened before the pane's SessionStart
+    /// would otherwise file a finding the hook has since disproved.
+    fn state_present(&self, names: &[String]) -> bool;
+}
+
+/// Two paths name the same directory when they resolve to the same file. tmux
+/// reports the kernel-physical path while kata records the as-written one, so
+/// a symlinked component must not read as "the pane left the worktree".
+fn same_directory(left: &str, right: &str) -> bool {
+    match (
+        std::fs::canonicalize(left).ok(),
+        std::fs::canonicalize(right).ok(),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+/// The missing-hook-state record for one issue. `reference` is the canonical
+/// `project#id` — what kata-dispatch qualifies a bare ref to before exporting
+/// `KATA_DISPATCH_REF`, what the hook slugs its filename from, and what
+/// `kata list` reports as `qualified_id`; `kata show` does not echo it back.
+/// The record is produced only when every identity condition holds. Any unconfirmed condition returns `None` — silence is the correct
 /// answer for evidence this reader cannot establish.
 fn missing_hook_state_record(
     full: &Value,
@@ -440,6 +491,12 @@ fn missing_hook_state_record(
     let issue = &full["issue"];
     let dispatch = &issue["metadata"]["dispatch"];
     if dispatch["harness"].as_str() != Some("codex") {
+        return None;
+    }
+    // A closed issue is a finished dispatch, and the liveness watcher removes
+    // the hook state file and every marker on its clean disarm — so absence
+    // there is the normal end of a dispatch that worked, not a hook failure.
+    if issue["status"].as_str() != Some("open") {
         return None;
     }
     let id = dispatch["id"].as_str()?;
@@ -473,28 +530,52 @@ fn missing_hook_state_record(
     if !evidence.hooks_trusted {
         return None;
     }
-    // The worker must have actually run: a rollout in the dispatch worktree,
-    // started at or after the dispatch, with a first assistant turn.
-    let at = evidence
-        .rollouts
-        .get(worktree)?
-        .iter()
-        .filter(|r| r.started >= start)
+    // The worker must have actually run. Prefer the session kata-dispatch
+    // bound at kickoff: a rescue, a `codex resume`, or a review pass in the
+    // same worktree is a different session and says nothing about this pane.
+    let kickoff = &issue["metadata"]["kickoff"];
+    let bound = (kickoff["id"].as_str() == Some(id))
+        .then(|| kickoff["session_observed"].as_str())
+        .flatten()
+        .filter(|s| *s != "-");
+    let candidates = evidence.rollouts.get(worktree)?.iter().filter(|r| {
+        match bound {
+            // Without a bound session, only an interactive rollout can be this
+            // pane: `codex exec` never carries the dispatch markers.
+            None => r.started >= start && r.originator.as_deref() != Some("codex_exec"),
+            Some(session) => r.session_id.as_deref() == Some(session),
+        }
+    });
+    let (at, rollout) = candidates
         .filter_map(|r| first_assistant_turn(&r.path).map(|at| (at, &r.path)))
         .filter(|(at, _)| *at >= start)
-        .min_by(|a, b| a.0.cmp(&b.0));
-    let (at, rollout) = at?;
+        .min_by(|a, b| a.0.cmp(&b.0))?;
     if at < since {
+        return None;
+    }
+    // Last, because it spawns a process: the pane must still be sitting in the
+    // dispatch worktree. A pane that is gone leaves no live identity to
+    // confirm, and its silence has explanations this reader cannot rule out.
+    if !evidence
+        .probe
+        .pane_cwd(socket, &pane)
+        .is_some_and(|cwd| same_directory(&cwd, worktree))
+    {
+        return None;
+    }
+    // The snapshot this scan opened with may predate the pane's SessionStart.
+    if evidence.probe.state_present(&names) {
         return None;
     }
     Some(record(
         id,
         "codex_missing_hook_state",
         &format!(
-            "no kata-dispatch hook state for pane %{pane} on {} (socket {socket}) after the first assistant turn at {}; expected {}; rollout {}",
+            "no kata-dispatch hook state for live pane %{pane} on {} (socket {socket}) after the first assistant turn at {}; expected {}; session {}; rollout {}",
             evidence.host,
             at.to_rfc3339(),
             names.join(" or "),
+            bound.unwrap_or("unbound"),
             rollout.display()
         ),
         at,
@@ -503,11 +584,58 @@ fn missing_hook_state_record(
     ))
 }
 
+/// The live probe: tmux for the pane, the hook state directory for the files.
+struct LiveHookProbe {
+    state_dir: PathBuf,
+}
+
+impl HookProbe for LiveHookProbe {
+    fn pane_cwd(&self, socket: &str, pane: &str) -> Option<String> {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                socket,
+                "display-message",
+                "-p",
+                "-t",
+                &format!("%{pane}"),
+                "#{pane_current_path}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cwd = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!cwd.is_empty()).then_some(cwd)
+    }
+
+    fn state_present(&self, names: &[String]) -> bool {
+        names.iter().any(|name| {
+            if self.state_dir.join(name).exists() {
+                return true;
+            }
+            let prefix = format!("{}.ended.", name.trim_end_matches(".json"));
+            std::fs::read_dir(&self.state_dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|f| f.starts_with(&prefix))
+                })
+            })
+        })
+    }
+}
+
 impl WorkerSignalsReader {
     /// Codex seat homes: the main home plus every pool profile.
     fn codex_home_for(&self, seat: Option<&str>) -> PathBuf {
         match seat {
-            Some(seat) if seat != "main" => self.pool_dir.join("profiles").join(seat),
+            // `-` is kata-dispatch's placeholder for "no pool seat": the pane
+            // runs under the main CODEX_HOME, like an absent seat.
+            Some(seat) if seat != "main" && seat != "-" => {
+                self.pool_dir.join("profiles").join(seat)
+            }
             _ => self.codex_home.clone(),
         }
     }
@@ -581,6 +709,9 @@ impl Reader for WorkerSignalsReader {
         let state_files = self.state_files();
         let mut rollouts: Option<BTreeMap<String, Vec<Rollout>>> = None;
         let mut trust: BTreeMap<String, bool> = BTreeMap::new();
+        let probe = LiveHookProbe {
+            state_dir: self.state_dir.clone(),
+        };
         for issue in listed["issues"].as_array().into_iter().flatten() {
             // Kata updates updated_at when a comment is appended. Keep
             // missing timestamps eligible rather than silently losing data.
@@ -617,6 +748,7 @@ impl Reader for WorkerSignalsReader {
                             newest_pane: &newest_pane,
                             rollouts,
                             hooks_trusted,
+                            probe: &probe,
                         };
                         records.extend(missing_hook_state_record(
                             &full, qualified, since, &evidence,
@@ -725,57 +857,85 @@ mod tests {
             "allocation:host:2026-09-13:codex_fallback_main"
         );
     }
-
-    fn hook_fixture(
-        tree: &std::path::Path,
-        started: &str,
-        assistant: Option<&str>,
-    ) -> (Value, BTreeMap<String, Vec<Rollout>>, DateTime<Utc>) {
-        let worktree = tree.join("worktree");
-        let day = tree.join(".codex/sessions/2026/09/13");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::create_dir_all(&day).unwrap();
-        let mut lines = vec![json!({
-            "timestamp": started,
-            "type": "session_meta",
-            "payload": {"session_id": "s1", "cwd": worktree, "timestamp": started}
-        })
-        .to_string()];
-        if let Some(at) = assistant {
-            lines.push(
-                json!({"timestamp": at, "type": "event_msg", "payload": {"type": "task_started"}})
-                    .to_string(),
-            );
-            lines.push(
-                json!({"timestamp": at, "type": "response_item", "payload": {
-                "type": "message", "role": "assistant",
-                "content": [{"type": "output_text", "text": "on it"}]}})
-                .to_string(),
-            );
-        }
-        std::fs::write(
-            day.join("rollout-2026-09-13T00-00-30-s1.jsonl"),
-            lines.join("\n"),
-        )
-        .unwrap();
-        let since = timestamp(&json!("2026-09-12T00:00:00Z")).unwrap();
-        let rollouts = rollout_index(&[tree.join(".codex/sessions")], since);
-        let full = json!({"issue": {"uid": "issue-uid", "qualified_id": "jilog#4nd2", "metadata": {
-            "dispatch": {"id": "dispatch-1", "harness": "codex", "seat": "codex-01",
-                "host": "macazbd", "pane": "%542", "tmux_socket": "default",
-                "worktree": worktree, "dispatched_at": "2026-09-13T00:00:00Z"}
-        }}});
-        (full, rollouts, since)
+    /// A probe with fixed answers: the pane's directory, and whether the hook
+    /// state has appeared since the scan's snapshot.
+    struct FakeProbe {
+        cwd: Option<String>,
+        present: bool,
     }
 
-    fn newest_for(full: &Value) -> BTreeMap<(String, String, String), (DateTime<Utc>, String)> {
-        newest_pane_dispatches(&json!({"issues": [full["issue"].clone()]}))
+    impl HookProbe for FakeProbe {
+        fn pane_cwd(&self, _socket: &str, _pane: &str) -> Option<String> {
+            self.cwd.clone()
+        }
+        fn state_present(&self, _names: &[String]) -> bool {
+            self.present
+        }
+    }
+
+    struct Fixture {
+        _tree: tempfile::TempDir,
+        worktree: String,
+        full: Value,
+        rollouts: BTreeMap<String, Vec<Rollout>>,
+        newest: BTreeMap<(String, String, String), (DateTime<Utc>, String)>,
+        since: DateTime<Utc>,
+    }
+
+    /// One dispatched codex pane: an open issue bound to session `s1`, whose
+    /// rollout in the worktree produced a first assistant turn.
+    fn hook_fixture(rollouts: &[(&str, &str, Option<&str>, Option<&str>)]) -> Fixture {
+        let tree = tempfile::tempdir().unwrap();
+        let worktree = tree.path().join("worktree");
+        let day = tree.path().join(".codex/sessions/2026/09/13");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        for (session, started, assistant, originator) in rollouts {
+            let mut meta = json!({"session_id": session, "cwd": worktree, "timestamp": started});
+            if let Some(originator) = originator {
+                meta["originator"] = json!(originator);
+            }
+            let mut body = vec![
+                json!({"timestamp": started, "type": "session_meta", "payload": meta}).to_string(),
+            ];
+            if let Some(at) = assistant {
+                body.push(
+                    json!({"timestamp": at, "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "on it"}]}})
+                    .to_string(),
+                );
+            }
+            std::fs::write(
+                day.join(format!("rollout-2026-09-13T00-00-30-{session}.jsonl")),
+                body.join("\n"),
+            )
+            .unwrap();
+        }
+        let full = json!({"issue": {"uid": "issue-uid", "status": "open", "metadata": {
+            "dispatch": {"id": "dispatch-1", "harness": "codex", "seat": "codex-01",
+                "host": "macazbd", "pane": "%542", "tmux_socket": "default",
+                "worktree": worktree, "dispatched_at": "2026-09-13T00:00:00Z"},
+            "kickoff": {"id": "dispatch-1", "state": "accepted",
+                "session_observed": "s1", "at": "2026-09-13T00:00:20Z"}
+        }}});
+        let since = timestamp(&json!("2026-09-12T00:00:00Z")).unwrap();
+        Fixture {
+            worktree: worktree.to_string_lossy().into_owned(),
+            rollouts: rollout_index(&[tree.path().join(".codex/sessions")], since),
+            newest: newest_pane_dispatches(&json!({"issues": [full["issue"].clone()]})),
+            full,
+            since,
+            _tree: tree,
+        }
     }
 
     #[test]
     fn hook_state_names_follow_the_socket_qualified_contract() {
         assert_eq!(pane_number("%542").as_deref(), Some("542"));
-        assert_eq!(pane_number("%").as_deref(), None);
+        for not_a_pane in ["%", "-", "%-", "%5a2", ""] {
+            assert!(pane_number(not_a_pane).is_none(), "{not_a_pane}");
+        }
         assert_eq!(
             hook_state_names("jilog#4nd2", "default", "542"),
             vec!["jilog-4nd2-default-542.json", "jilog-4nd2-542.json"]
@@ -784,109 +944,195 @@ mod tests {
             hook_state_names("jilog#4nd2", "kwt", "542"),
             vec!["jilog-4nd2-kwt-542.json"]
         );
-        assert!(codex_hooks_trusted(
-            "[hooks.state.\"x\"]\ntrusted_hash = \"sha256:a\"\n"
-        ));
-        assert!(!codex_hooks_trusted("[hooks.state]\n"));
     }
 
     #[test]
-    fn missing_hook_state_needs_a_first_assistant_turn_in_this_dispatch() {
-        let tree = tempfile::tempdir().unwrap();
-        let (full, rollouts, since) = hook_fixture(
-            tree.path(),
+    fn hook_trust_is_read_per_event_not_per_file() {
+        let session_start =
+            "[hooks.state.\"/h.json:session_start:1:0\"]\ntrusted_hash = \"sha256:a\"\n";
+        assert!(codex_hooks_trusted(session_start));
+        // A hash for another event does not trust the dispatch-state hook.
+        assert!(!codex_hooks_trusted(
+            "[hooks.state.\"/h.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:a\"\n"
+        ));
+        // A bare hash outside any hooks.state table is not trust either.
+        assert!(!codex_hooks_trusted("trusted_hash = \"sha256:a\"\n"));
+        assert!(!codex_hooks_trusted("[hooks.state]\n"));
+        assert!(codex_hooks_trusted(&format!(
+            "[hooks.state.\"/h.json:stop:0:0\"]\ntrusted_hash = \"sha256:b\"\n{session_start}"
+        )));
+    }
+
+    #[test]
+    fn missing_hook_state_reports_a_confirmed_live_pane() {
+        let f = hook_fixture(&[(
+            "s1",
             "2026-09-13T00:00:30Z",
             Some("2026-09-13T00:01:00Z"),
-        );
-        let newest = newest_for(&full);
-        let state_files = BTreeSet::new();
+            None,
+        )]);
+        let empty = BTreeSet::new();
+        let probe = FakeProbe {
+            cwd: Some(f.worktree.clone()),
+            present: false,
+        };
         let evidence = HookEvidence {
             host: "macazbd",
-            state_files: &state_files,
-            newest_pane: &newest,
-            rollouts: &rollouts,
+            state_files: &empty,
+            newest_pane: &f.newest,
+            rollouts: &f.rollouts,
             hooks_trusted: true,
+            probe: &probe,
         };
-        let (handle, message) = missing_hook_state_record(&full, "jilog#4nd2", since, &evidence)
-            .expect("confirmed identity files");
+        let (handle, message) =
+            missing_hook_state_record(&f.full, "jilog#4nd2", f.since, &evidence)
+                .expect("a live pane with a first turn and no hook state");
         assert_eq!(handle.session_id, "dispatch-1:codex_missing_hook_state");
         assert_eq!(message.name.as_deref(), Some("codex_missing_hook_state"));
         let content = message.content.as_ref().unwrap();
         assert_eq!(content["seat"].as_str(), Some("codex-01"));
         let detail = content["error"].as_str().unwrap();
-        assert!(detail.contains("jilog-4nd2-default-542.json"), "{detail}");
-        assert!(detail.contains("%542"), "{detail}");
+        for expected in ["jilog-4nd2-default-542.json", "%542", "session s1"] {
+            assert!(
+                detail.contains(expected),
+                "{expected} missing from {detail}"
+            );
+        }
         assert_eq!(
             handle.modified,
             timestamp(&json!("2026-09-13T00:01:00Z")).unwrap()
         );
+    }
 
-        // A rollout with no assistant turn proves nothing about the hook.
-        let quiet = tempfile::tempdir().unwrap();
-        let (quiet_full, quiet_rollouts, _) =
-            hook_fixture(quiet.path(), "2026-09-13T00:00:30Z", None);
-        let quiet_newest = newest_for(&quiet_full);
-        assert!(missing_hook_state_record(
-            &quiet_full,
-            "jilog#4nd2",
-            since,
-            &HookEvidence {
-                rollouts: &quiet_rollouts,
-                newest_pane: &quiet_newest,
-                ..evidence
-            }
-        )
-        .is_none());
+    #[test]
+    fn missing_hook_state_binds_the_turn_to_the_dispatched_session() {
+        let live = |f: &Fixture| FakeProbe {
+            cwd: Some(f.worktree.clone()),
+            present: false,
+        };
+        let empty = BTreeSet::new();
+        let check = |f: &Fixture, probe: &FakeProbe| {
+            missing_hook_state_record(
+                &f.full,
+                "jilog#4nd2",
+                f.since,
+                &HookEvidence {
+                    host: "macazbd",
+                    state_files: &empty,
+                    newest_pane: &f.newest,
+                    rollouts: &f.rollouts,
+                    hooks_trusted: true,
+                    probe,
+                },
+            )
+        };
+
+        // Another session in the same worktree — a rescue, a `codex resume` —
+        // is not this pane's evidence, even when it produced the only turn.
+        let other = hook_fixture(&[
+            ("s1", "2026-09-13T00:00:30Z", None, None),
+            (
+                "s9",
+                "2026-09-13T00:02:00Z",
+                Some("2026-09-13T00:03:00Z"),
+                None,
+            ),
+        ]);
+        assert!(check(&other, &live(&other)).is_none());
+
+        // The bound session's own turn is what counts, whichever rollout is
+        // newest or quietest.
+        let bound = hook_fixture(&[
+            (
+                "s1",
+                "2026-09-13T00:00:30Z",
+                Some("2026-09-13T00:01:00Z"),
+                None,
+            ),
+            (
+                "s9",
+                "2026-09-13T00:02:00Z",
+                Some("2026-09-13T00:03:00Z"),
+                None,
+            ),
+        ]);
+        let record = check(&bound, &live(&bound)).expect("the bound session produced a turn");
+        assert_eq!(
+            record.0.modified,
+            timestamp(&json!("2026-09-13T00:01:00Z")).unwrap()
+        );
+
+        // With no bound session, a non-interactive `codex exec` run in the
+        // worktree never carries dispatch markers and proves nothing.
+        let mut exec = hook_fixture(&[(
+            "s7",
+            "2026-09-13T00:00:30Z",
+            Some("2026-09-13T00:01:00Z"),
+            Some("codex_exec"),
+        )]);
+        exec.full["issue"]["metadata"]["kickoff"]["session_observed"] = json!("-");
+        assert!(check(&exec, &live(&exec)).is_none());
+
+        // A kickoff record from an earlier dispatch does not bind this one;
+        // an interactive rollout then still counts.
+        let mut stale = hook_fixture(&[(
+            "s7",
+            "2026-09-13T00:00:30Z",
+            Some("2026-09-13T00:01:00Z"),
+            None,
+        )]);
+        stale.full["issue"]["metadata"]["kickoff"]["id"] = json!("dispatch-0");
+        assert!(check(&stale, &live(&stale)).is_some());
 
         // A rollout that predates the dispatch belongs to earlier work.
-        let stale = tempfile::tempdir().unwrap();
-        let (stale_full, stale_rollouts, _) = hook_fixture(
-            stale.path(),
+        let mut early = hook_fixture(&[(
+            "s1",
             "2026-09-12T23:00:00Z",
             Some("2026-09-12T23:01:00Z"),
-        );
-        let stale_newest = newest_for(&stale_full);
-        assert!(missing_hook_state_record(
-            &stale_full,
-            "jilog#4nd2",
-            since,
-            &HookEvidence {
-                rollouts: &stale_rollouts,
-                newest_pane: &stale_newest,
-                ..evidence
-            }
-        )
-        .is_none());
+            None,
+        )]);
+        early.full["issue"]["metadata"]["dispatch"]["dispatched_at"] =
+            json!("2026-09-13T00:00:00Z");
+        assert!(check(&early, &live(&early)).is_none());
+
+        // A session that never answered proves nothing about the hook.
+        let quiet = hook_fixture(&[("s1", "2026-09-13T00:00:30Z", None, None)]);
+        assert!(check(&quiet, &live(&quiet)).is_none());
     }
 
     #[test]
     fn missing_hook_state_is_silent_without_a_confirmed_live_identity() {
-        let tree = tempfile::tempdir().unwrap();
-        let (full, rollouts, since) = hook_fixture(
-            tree.path(),
+        let f = hook_fixture(&[(
+            "s1",
             "2026-09-13T00:00:30Z",
             Some("2026-09-13T00:01:00Z"),
-        );
-        let newest = newest_for(&full);
+            None,
+        )]);
+        let live = FakeProbe {
+            cwd: Some(f.worktree.clone()),
+            present: false,
+        };
         let empty = BTreeSet::new();
         let base = HookEvidence {
             host: "macazbd",
             state_files: &empty,
-            newest_pane: &newest,
-            rollouts: &rollouts,
+            newest_pane: &f.newest,
+            rollouts: &f.rollouts,
             hooks_trusted: true,
+            probe: &live,
         };
-        assert!(missing_hook_state_record(&full, "jilog#4nd2", since, &base).is_some());
+        let check = |issue: &Value, evidence: &HookEvidence| {
+            missing_hook_state_record(issue, "jilog#4nd2", f.since, evidence)
+        };
+        assert!(check(&f.full, &base).is_some());
 
         // Valid hooks: either the socket-qualified file or its default-server
         // transition copy is proof the hook ran.
         for name in ["jilog-4nd2-default-542.json", "jilog-4nd2-542.json"] {
             let present = BTreeSet::from([name.to_string()]);
             assert!(
-                missing_hook_state_record(
-                    &full,
-                    "jilog#4nd2",
-                    since,
+                check(
+                    &f.full,
                     &HookEvidence {
                         state_files: &present,
                         ..base
@@ -897,28 +1143,62 @@ mod tests {
             );
         }
 
+        // A hook state file written after this scan's snapshot — the pane was
+        // still starting — disproves the finding before it is filed.
+        let appeared = FakeProbe {
+            cwd: Some(f.worktree.clone()),
+            present: true,
+        };
+        assert!(check(
+            &f.full,
+            &HookEvidence {
+                probe: &appeared,
+                ..base
+            }
+        )
+        .is_none());
+
         // Teardown: a terminal marker, or a worktree that is gone.
         let ended = BTreeSet::from(["jilog-4nd2-default-542.ended.s1".to_string()]);
-        assert!(missing_hook_state_record(
-            &full,
-            "jilog#4nd2",
-            since,
+        assert!(check(
+            &f.full,
             &HookEvidence {
                 state_files: &ended,
                 ..base
             }
         )
         .is_none());
-        let mut removed = full.clone();
+        let mut removed = f.full.clone();
         removed["issue"]["metadata"]["dispatch"]["worktree"] =
-            json!(tree.path().join("gone").to_string_lossy());
-        assert!(missing_hook_state_record(&removed, "jilog#4nd2", since, &base).is_none());
+            json!(format!("{}/gone", f.worktree));
+        assert!(check(&removed, &base).is_none());
+
+        // A closed issue is a finished dispatch: the liveness watcher deletes
+        // the hook state file and its markers on a clean disarm.
+        let mut closed = f.full.clone();
+        closed["issue"]["status"] = json!("closed");
+        assert!(check(&closed, &base).is_none());
+
+        // A pane that is gone, or one that has moved on to other work, leaves
+        // no live identity to confirm.
+        for cwd in [None, Some(format!("{}/..", f.worktree))] {
+            let gone = FakeProbe {
+                cwd,
+                present: false,
+            };
+            assert!(check(
+                &f.full,
+                &HookEvidence {
+                    probe: &gone,
+                    ..base
+                }
+            )
+            .is_none());
+        }
 
         // Remote dispatch: another host's state directory is not readable here.
-        assert!(missing_hook_state_record(
-            &full,
-            "jilog#4nd2",
-            since,
+        assert!(check(
+            &f.full,
             &HookEvidence {
                 host: "joimba",
                 ..base
@@ -927,15 +1207,13 @@ mod tests {
         .is_none());
 
         // Pane reuse: a later dispatch owns pane %542 now.
-        let mut later = full["issue"].clone();
+        let mut later = f.full["issue"].clone();
         later["metadata"]["dispatch"]["id"] = json!("dispatch-2");
         later["metadata"]["dispatch"]["dispatched_at"] = json!("2026-09-13T01:00:00Z");
-        let reused = newest_pane_dispatches(&json!({"issues": [full["issue"].clone(), later]}));
+        let reused = newest_pane_dispatches(&json!({"issues": [f.full["issue"].clone(), later]}));
         assert_eq!(reused.len(), 1);
-        assert!(missing_hook_state_record(
-            &full,
-            "jilog#4nd2",
-            since,
+        assert!(check(
+            &f.full,
             &HookEvidence {
                 newest_pane: &reused,
                 ..base
@@ -943,11 +1221,14 @@ mod tests {
         )
         .is_none());
 
+        // A phase-one record with no pane yet is not a pane identity.
+        let mut placeholder = f.full.clone();
+        placeholder["issue"]["metadata"]["dispatch"]["pane"] = json!("-");
+        assert!(check(&placeholder, &base).is_none());
+
         // Untrusted hooks: the pane stops at the hook-review dialog instead.
-        assert!(missing_hook_state_record(
-            &full,
-            "jilog#4nd2",
-            since,
+        assert!(check(
+            &f.full,
             &HookEvidence {
                 hooks_trusted: false,
                 ..base
@@ -956,12 +1237,32 @@ mod tests {
         .is_none());
 
         // Claude panes install hooks by a different path; out of scope here.
-        let mut claude = full.clone();
+        let mut claude = f.full.clone();
         claude["issue"]["metadata"]["dispatch"]["harness"] = json!("claude");
-        assert!(missing_hook_state_record(&claude, "jilog#4nd2", since, &base).is_none());
+        assert!(check(&claude, &base).is_none());
 
         // Evidence older than the scan window is not refiled.
         let later_since = timestamp(&json!("2026-09-13T02:00:00Z")).unwrap();
-        assert!(missing_hook_state_record(&full, "jilog#4nd2", later_since, &base).is_none());
+        assert!(missing_hook_state_record(&f.full, "jilog#4nd2", later_since, &base).is_none());
+    }
+
+    #[test]
+    fn a_dispatch_without_a_pool_seat_reads_the_main_codex_home() {
+        let reader = WorkerSignalsReader {
+            pool_dir: PathBuf::from("/pool"),
+            codex_home: PathBuf::from("/main"),
+            ..WorkerSignalsReader::default()
+        };
+        for seat in [None, Some("main"), Some("-")] {
+            assert_eq!(
+                reader.codex_home_for(seat),
+                PathBuf::from("/main"),
+                "{seat:?}"
+            );
+        }
+        assert_eq!(
+            reader.codex_home_for(Some("codex-01")),
+            PathBuf::from("/pool/profiles/codex-01")
+        );
     }
 }

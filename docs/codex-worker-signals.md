@@ -21,7 +21,8 @@ Only explicit first-line `review: fresheyes --gpt` or `--claude` commands count.
 Commands containing both provider flags do not establish which provider ran.
 
 The distinct error tool names are `codex_trust_prompt`, `same_model_review`,
-`codex_fallback_main`, and `codex_missing_hook_state`. The first two preserve the dispatch ID. Trust failures
+`codex_fallback_main`, and `codex_missing_hook_state`. Every kind except
+`codex_fallback_main` preserves the dispatch ID. Trust failures
 require a matching kickoff ID, failed state, and `dialog:dir-trust:` detail.
 Silence alone does not establish a trust failure. Each dispatch/kind pair has
 one stable processed-session identity and follows existing P3 error filing,
@@ -47,23 +48,43 @@ kind is emitted only when every identity condition is confirmed on the scanning
 host:
 
 - the dispatch harness is `codex` and its recorded `host` is this machine;
+- the issue is still open. A closed issue is a finished dispatch, and the
+  liveness watcher deletes the hook state file, its `.ended.*` markers, and the
+  default-server copy on every clean disarm — so their absence there is the
+  normal end of a dispatch that worked;
 - the recorded `(host, tmux_socket, pane)` still belongs to this dispatch id —
-  a later dispatch on the same pane number means the pane was reused;
+  a later dispatch on the same pane number means the pane was reused. A pane
+  that is not `%<digits>` is kata-dispatch's phase-one placeholder, not a pane;
 - neither socket-qualified name nor, on the default server, the transition copy
   (`<ref-slug>-<socket>-<pane#>.json`, `<ref-slug>-<pane#>.json`) exists;
 - no terminal marker (`<stem>.ended.<session>`) exists and the recorded worktree
   is still present — either marks teardown;
-- the seat's Codex `config.toml` records a `trusted_hash`; untrusted hooks stop
-  the pane at the hook-review dialog, a separate visible condition;
-- a rollout in the dispatch worktree, started at or after the dispatch, contains
-  a first assistant turn. That turn's timestamp is the signal's time.
+- the seat's Codex `config.toml` records a `trusted_hash` under a
+  `session_start` hook entry, the group the dispatch-state hook belongs to. A
+  hash for another event is not that trust, and untrusted hooks stop the pane
+  at the hook-review dialog, a separate visible condition. `seat: "-"`, the
+  placeholder for a dispatch with no pool profile, reads the main Codex home;
+- the session kata-dispatch bound at kickoff (`metadata.kickoff.session_observed`,
+  when the kickoff belongs to this dispatch) produced a first assistant turn.
+  With no bound session, an interactive rollout in the worktree started at or
+  after the dispatch counts, but a `codex exec` one never does: it carries no
+  dispatch markers. A rescue or `codex resume` in the same worktree is a
+  different session and is not this pane's evidence. The turn's timestamp is
+  the signal's time;
+- the pane is still sitting in the dispatch worktree, by the liveness watcher's
+  own probe (`tmux -L <socket> display-message -p -t %<pane>
+  '#{pane_current_path}'`), and no hook state file has appeared since the scan
+  opened. Both are checked last, against the world as it is, because both cost
+  a syscall or a process and both can retire a finding the snapshot supported.
 
 The hook state directory defaults to `KATA_DISPATCH_STATE_DIR`, else
 `~/.local/state/kata-dispatch`; an unreadable directory or an unreadable
 hostname skips the kind rather than guessing. Rollouts are read from
 `<codex_home>/sessions` and every pool profile's `sessions`, first line first,
 and only for files modified inside the scan window. Identity is the dispatch id,
-like the other dispatch kinds.
+like the other dispatch kinds. A pane that has died without writing hook state
+is deliberately not reported: the kata asks for a confirmed LIVE identity, and
+a dead pane's silence has explanations this reader cannot rule out.
 
 The inspected opsctl `review nightly` wrapper constructs only an Amplifier
 reader. Updating this jilog library alone does not add Codex readers to that
