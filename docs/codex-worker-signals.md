@@ -59,11 +59,15 @@ host:
   (`<ref-slug>-<socket>-<pane#>.json`, `<ref-slug>-<pane#>.json`) exists;
 - no terminal marker (`<stem>.ended.<session>`) exists and the recorded worktree
   is still present — either marks teardown;
-- the seat's Codex `config.toml` records a `trusted_hash` under a
-  `session_start` hook entry, the group the dispatch-state hook belongs to. A
-  hash for another event is not that trust, and untrusted hooks stop the pane
-  at the hook-review dialog, a separate visible condition. `seat: "-"`, the
-  placeholder for a dispatch with no pool profile, reads the main Codex home;
+- the seat has trusted the dispatch-state hook itself. Its `hooks.json` is
+  resolved, the SessionStart entry whose command is exactly
+  `<python…> <runner> dispatch-state` is located, and the seat's `config.toml`
+  must carry a non-empty `trusted_hash` under that exact
+  `[hooks.state."<resolved hooks.json>:session_start:<group>:<hook>"]` key —
+  the shape `codex-parity-check` checks. The sibling `startup` hook's trust is
+  not this hook's trust; untrusted hooks stop the pane at the hook-review
+  dialog, a separate visible condition. `seat: "-"`, the placeholder for a
+  dispatch with no pool profile, reads the main Codex home;
 - the session kata-dispatch bound at kickoff (`metadata.kickoff.session_observed`,
   when the kickoff belongs to this dispatch) produced a first assistant turn.
   With no bound session, an interactive rollout in the worktree started at or
@@ -72,10 +76,16 @@ host:
   different session and is not this pane's evidence. The turn's timestamp is
   the signal's time;
 - the pane is still sitting in the dispatch worktree, by the liveness watcher's
-  own probe (`tmux -L <socket> display-message -p -t %<pane>
-  '#{pane_current_path}'`), and no hook state file has appeared since the scan
-  opened. Both are checked last, against the world as it is, because both cost
-  a syscall or a process and both can retire a finding the snapshot supported.
+  own probe (`tmux -L <socket> display-message -p -t %<pane>`), reading
+  `#{pane_dead}` alongside `#{pane_current_path}` so a pane kept by
+  `remain-on-exit` does not read as live. The probe is bounded at 15 seconds:
+  an unattended nightly must not be held open by an unresponsive tmux server,
+  and a timeout reads as "could not confirm". Directories are compared
+  resolved, so a symlinked component is not "the pane left the worktree";
+- no hook state file has appeared since the scan opened. Both live checks run
+  last, against the world as it is, because both cost a process or a syscall
+  and both can retire a finding the snapshot supported. A hook state directory
+  that cannot be read at this point counts as present, not absent.
 
 The hook state directory defaults to `KATA_DISPATCH_STATE_DIR`, else
 `~/.local/state/kata-dispatch`; an unreadable directory or an unreadable
@@ -84,7 +94,13 @@ hostname skips the kind rather than guessing. Rollouts are read from
 and only for files modified inside the scan window. Identity is the dispatch id,
 like the other dispatch kinds. A pane that has died without writing hook state
 is deliberately not reported: the kata asks for a confirmed LIVE identity, and
-a dead pane's silence has explanations this reader cannot rule out.
+a dead pane's silence has explanations this reader cannot rule out. The probe
+confirms the pane, not the process inside it: `codex-parity-check` and the
+liveness watcher go further and check the pane's foreground process, which this
+reader does not. Nor is an existing state file parsed — any file or marker under
+an expected name suppresses the kind, which can hide a worker whose file is
+stale or malformed. Both are deliberate: this rule only ever chooses between
+filing and silence, and silence is the safe answer.
 
 The inspected opsctl `review nightly` wrapper constructs only an Amplifier
 reader. Updating this jilog library alone does not add Codex readers to that

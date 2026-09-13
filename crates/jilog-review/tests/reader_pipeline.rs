@@ -372,9 +372,22 @@ esac
     for path in [&worktree, &state_dir, &day] {
         fs::create_dir_all(path).unwrap();
     }
+    // The seat's own hooks.json and the trust entry for its dispatch-state
+    // hook, keyed the way Codex stores it.
+    let hooks_json = seat.join("hooks.json");
+    fs::write(
+        &hooks_json,
+        json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+            "command": "/opt/homebrew/bin/python3 /runner/hooks.py dispatch-state"}]}]}})
+        .to_string(),
+    )
+    .unwrap();
     fs::write(
         seat.join("config.toml"),
-        "[hooks.state.\"/h.json:session_start:0:0\"]\ntrusted_hash = \"sha256:a\"\n",
+        format!(
+            "[hooks.state.\"{}:session_start:0:0\"]\ntrusted_hash = \"sha256:a\"\n",
+            fs::canonicalize(&hooks_json).unwrap().display()
+        ),
     )
     .unwrap();
     let rollout = [

@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 pub struct WorkerSignalsReader {
@@ -260,7 +261,7 @@ fn sanitize(value: &str) -> String {
 /// that is not a run of digits is not a pane — kata-dispatch writes the
 /// literal `-` as a placeholder in a phase-1 record that never got a pane.
 fn pane_number(pane: &str) -> Option<String> {
-    let number = pane.strip_prefix('%').unwrap_or(pane);
+    let number = pane.strip_prefix('%')?;
     (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then(|| number.to_owned())
 }
 
@@ -285,23 +286,55 @@ fn ended_marker_present(names: &[String], files: &BTreeSet<String>) -> bool {
     })
 }
 
-/// Whether the seat has trusted the SessionStart hooks — the group the
-/// dispatch-state hook belongs to. Trust is stored per hook entry under
-/// `[hooks.state."<hooks.json>:<event>:<i>:<j>"]`, so a hash for some other
-/// event says nothing: only a `trusted_hash` under a `session_start` key
-/// counts. Untrusted hooks stop the pane at the hook-review dialog, a
-/// different and already-visible condition.
-fn codex_hooks_trusted(config_toml: &str) -> bool {
-    let mut session_start = false;
-    for line in config_toml.lines().map(str::trim) {
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            session_start =
-                header.starts_with("hooks.state.") && header.contains(":session_start:");
-        } else if session_start && line.starts_with("trusted_hash") {
-            return true;
+/// The `[hooks.state]` key Codex stores trust under for the dispatch-state
+/// SessionStart hook: `<resolved hooks.json>:session_start:<group>:<hook>`.
+/// The command must be exactly `<python…> <runner> dispatch-state`, the way
+/// the installer writes it — `codex-parity-check` matches the same shape, and
+/// a substring match would accept an impostor that never runs the bridge.
+fn dispatch_state_trust_key(hooks_json: &Path) -> Option<String> {
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(hooks_json).ok()?).ok()?;
+    let resolved = std::fs::canonicalize(hooks_json).unwrap_or_else(|_| hooks_json.to_owned());
+    for (group, entry) in doc["hooks"]["SessionStart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (index, hook) in entry["hooks"].as_array().into_iter().flatten().enumerate() {
+            if hook["type"].as_str() != Some("command") {
+                continue;
+            }
+            let argv: Vec<_> = hook["command"].as_str()?.split_whitespace().collect();
+            let python = argv
+                .first()
+                .and_then(|a| Path::new(a).file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python"));
+            if argv.len() == 3 && argv[2] == "dispatch-state" && python {
+                return Some(format!(
+                    "{}:session_start:{group}:{index}",
+                    resolved.display()
+                ));
+            }
         }
     }
-    false
+    None
+}
+
+/// Whether this seat has trusted the dispatch-state hook itself. Trust is
+/// stored per hook entry, so a hash for the sibling `startup` hook — or for
+/// any other event — is not this hook's trust, and Codex would still stop the
+/// pane at the hook-review dialog, a different and already-visible condition.
+fn codex_hooks_trusted(config_toml: &str, key: &str) -> bool {
+    let Ok(doc) = config_toml.parse::<toml::Value>() else {
+        return false;
+    };
+    doc.get("hooks")
+        .and_then(|h| h.get("state"))
+        .and_then(|s| s.get(key))
+        .and_then(|entry| entry.get("trusted_hash"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|hash| !hash.is_empty())
 }
 
 /// The newest dispatch recorded for each `(host, socket, pane)` identity,
@@ -430,7 +463,10 @@ fn rollout_index(roots: &[PathBuf], since: DateTime<Utc>) -> BTreeMap<String, Ve
                 continue;
             }
             if let Some(rollout) = rollout_meta(&entry) {
-                index.entry(rollout.cwd.clone()).or_default().push(rollout);
+                index
+                    .entry(canonical_key(&rollout.cwd))
+                    .or_default()
+                    .push(rollout);
             }
         }
     }
@@ -461,6 +497,14 @@ trait HookProbe {
     /// exists right now. A scan that opened before the pane's SessionStart
     /// would otherwise file a finding the hook has since disproved.
     fn state_present(&self, names: &[String]) -> bool;
+}
+
+/// The index key for a working directory: its resolved path where that can be
+/// read, so a symlinked component cannot spell the same directory two ways.
+fn canonical_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_owned())
 }
 
 /// Two paths name the same directory when they resolve to the same file. tmux
@@ -538,14 +582,18 @@ fn missing_hook_state_record(
         .then(|| kickoff["session_observed"].as_str())
         .flatten()
         .filter(|s| *s != "-");
-    let candidates = evidence.rollouts.get(worktree)?.iter().filter(|r| {
-        match bound {
-            // Without a bound session, only an interactive rollout can be this
-            // pane: `codex exec` never carries the dispatch markers.
-            None => r.started >= start && r.originator.as_deref() != Some("codex_exec"),
-            Some(session) => r.session_id.as_deref() == Some(session),
-        }
-    });
+    let candidates = evidence
+        .rollouts
+        .get(&canonical_key(worktree))?
+        .iter()
+        .filter(|r| {
+            match bound {
+                // Without a bound session, only an interactive rollout can be this
+                // pane: `codex exec` never carries the dispatch markers.
+                None => r.started >= start && r.originator.as_deref() != Some("codex_exec"),
+                Some(session) => r.session_id.as_deref() == Some(session),
+            }
+        });
     let (at, rollout) = candidates
         .filter_map(|r| first_assistant_turn(&r.path).map(|at| (at, &r.path)))
         .filter(|(at, _)| *at >= start)
@@ -584,6 +632,31 @@ fn missing_hook_state_record(
     ))
 }
 
+/// Run a command, killing it if it outlives `limit`. An unattended nightly
+/// must not be held open by an unresponsive tmux server; a timeout reads as
+/// "could not confirm", which suppresses the kind.
+fn run_bounded(mut command: Command, limit: Duration) -> Option<std::process::Output> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!("worker-signals: pane probe timed out after {limit:?}");
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// The live probe: tmux for the pane, the hook state directory for the files.
 struct LiveHookProbe {
     state_dir: PathBuf,
@@ -591,38 +664,50 @@ struct LiveHookProbe {
 
 impl HookProbe for LiveHookProbe {
     fn pane_cwd(&self, socket: &str, pane: &str) -> Option<String> {
-        let output = Command::new("tmux")
-            .args([
-                "-L",
-                socket,
-                "display-message",
-                "-p",
-                "-t",
-                &format!("%{pane}"),
-                "#{pane_current_path}",
-            ])
-            .output()
-            .ok()?;
+        let mut command = Command::new("tmux");
+        command.args([
+            "-L",
+            socket,
+            "display-message",
+            "-p",
+            "-t",
+            &format!("%{pane}"),
+            // A pane kept by remain-on-exit still answers with its last
+            // directory, so ask whether it is dead in the same breath.
+            "#{pane_dead}\n#{pane_current_path}",
+        ]);
+        let output = run_bounded(command, Duration::from_secs(15))?;
         if !output.status.success() {
             return None;
         }
-        let cwd = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines();
+        if lines.next()?.trim() != "0" {
+            return None;
+        }
+        let cwd = lines.next()?.trim().to_owned();
         (!cwd.is_empty()).then_some(cwd)
     }
 
     fn state_present(&self, names: &[String]) -> bool {
-        names.iter().any(|name| {
-            if self.state_dir.join(name).exists() {
-                return true;
+        // A directory this pass cannot read is "unknown", and unknown
+        // suppresses: the documented rule is that unreadable hook state never
+        // produces a finding.
+        let Ok(entries) = std::fs::read_dir(&self.state_dir) else {
+            return true;
+        };
+        let mut present = BTreeSet::new();
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            if let Some(name) = entry.file_name().to_str() {
+                present.insert(name.to_owned());
             }
-            let prefix = format!("{}.ended.", name.trim_end_matches(".json"));
-            std::fs::read_dir(&self.state_dir).is_ok_and(|entries| {
-                entries.flatten().any(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|f| f.starts_with(&prefix))
-                })
-            })
+        }
+        names.iter().any(|name| {
+            present.contains(name) || {
+                let prefix = format!("{}.ended.", name.trim_end_matches(".json"));
+                present.iter().any(|f| f.starts_with(&prefix))
+            }
         })
     }
 }
@@ -652,12 +737,15 @@ impl WorkerSignalsReader {
         roots
     }
 
-    /// Whether the seat's Codex config records a trusted hook hash. An
-    /// unreadable config reads as untrusted, which suppresses the kind.
+    /// Whether the seat has trusted its dispatch-state hook. An unreadable
+    /// config or hooks.json reads as untrusted, which suppresses the kind.
     fn hooks_trusted(&self, seat: Option<&str>) -> bool {
-        std::fs::read_to_string(self.codex_home_for(seat).join("config.toml"))
-            .map(|c| codex_hooks_trusted(&c))
-            .unwrap_or(false)
+        let home = self.codex_home_for(seat);
+        let Some(key) = dispatch_state_trust_key(&home.join("hooks.json")) else {
+            return false;
+        };
+        std::fs::read_to_string(home.join("config.toml"))
+            .is_ok_and(|config| codex_hooks_trusted(&config, &key))
     }
 
     /// File names in the hook state directory. `None` when the directory
@@ -947,20 +1035,55 @@ mod tests {
     }
 
     #[test]
-    fn hook_trust_is_read_per_event_not_per_file() {
-        let session_start =
-            "[hooks.state.\"/h.json:session_start:1:0\"]\ntrusted_hash = \"sha256:a\"\n";
-        assert!(codex_hooks_trusted(session_start));
-        // A hash for another event does not trust the dispatch-state hook.
+    fn hook_trust_is_read_for_the_dispatch_state_hook_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks.json");
+        std::fs::write(
+            &hooks,
+            json!({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command",
+                    "command": "/opt/homebrew/bin/python3 /runner/hooks.py startup"}]},
+                {"hooks": [
+                    {"type": "other", "command": "noise"},
+                    {"type": "command",
+                     "command": "/opt/homebrew/bin/python3 /runner/hooks.py dispatch-state"}]}
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        let key = dispatch_state_trust_key(&hooks).expect("the dispatch-state entry");
+        assert!(key.ends_with(":session_start:1:1"), "{key}");
+        assert!(key.starts_with(&std::fs::canonicalize(&hooks).unwrap().display().to_string()));
+
+        let trusted = |k: &str| {
+            codex_hooks_trusted(
+                &format!("[hooks.state.\"{k}\"]\ntrusted_hash = \"sha256:a\"\n"),
+                &key,
+            )
+        };
+        assert!(trusted(&key));
+        // The sibling startup hook's trust is not this hook's trust, and
+        // neither is a hash for another event.
+        assert!(!trusted(&key.replace(":1:1", ":0:0")));
+        assert!(!trusted(&key.replace("session_start", "pre_tool_use")));
+        // An empty hash, a missing table, and unparseable TOML are untrusted.
         assert!(!codex_hooks_trusted(
-            "[hooks.state.\"/h.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:a\"\n"
+            &format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"\"\n"),
+            &key
         ));
-        // A bare hash outside any hooks.state table is not trust either.
-        assert!(!codex_hooks_trusted("trusted_hash = \"sha256:a\"\n"));
-        assert!(!codex_hooks_trusted("[hooks.state]\n"));
-        assert!(codex_hooks_trusted(&format!(
-            "[hooks.state.\"/h.json:stop:0:0\"]\ntrusted_hash = \"sha256:b\"\n{session_start}"
-        )));
+        assert!(!codex_hooks_trusted("trusted_hash = \"sha256:a\"\n", &key));
+        assert!(!codex_hooks_trusted("[hooks.state\n", &key));
+
+        // An impostor that only ends in the right word is not the bridge.
+        std::fs::write(
+            &hooks,
+            json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                "command": "/bin/echo /runner/hooks.py dispatch-state"}]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(dispatch_state_trust_key(&hooks).is_none());
+        assert!(dispatch_state_trust_key(&dir.path().join("absent.json")).is_none());
     }
 
     #[test]
