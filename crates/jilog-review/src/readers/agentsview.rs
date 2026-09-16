@@ -483,26 +483,32 @@ impl Reader for AgentsviewReader {
             ))?;
             let (msgs, count, last) = parse_messages_page(&v)?;
             out.extend(msgs);
-            match last {
-                Some(l) if count >= PAGE_LIMIT => {
-                    // Ordinals must advance; anything else is a protocol
-                    // failure that degrades to a warning, never a panic or
-                    // a repeated request.
-                    let next = l.checked_add(1).ok_or_else(|| {
-                        JilogReviewError::Reader("agentsview: message ordinal overflow".into())
-                    })?;
-                    if next <= from {
-                        return Err(JilogReviewError::Reader(format!(
-                            "agentsview: messages page did not advance (from {} → last_ordinal {})",
-                            from, l
-                        )));
-                    }
-                    from = next;
-                }
-                _ => break,
+            if count < PAGE_LIMIT {
+                return Ok(out);
             }
+            // A full page must carry an advancing `last_ordinal`; anything
+            // else is a protocol failure that degrades to a warning (the
+            // session is not marked processed with a partial transcript),
+            // never a panic or a repeated request.
+            let l = last.ok_or_else(|| {
+                JilogReviewError::Reader("agentsview: full messages page without last_ordinal".into())
+            })?;
+            let next = l.checked_add(1).ok_or_else(|| {
+                JilogReviewError::Reader("agentsview: message ordinal overflow".into())
+            })?;
+            if next <= from {
+                return Err(JilogReviewError::Reader(format!(
+                    "agentsview: messages page did not advance (from {} → last_ordinal {})",
+                    from, l
+                )));
+            }
+            from = next;
         }
-        Ok(out)
+        Err(JilogReviewError::Reader(format!(
+            "agentsview: session {} exceeds {} message pages; not scanned",
+            handle.session_id,
+            MAX_PAGES
+        )))
     }
 
     fn load_stats(
@@ -845,6 +851,10 @@ mod tests {
             ("/api/v1/sessions?limit=500", "{\"total\": 1}".to_string()),
             ("drift-1/messages", "{\"ok\": true}".to_string()),
             ("stuck-1/messages", "{\"count\":500,\"last_ordinal\":0,\"messages\":[]}".to_string()),
+            ("noord-1/messages", "{\"count\":500,\"messages\":[]}".to_string()),
+            // Every page claims to be full and advances: the page cap is an error.
+            ("endless-1/messages?from=0&", "{\"count\":500,\"last_ordinal\":499,\"messages\":[]}".to_string()),
+            ("endless-1/messages", "{\"count\":500,\"last_ordinal\":99999999,\"messages\":[]}".to_string()),
         ]);
         let reader = AgentsviewReader::new(&base, token_file, 7, Duration::from_secs(5)).unwrap();
         assert!(reader.discover(Utc::now()).is_err(), "a sessions page without `sessions` is an error");
@@ -861,6 +871,15 @@ mod tests {
         // instead of looping to the page cap.
         let err = reader.load(&handle("stuck-1")).unwrap_err().to_string();
         assert!(err.contains("did not advance"), "{err}");
+        // A full page without last_ordinal cannot be paged: error, not a
+        // partial transcript reported as complete.
+        let err = reader.load(&handle("noord-1")).unwrap_err().to_string();
+        assert!(err.contains("without last_ordinal"), "{err}");
+        // The second endless page repeats last_ordinal 99999999 forever, so
+        // page 3 fails to advance — either way the cap or the monotonic
+        // check ends it with an error, never Ok.
+        let err = reader.load(&handle("endless-1")).unwrap_err().to_string();
+        assert!(err.contains("did not advance") || err.contains("exceeds"), "{err}");
     }
 
     #[test]

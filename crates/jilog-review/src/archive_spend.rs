@@ -129,8 +129,14 @@ fn breakdown(
     list: &str,
     name: &str,
 ) -> Result<BTreeMap<String, Decimal>, JilogReviewError> {
+    // Schema 6 always carries both breakdown arrays (agent rows need
+    // --breakdown, model rows are unconditional): a missing array is
+    // structural drift, not "no attribution".
+    let rows = v.get(list).and_then(|b| b.as_array()).ok_or_else(|| {
+        JilogReviewError::Reader(format!("agentsview usage daily: a daily row has no `{}` array", list))
+    })?;
     let mut out = BTreeMap::new();
-    for row in v.get(list).and_then(|b| b.as_array()).into_iter().flatten() {
+    for row in rows {
         let k = row.get(name).and_then(|n| n.as_str()).ok_or_else(|| {
             JilogReviewError::Reader(format!("agentsview usage daily: a {} row has no `{}`", list, name))
         })?;
@@ -287,7 +293,9 @@ mod tests {
             "{\"schema_version\": 7, \"daily\": []}",                                                // unsupported version
             "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\"}]}",                       // no totalCost
             "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":\"1\"}}]}", // wrong type
-            "{\"schema_version\": 6, \"daily\": [{\"totalCost\":{\"microdollars\":1}}]}",           // no date
+            "{\"schema_version\": 6, \"daily\": [{\"totalCost\":{\"microdollars\":1},\"agentBreakdowns\":[],\"modelBreakdowns\":[]}]}", // no date
+            "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":1},\"modelBreakdowns\":[]}]}", // no agentBreakdowns
+            "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":1},\"agentBreakdowns\":[],\"modelBreakdowns\":5}]}", // wrong type
             "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":1},\"agentBreakdowns\":[{\"agent\":\"codex\"}]}]}", // breakdown row without cost
         ] {
             assert!(parse_daily_usage(bad).is_err(), "must reject: {bad}");

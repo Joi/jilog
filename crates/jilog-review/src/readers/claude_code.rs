@@ -114,6 +114,12 @@ impl Reader for ClaudeCodeReader {
     fn discover(&self, since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
         let mut handles = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        // Canonical-file dedupe exists for roots that overlap (an explicit
+        // root that is also a profile home, or a symlinked root). A legacy
+        // single-root configuration keeps its exact pre-0.8 discovery — a
+        // transcript reachable twice through symlinks inside that root is
+        // still scanned twice, as it always was (byte-identity lens).
+        let dedupe = self.roots.len() > 1 || !self.profile_parents.is_empty();
 
         for root in self.scan_roots()? {
             if !root.is_dir() {
@@ -139,15 +145,17 @@ impl Reader for ClaudeCodeReader {
                 }
                 // One canonical file is scanned once even when two roots
                 // reach it (an explicit symlink root plus its profile copy).
-                let canonical = match std::fs::canonicalize(&entry) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        tracing::warn!("claude-code: {}: {error}", entry.display());
+                if dedupe {
+                    let canonical = match std::fs::canonicalize(&entry) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            tracing::warn!("claude-code: {}: {error}", entry.display());
+                            continue;
+                        }
+                    };
+                    if !seen.insert(canonical) {
                         continue;
                     }
-                };
-                if !seen.insert(canonical) {
-                    continue;
                 }
 
                 let session_id = entry
@@ -433,6 +441,28 @@ mod tests {
             handles[0].path.display()
         );
         assert_eq!(reader.seat(&handles[0]), None, "explicit root wins, even through a symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_single_root_keeps_symlink_duplicates_but_multi_root_dedupes() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().join("projects");
+        let proj = root.join("-p");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("real.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        std::os::unix::fs::symlink(proj.join("real.jsonl"), proj.join("alias.jsonl")).unwrap();
+        let since = Utc::now() - Duration::days(1);
+        // One explicit root, nothing else: exactly the pre-0.8 behaviour,
+        // two handles with two session ids.
+        let legacy = ClaudeCodeReader::new(&root);
+        let ids: Vec<String> = legacy.discover(since).unwrap().into_iter().map(|h| h.session_id).collect();
+        assert_eq!(ids, ["alias", "real"]);
+        // The same root twice, or with a profile parent: one canonical file.
+        let multi = ClaudeCodeReader::from_roots(vec![root.clone(), root.clone()]);
+        assert_eq!(multi.discover(since).unwrap().len(), 1);
+        let with_profiles = ClaudeCodeReader::new(&root).with_profile_parents(vec![tree.path().join("nope")]);
+        assert_eq!(with_profiles.discover(since).unwrap().len(), 1);
     }
 
     #[test]
