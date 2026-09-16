@@ -374,6 +374,24 @@ mod tests {
     }
 
     #[test]
+    fn review_json_bytes_match_golden() {
+        // Byte-identity guard (jilog#heyg lens): the full --json document for
+        // a host without agentsview. Generated once on the pre-change code
+        // with UPDATE_GOLDEN=1; compared byte-for-byte afterwards.
+        let value = digest_report_json(&digest_report(), false);
+        let got = serde_json::to_string_pretty(&value).unwrap() + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/review-nightly.json");
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &got).unwrap();
+        }
+        let want = std::fs::read_to_string(&path)
+            .expect("golden missing — generate once with UPDATE_GOLDEN=1");
+        assert_eq!(got, want, "review JSON bytes changed for a host without agentsview");
+    }
+
+    #[test]
     fn json_output_has_documented_keys() {
         let value = digest_report_json(&digest_report(), false);
         let encoded = serde_json::to_string(&value).unwrap();
