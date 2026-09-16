@@ -233,25 +233,26 @@ pub fn parse_messages_page(
         .get("messages")
         .and_then(|m| m.as_array())
         .ok_or_else(|| JilogReviewError::Reader("agentsview: messages page has no `messages` array".into()))?;
-    let messages: Vec<Message> = rows
-        .iter()
-        .filter_map(|row| {
-            let role = str_field(row, "role")?;
-            if role != "user" && role != "assistant" {
-                return None;
-            }
-            let content = row
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(Message {
-                role: Some(role),
-                content: Some(serde_json::Value::String(content)),
-                name: None,
-            })
-        })
-        .collect();
+    // Inside the array the same rule: a row without a string `role`, or a
+    // user/assistant row without string `content`, is drift (an error),
+    // never a silently empty session. Rows with another role are skipped.
+    let mut messages: Vec<Message> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let role = str_field(row, "role").ok_or_else(|| {
+            JilogReviewError::Reader("agentsview: a message row has no string `role`".into())
+        })?;
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let content = row.get("content").and_then(|c| c.as_str()).ok_or_else(|| {
+            JilogReviewError::Reader(format!("agentsview: a {} row has no string `content`", role))
+        })?;
+        messages.push(Message {
+            role: Some(role),
+            content: Some(serde_json::Value::String(content.to_string())),
+            name: None,
+        });
+    }
     // `count` is the page's row count (all roles); fall back to the raw row
     // count, never the filtered one, so a page of tool rows does not end
     // pagination early.
@@ -333,9 +334,9 @@ impl AgentsviewReader {
                 since_days
             )));
         }
-        if timeout.as_secs() == 0 || timeout.as_secs() > 3600 {
+        if timeout < Duration::from_secs(1) || timeout > Duration::from_secs(3600) {
             return Err(JilogReviewError::Reader(format!(
-                "agentsview: timeout must be 1..=3600 seconds, got {:?}",
+                "agentsview: timeout must be between 1s and 3600s, got {:?}",
                 timeout
             )));
         }
@@ -557,7 +558,7 @@ mod tests {
     const MESSAGES_PAGE: &str = r#"{"count":4,"first_ordinal":0,"last_ordinal":3,"messages":[
       {"ordinal":0,"role":"user","content":"clean up the worktree","timestamp":"2026-09-11T21:57:31.589Z","model":""},
       {"ordinal":1,"role":"assistant","content":"On it.","timestamp":"2026-09-11T21:57:35.717Z","model":"claude-fable-5-1"},
-      {"ordinal":2,"content":"no role here"},
+      {"ordinal":2,"role":"system","content":"not chat"},
       {"ordinal":3,"role":"tool","content":"{\"success\":false}"}
     ]}"#;
     const USAGE: &str = r#"{"session_id":"a37ffc87-2799-4a09-830b-a92fde71d768","agent":"claude","total_output_tokens":360,"peak_context_tokens":326390,"has_token_data":true,"cost":{"microdollars":717783},"has_cost":true,"cost_usd":0.717783,"models":["claude-fable-5-1"],"unpriced_models":[],"breakdown_count":2,"breakdown":[
@@ -584,6 +585,9 @@ mod tests {
         assert!(parse_sessions_page(&serde_json::json!({})).is_err());
         assert!(parse_sessions_page(&serde_json::json!({"sessions": 5})).is_err());
         assert!(parse_messages_page(&serde_json::json!({"count": 1})).is_err());
+        assert!(parse_messages_page(&serde_json::json!({"messages": [{"content": "no role"}]})).is_err(), "role-less row is drift");
+        assert!(parse_messages_page(&serde_json::json!({"messages": [{"role": "user"}]})).is_err(), "chat row without content is drift");
+        assert!(parse_messages_page(&serde_json::json!({"messages": [{"role": "user", "content": 5}]})).is_err());
         let (empty, count, _) = parse_messages_page(&serde_json::json!({"messages": []})).unwrap();
         assert!(empty.is_empty() && count == 0);
         // The count fallback is the raw row count, not the filtered one.
@@ -592,7 +596,7 @@ mod tests {
 
         let (msgs, count, last) = parse_messages_page(&serde_json::from_str(MESSAGES_PAGE).unwrap()).unwrap();
         assert_eq!((count, last), (4, Some(3)));
-        assert_eq!(msgs.len(), 2, "role-less and tool rows are dropped: no tool identity, so no error signals");
+        assert_eq!(msgs.len(), 2, "system and tool rows are skipped: no tool identity, so no error signals");
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
         assert_eq!(msgs[1].content.as_ref().and_then(|c| c.as_str()), Some("On it."));
 
@@ -674,8 +678,9 @@ mod tests {
         // The constructor enforces the same numeric bounds as the config loader.
         assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 0, Duration::from_secs(1)).is_err());
         assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 3651, Duration::from_secs(1)).is_err());
-        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_millis(0)).is_err());
-        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_secs(3601)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_millis(999)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_millis(3_600_500)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_secs(3600)).is_ok());
     }
 
     /// Minimal HTTP/1.1 stub: serves canned JSON by path substring (first
