@@ -106,6 +106,12 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         contract_tilde(&digest_file_path(&digest_dir_abs, &date_str));
     let tracker = cfg.into_tracker(Some((digest_display_path.as_str(), date_str.as_str())));
 
+    // Archive spend (agentsview): advisory. Any failure hides the block
+    // and the run continues.
+    let archive_spend = cfg
+        .agentsview_settings()
+        .and_then(|s| load_archive_spend(&s, date));
+
     let review_args = LibReviewArgs {
         since,
         digest_dir: digest_dir.clone(),
@@ -113,6 +119,7 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         date,
         dry_run: args.dry_run,
         create_issues: args.create_issues,
+        archive_spend,
     };
 
     let report = jilog_review::run_review(readers.as_slice(), tracker.as_ref(), &review_args)
@@ -146,6 +153,18 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
             }
         }
 
+        if let Some(a) = &report.archive_spend {
+            println!(
+                "Archive spend: {} yesterday, ${} trailing 7d ({} day(s))",
+                a.yesterday
+                    .as_ref()
+                    .map(|y| format!("${}", y.total_usd))
+                    .unwrap_or_else(|| "n/a".into()),
+                a.week.total_usd,
+                a.week.days
+            );
+        }
+
         if !args.dry_run {
             println!("Digest: {}", report.digest_path.display());
         }
@@ -163,6 +182,48 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The digest's archive Spend block, or None. Advisory by contract: the
+/// daemon is probed first (a `usage daily` run answers from the local
+/// archive even when the daemon is down, which would render stale numbers
+/// the brief says to hide), then the CLI runs under the timeout. Every
+/// failure — unreachable, no binary, mid-sync block, timeout, bad JSON,
+/// empty window — logs one warning and hides the block; the run goes on.
+pub fn load_archive_spend(
+    settings: &crate::config::AgentsviewSettings,
+    date: NaiveDate,
+) -> Option<jilog_review::ArchiveSpend> {
+    let reader = match jilog_review::readers::AgentsviewReader::new(
+        &settings.url,
+        settings.token_file.clone(),
+        settings.since_days,
+        settings.timeout,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("archive spend hidden: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = reader.probe() {
+        tracing::warn!("archive spend hidden: agentsview daemon not reachable: {}", e);
+        return None;
+    }
+    let (from, to) = jilog_review::ArchiveSpend::window(date);
+    match jilog_review::archive_spend::fetch_daily_usage(&settings.bin, from, to, settings.timeout) {
+        Ok(rows) => {
+            let spend = jilog_review::ArchiveSpend::summarize(&rows, date);
+            if spend.is_none() {
+                tracing::warn!("archive spend hidden: no usage rows between {} and {}", from, to);
+            }
+            spend
+        }
+        Err(e) => {
+            tracing::warn!("archive spend hidden: {}", e);
+            None
+        }
+    }
 }
 
 fn nightly_since(args: &NightlyArgs) -> anyhow::Result<chrono::DateTime<Utc>> {
@@ -240,7 +301,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         })
         .collect::<serde_json::Map<String, serde_json::Value>>();
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "schema_version": 2,
         "sessions_scanned": report.sessions_scanned,
         "tracker_failures": report.tracker_failures,
@@ -254,7 +315,32 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         "spend": spend,
         "digest_path": digest_path,
         "created_issues": serde_json::Value::Array(created_issues),
-    })
+    });
+
+    // Archive spend (agentsview): present only when the block rendered, so
+    // an unconfigured host's document keeps today's exact key set (the
+    // golden and key-set tests guard it). Costs are decimal strings.
+    if let Some(a) = &report.archive_spend {
+        let period = |p: &jilog_review::PeriodSpend| {
+            serde_json::json!({
+                "total_usd": p.total_usd.to_string(),
+                "days": p.days,
+                "agents_usd": p.agents.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                "models_usd": p.models.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_string())))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+            })
+        };
+        value["archive_spend"] = serde_json::json!({
+            "yesterday": a.yesterday.as_ref().map(period),
+            "week": period(&a.week),
+            "week_from": a.week_from.to_string(),
+            "week_to": a.week_to.to_string(),
+        });
+    }
+    value
 }
 
 #[cfg(test)]
@@ -306,6 +392,7 @@ mod tests {
             patterns: Vec::new(),
             p0_alerts,
             spend: None,
+            archive_spend: None,
             personas: std::collections::BTreeMap::from([(
                 "jibot@The vibez".to_string(),
                 jilog_review::PersonaCounts {
@@ -371,6 +458,110 @@ mod tests {
 
         let err = nightly_since(&args).unwrap_err().to_string();
         assert!(err.contains("invalid --since value: notaduration"));
+    }
+
+    /// One-shot loopback daemon stand-in: answers every request 200 with
+    /// `body`, then stops. Enough for the probe.
+    fn one_shot_daemon(body: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn nightly_survives_an_unreachable_agentsview() {
+        // The agentsview reader points at a closed port: the probe fails,
+        // the block is hidden, and a full (non-dry) run still writes a
+        // digest and exits Ok.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "t").unwrap();
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "[[reader]]\ntype = \"agentsview\"\nurl = \"http://127.0.0.1:{port}\"\ntoken_file = \"{}\"\ntimeout_secs = 2\nbin = \"{}\"\n",
+            token.display(),
+            dir.path().join("no-such-agentsview").display()
+        ))
+        .unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+        let settings = cfg.agentsview_settings().unwrap();
+        assert!(load_archive_spend(&settings, date).is_none(), "probe fails → hidden");
+        let mut args = nightly_args();
+        args.dry_run = false;
+        args.date = Some(date);
+        args.digest_dir = Some(dir.path().join("digests"));
+        args.processed_file = Some(dir.path().join("processed.txt"));
+        run_nightly(&cfg, &args).expect("agentsview outage never fails the nightly");
+        let digest = std::fs::read_to_string(dir.path().join("digests/learning-digest-2026-09-16.md")).unwrap();
+        assert!(!digest.contains("Archive spend"), "{digest}");
+        assert!(!digest.contains("## Spend"), "{digest}");
+    }
+
+    #[test]
+    fn archive_spend_hidden_when_the_binary_is_missing_even_if_the_daemon_answers() {
+        // Probe succeeds (stub answers /api/v1/machines) but `bin` does not
+        // exist → fetch fails → None, no panic.
+        let base = one_shot_daemon(r#"{"machines":[],"machine_labels":{},"machine_aliases":{}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "t").unwrap();
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "[[reader]]\ntype = \"agentsview\"\nurl = \"{base}\"\ntoken_file = \"{}\"\ntimeout_secs = 2\nbin = \"{}\"\n",
+            token.display(),
+            dir.path().join("no-such-agentsview").display()
+        ))
+        .unwrap();
+        let settings = cfg.agentsview_settings().unwrap();
+        assert!(load_archive_spend(&settings, chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap()).is_none());
+        // And the JSON document for a report without the block has no key.
+        let value = digest_report_json(&digest_report(), false);
+        assert!(value.get("archive_spend").is_none());
+    }
+
+    #[test]
+    fn review_json_carries_archive_spend_only_when_present() {
+        let mut report = digest_report();
+        let value = digest_report_json(&report, false);
+        assert!(value.get("archive_spend").is_none(), "no key when absent — unconfigured hosts keep today's document");
+        let mut week = jilog_review::PeriodSpend::default();
+        week.total_usd = rust_decimal::Decimal::new(2101500000, 6);
+        week.days = 7;
+        week.agents.insert("codex".into(), rust_decimal::Decimal::new(1300250000, 6));
+        report.archive_spend = Some(jilog_review::ArchiveSpend {
+            yesterday: None,
+            week,
+            week_from: chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
+            week_to: chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        });
+        let value = digest_report_json(&report, false);
+        assert_eq!(value["archive_spend"]["week"]["total_usd"], "2101.500000");
+        assert_eq!(value["archive_spend"]["week"]["days"], 7);
+        assert_eq!(value["archive_spend"]["week"]["agents_usd"]["codex"], "1300.250000");
+        assert_eq!(value["archive_spend"]["week_from"], "2026-09-09");
+        assert!(value["archive_spend"]["yesterday"].is_null());
+        assert_eq!(value["schema_version"], 2);
     }
 
     #[test]

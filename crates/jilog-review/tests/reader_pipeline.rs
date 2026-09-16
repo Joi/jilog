@@ -51,6 +51,7 @@ fn run_pipeline(reader: Box<dyn Reader>, digest_dir: &Path) -> String {
         date: NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(),
         dry_run: false,
         create_issues: false,
+        archive_spend: None,
     };
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
     assert_eq!(
@@ -242,6 +243,7 @@ fn pooled_codex_seat_reaches_signals_without_chat_heuristics() {
         date: Utc::now().date_naive(),
         dry_run: false,
         create_issues: false,
+        archive_spend: None,
     };
     let readers: Vec<Box<dyn Reader>> = vec![Box::new(CodexReader::new(sessions))];
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
@@ -316,6 +318,7 @@ esac
         date: NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
         dry_run: false,
         create_issues: false,
+        archive_spend: None,
     };
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
     assert_eq!(report.errors.len(), 1);
@@ -467,6 +470,7 @@ esac
         date: NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
         dry_run: false,
         create_issues: false,
+        archive_spend: None,
     };
     let report = run_review(&readers, &NoneTracker, &args("processed-1")).unwrap();
     assert_eq!(report.errors.len(), 1);

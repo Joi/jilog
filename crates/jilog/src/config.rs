@@ -472,7 +472,6 @@ impl JilogConfig {
 
     /// The first `agentsview` reader's resolved settings (for the CLI's
     /// archive-spend probe + fetch); None when none is configured.
-    #[allow(dead_code)] // wired into commands/review.rs by the archive-spend chunk
     pub fn agentsview_settings(&self) -> Option<AgentsviewSettings> {
         self.readers.iter().find_map(AgentsviewSettings::from_reader)
     }

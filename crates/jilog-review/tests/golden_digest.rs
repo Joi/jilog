@@ -103,6 +103,7 @@ fn render_fixture() -> String {
         &[p1],
         &p0,
         Some(&spend),
+        None,
         &recurrence,
         &issues,
         &personas,

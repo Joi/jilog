@@ -14,6 +14,7 @@
 //! - Built-in readers via [`readers`] module
 //! - Built-in trackers via [`trackers`] module
 
+pub mod archive_spend;
 pub mod error;
 pub mod signal;
 pub mod reader;
@@ -25,6 +26,7 @@ pub mod util;
 pub mod readers;
 pub mod trackers;
 
+pub use archive_spend::{ArchiveSpend, DailyUsage, PeriodSpend};
 pub use error::JilogReviewError;
 pub use signal::{Signal, Correction, ErrorSignal, Workaround, PatternSignal, DeferralSignal};
 pub use reader::{Reader, Message, TranscriptHandle, SessionEvent, SessionEventKind, SessionStats, ProcessedSessions, parse_session_role, is_sub_agent_session, trailing_uuid, SUB_AGENT_PREFIX};

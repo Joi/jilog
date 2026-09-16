@@ -153,6 +153,135 @@ pub(crate) fn json_decimal(v: &serde_json::Value) -> Option<rust_decimal::Decima
 // Tests — ported from opsctl/src/review_nightly.rs
 // ---------------------------------------------------------------------------
 
+/// Run `cmd` with stdin closed and both pipes captured, bounded by
+/// `timeout` end to end: the child runs in its own process group (unix) so
+/// a descendant that inherited a pipe dies with it, the exit wait and the
+/// pipe drain share one deadline, and on expiry the whole group is killed.
+/// A daemon mid-sync makes `agentsview usage daily` block for minutes
+/// (observed 2026-09-16); the nightly must never wait on it (jilog#heyg).
+pub fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, crate::error::JilogReviewError> {
+    use crate::error::JilogReviewError;
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| JilogReviewError::Reader("timeout too large".into()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pgid = child.id();
+    let kill_group = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        // SAFETY: plain libc call; a negative pid addresses the process
+        // group created by process_group(0), whose id is the child's pid.
+        unsafe {
+            libc::kill(-(pgid as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx_out.send((0, buf));
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = tx.send((1, buf));
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_group(&mut child);
+            return Err(JilogReviewError::Reader(format!(
+                "command timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    // Drain both pipes under the same deadline: a descendant that inherited
+    // a pipe keeps it open after the direct child exits.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((0, buf)) => out = buf,
+            Ok((_, buf)) => err = buf,
+            Err(_) => {
+                kill_group(&mut child);
+                return Err(JilogReviewError::Reader(format!(
+                    "command timed out after {}s waiting for output (a descendant kept the pipe open)",
+                    timeout.as_secs()
+                )));
+            }
+        }
+    }
+    Ok(std::process::Output { status, stdout: out, stderr: err })
+}
+
+#[cfg(all(test, unix))]
+mod timeout_tests {
+    use super::run_with_timeout;
+
+    #[test]
+    fn run_with_timeout_returns_inside_the_deadline_when_a_descendant_holds_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("orphan.sh");
+        // The direct child exits at once; its background grandchild keeps
+        // stdout open for 30s. Without a group kill + bounded drain this
+        // would block on the pipe until the grandchild exits.
+        std::fs::write(&script, "#!/bin/sh\n( sleep 30 ) &\necho started\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let err = run_with_timeout(
+            &mut std::process::Command::new(&script),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "returned in {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("timed out"), "{err}");
+        // A well-behaved child returns its output and status.
+        let ok = dir.path().join("ok.sh");
+        std::fs::write(&ok, "#!/bin/sh\necho out\necho err >&2\nexit 0\n").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = run_with_timeout(
+            &mut std::process::Command::new(&ok),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

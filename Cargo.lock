@@ -633,6 +633,7 @@ dependencies = [
  "ledger-core",
  "ledger-spool",
  "ledger-sqlite",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tempfile",

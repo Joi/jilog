@@ -38,6 +38,10 @@ pub struct ReviewArgs {
     pub dry_run: bool,
     /// If true (and not dry_run), create issues in the tracker.
     pub create_issues: bool,
+    /// Archive spend from `agentsview usage daily`, fetched by the caller
+    /// (the CLI) before the run; None when agentsview is not configured or
+    /// was unavailable. Rendered as the digest's "Archive spend" block.
+    pub archive_spend: Option<crate::archive_spend::ArchiveSpend>,
 }
 
 /// Result of a run_review call.
@@ -53,6 +57,8 @@ pub struct DigestReport {
     /// Aggregated spend across sessions that reported stats; None when no
     /// scanned session carried usage data.
     pub spend: Option<SpendSummary>,
+    /// The archive spend block (agentsview), echoed from `ReviewArgs`.
+    pub archive_spend: Option<crate::archive_spend::ArchiveSpend>,
     /// Per-persona/channel rollup for fleet sessions (handles that carried a
     /// persona). Keyed `persona@channel` (or bare persona when the channel is
     /// unknown). Empty when only coding sessions were scanned.
@@ -646,6 +652,7 @@ pub fn run_review(
             &all_patterns,
             &p0_alerts,
             spend.as_ref(),
+            args.archive_spend.as_ref(),
             &recurrence_costs,
             &args.digest_dir,
             &issue_index,
@@ -682,6 +689,7 @@ pub fn run_review(
         patterns: all_patterns,
         p0_alerts,
         spend,
+        archive_spend: args.archive_spend.clone(),
         personas,
         digest_path,
         created_issues,
@@ -714,6 +722,7 @@ pub fn render_digest(
     patterns: &[PatternSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     spend: Option<&SpendSummary>,
+    archive_spend: Option<&crate::archive_spend::ArchiveSpend>,
     recurrence_costs: &HashMap<String, String>,
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
@@ -906,10 +915,13 @@ pub fn render_digest(
         buf.push('\n');
     }
 
-    // Spend — rendered only when at least one session reported stats.
-    // No empty section otherwise: message-only readers stay silent here.
-    if let Some(sp) = spend {
+    // Spend — rendered when at least one session reported stats OR the
+    // archive block is available. No empty section otherwise: message-only
+    // readers without agentsview stay silent here, byte-identical to before.
+    if spend.is_some() || archive_spend.is_some() {
         buf.push_str("## Spend\n\n");
+    }
+    if let Some(sp) = spend {
         match &sp.total_cost_usd {
             Some(total) => buf.push_str(&format!(
                 "- **Total**: {} across {} of {} session(s) with usage data\n",
@@ -942,8 +954,53 @@ pub fn render_digest(
             buf.push('\n');
         }
     }
+    if let Some(a) = archive_spend {
+        render_archive_spend(&mut buf, a);
+    }
 
     buf
+}
+
+/// The "Archive spend (agentsview)" block: yesterday, trailing 7d, top
+/// models (jilog#heyg). Agents by cost descending; the five most expensive
+/// models.
+fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
+    fn agents(p: &crate::archive_spend::PeriodSpend) -> String {
+        p.agents_by_cost()
+            .iter()
+            .map(|(agent, cost)| format!("{} {}", sanitize_display(agent), format_usd(cost)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    buf.push_str("### Archive spend (agentsview)\n\n");
+    match &a.yesterday {
+        Some(y) => buf.push_str(&format!(
+            "- **Yesterday ({})**: {} — {}\n",
+            a.week_to,
+            format_usd(&y.total_usd),
+            agents(y)
+        )),
+        None => buf.push_str(&format!("- **Yesterday ({})**: no archive rows\n", a.week_to)),
+    }
+    buf.push_str(&format!(
+        "- **Trailing 7d ({} – {})**: {} across {} day(s) — {}\n",
+        a.week_from,
+        a.week_to,
+        format_usd(&a.week.total_usd),
+        a.week.days,
+        agents(&a.week)
+    ));
+    let models = a
+        .week
+        .top_models(5)
+        .iter()
+        .map(|(m, c)| format!("`{}` {}", sanitize_display(m), format_usd(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !models.is_empty() {
+        buf.push_str(&format!("- **Top models (7d)**: {}\n", models));
+    }
+    buf.push('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +1021,7 @@ pub fn write_digest(
     patterns: &[PatternSignal],
     p0_alerts: &HashMap<String, BTreeSet<String>>,
     spend: Option<&SpendSummary>,
+    archive_spend: Option<&crate::archive_spend::ArchiveSpend>,
     recurrence_costs: &HashMap<String, String>,
     digest_dir: &Path,
     issue_index: &HashMap<String, IssueRef>,
@@ -973,7 +1031,7 @@ pub fn write_digest(
     let path = crate::util::digest_file_path(digest_dir, date);
     let body = render_digest(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
-        spend, recurrence_costs, issue_index, personas,
+        spend, archive_spend, recurrence_costs, issue_index, personas,
     );
     std::fs::write(&path, body)?;
     Ok(path)
@@ -1191,7 +1249,7 @@ mod tests {
     #[test]
     fn digest_frontmatter_has_counts() {
         let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into(), ..Default::default() }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.starts_with("---\n"));
         assert!(body.contains("date: 2026-04-30"));
         assert!(body.contains("signals_captured: 1"));
@@ -1202,7 +1260,7 @@ mod tests {
 
     #[test]
     fn digest_empty_sections_use_placeholder() {
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("_No P0 alerts._"));
         assert!(body.contains("_No corrections detected._"));
         assert!(body.contains("_No errors detected._"));
@@ -1219,7 +1277,7 @@ mod tests {
         sessions.insert("bbb".into());
         sessions.insert("ccc".into());
         p0.insert("bash".into(), sessions);
-        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &p0, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &p0, None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("`bash` failed in 3 distinct sessions"));
         assert!(body.contains("aaa, bbb, ccc"));
     }
@@ -1231,7 +1289,7 @@ mod tests {
             context: "don't do that".into(),
             ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &corrections, &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         // Single quote inside should be escaped: \'
         assert!(body.contains("'don\\'t do that'"), "digest body: {}", body);
     }
@@ -1244,7 +1302,7 @@ mod tests {
             message: "x".repeat(600),
             ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &[], &errors, &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("[truncated]"));
     }
 
@@ -1257,7 +1315,7 @@ mod tests {
             evidence: "4 compactions 09:01-09:08".into(),
             ..Default::default()
         }];
-        let body = render_digest("2026-07-05", &[], &[], &[], &[], &patterns, &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &patterns, &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("patterns: 1"));
         assert!(body.contains("## Patterns"));
@@ -1283,7 +1341,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-07-05", &[], &[], &[], &[], &[pattern], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new());
+        let body = render_digest("2026-07-05", &[], &[], &[], &[], &[pattern], &HashMap::new(), None, None, &HashMap::new(), &index, &BTreeMap::new());
         assert!(body.contains("(→ kata#9)"), "annotation missing in:\n{}", body);
     }
 
@@ -1294,7 +1352,7 @@ mod tests {
             item: "next session".into(),
             ..Default::default()
         }];
-        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-04-30", &[], &[], &[], &deferrals, &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         assert!(body.contains("signals_captured: 1"));
         assert!(body.contains("- `s1` pattern=`next session`"));
     }
@@ -1302,7 +1360,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new()).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new()).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -1337,6 +1395,7 @@ mod tests {
             date,
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 0);
@@ -1369,6 +1428,7 @@ mod tests {
             date,
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         run_review(&readers, &tracker, &args).unwrap();
 
@@ -1402,7 +1462,7 @@ mod tests {
         };
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            Some(&spend), &HashMap::new(), &no_issues(), &BTreeMap::new(),
+            Some(&spend), None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(body.contains("## Spend"));
         assert!(body.contains("- **Total**: $4.20 across 2 of 3 session(s) with usage data"));
@@ -1418,7 +1478,7 @@ mod tests {
     fn digest_spend_section_absent_without_stats() {
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
+            None, None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(!body.contains("## Spend"), "no stats → no Spend section:\n{}", body);
     }
@@ -1435,7 +1495,7 @@ mod tests {
         };
         let body = render_digest(
             "2026-07-05", &[], &[], &[], &[], &[], &HashMap::new(),
-            Some(&spend), &HashMap::new(), &no_issues(), &BTreeMap::new(),
+            Some(&spend), None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(body.contains("- **Total**: no cost data (2 session(s) with usage; unpriced models)"));
         assert!(!body.contains("### Spend by role"), "no costs → no role table");
@@ -1572,6 +1632,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.corrections.len(), 1);
@@ -1636,6 +1697,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
 
@@ -1696,6 +1758,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
             dry_run: true,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert!(
@@ -1733,7 +1796,7 @@ mod tests {
         )]);
         let body = render_digest(
             "2026-07-13", &[correction], &[], &[], &[], &[], &HashMap::new(),
-            None, &HashMap::new(), &no_issues(), &personas,
+            None, None, &HashMap::new(), &no_issues(), &personas,
         );
         assert!(
             body.contains("- `jibot@vibez' injected` `s1` — "),
@@ -1773,7 +1836,7 @@ mod tests {
     fn digest_personas_section_absent_for_coding_only_runs() {
         let body = render_digest(
             "2026-07-13", &[], &[], &[], &[], &[], &HashMap::new(),
-            None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
+            None, None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(!body.contains("## Personas"), "no fleet sessions → no Personas section");
     }
@@ -1804,6 +1867,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         let body = fs::read_to_string(&report.digest_path).unwrap();
@@ -1834,7 +1898,7 @@ mod tests {
         let mut index = HashMap::new();
         index.insert(signal_title(&signal), issue_ref);
 
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new());
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &index, &BTreeMap::new());
         // Annotation must appear at end of bullet line, before newline.
         assert!(
             body.contains("(→ kata#7)"),
@@ -1851,7 +1915,7 @@ mod tests {
             context: "fix it".into(),
             ..Default::default()
         };
-        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let body = render_digest("2026-05-11", &[correction], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
         // Line must end with content then newline — no trailing annotation.
         assert!(!body.contains("(→"), "unexpected annotation in:\n{}", body);
     }
@@ -1876,12 +1940,12 @@ mod tests {
         let body_with = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &index, &BTreeMap::new(),
+            &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &index, &BTreeMap::new(),
         );
         let body_without = render_digest(
             "2026-05-11",
             &[c_annotated.clone(), c_plain.clone()],
-            &[], &[], &[], &[], &HashMap::new(), None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
+            &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
 
         // The plain line must be identical in both renders.
@@ -1949,6 +2013,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
 
@@ -2039,6 +2104,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: true,
+            archive_spend: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-aging".into() };
         let r1 = run_review(&readers, &failing, &args).unwrap();
@@ -2141,6 +2207,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "stats-only session must be counted");
@@ -2176,6 +2243,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: true,
+            archive_spend: None,
         };
         let healthy = FailForSessionTracker { fail_session: "none".into() };
         let report = run_review(&readers, &healthy, &args).unwrap();
@@ -2206,6 +2274,7 @@ mod tests {
                 date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
                 dry_run: false,
                 create_issues: true,
+                archive_spend: None,
             };
             let failing = FailForSessionTracker { fail_session: format!("sess-{}", name) };
             run_review(&readers, &failing, &args).unwrap();
@@ -2241,6 +2310,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: true,
+            archive_spend: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-pending".into() };
         run_review(&readers, &failing, &args).unwrap();
@@ -2346,6 +2416,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
             dry_run: false,
             create_issues: true,
+            archive_spend: None,
         };
 
         let report = run_review(&readers, &tracker, &args).unwrap();
@@ -2412,6 +2483,81 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Archive spend block (jilog#heyg)
+    // -----------------------------------------------------------------------
+
+    fn sample_archive_spend() -> crate::archive_spend::ArchiveSpend {
+        use crate::archive_spend::{ArchiveSpend, PeriodSpend};
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        let mut week = PeriodSpend { total_usd: d("2101.5"), days: 7, ..Default::default() };
+        week.agents.insert("codex".into(), d("1300.25"));
+        week.agents.insert("claude".into(), d("800.25"));
+        week.agents.insert("cowork".into(), d("1"));
+        for (m, c) in [
+            ("gpt-6-astra", "900"),
+            ("claude-opus-5", "700.5"),
+            ("gpt-5.6-sol", "400"),
+            ("claude-haiku-4-5-20251001", "60"),
+            ("m5", "30"),
+            ("m6", "11"),
+        ] {
+            week.models.insert(m.into(), d(c));
+        }
+        let mut yesterday = PeriodSpend { total_usd: d("332.138392"), days: 1, ..Default::default() };
+        yesterday.agents.insert("codex".into(), d("224.55406"));
+        yesterday.agents.insert("claude".into(), d("104.943456"));
+        yesterday.agents.insert("cowork".into(), d("2.640876"));
+        ArchiveSpend {
+            yesterday: Some(yesterday),
+            week,
+            week_from: NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
+            week_to: NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+        }
+    }
+
+    #[test]
+    fn digest_archive_spend_block_renders_after_observed_spend() {
+        let archive = sample_archive_spend();
+        let body = render_digest(
+            "2026-09-16", &[], &[], &[], &[], &[], &HashMap::new(),
+            None, Some(&archive), &HashMap::new(), &no_issues(), &BTreeMap::new(),
+        );
+        let expected = "## Spend\n\n### Archive spend (agentsview)\n\n\
+- **Yesterday (2026-09-15)**: $332.138392 — codex $224.55406, claude $104.943456, cowork $2.640876\n\
+- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s) — codex $1300.25, claude $800.25, cowork $1.00\n\
+- **Top models (7d)**: `gpt-6-astra` $900.00, `claude-opus-5` $700.50, `gpt-5.6-sol` $400.00, `claude-haiku-4-5-20251001` $60.00, `m5` $30.00\n\n";
+        assert!(body.ends_with(expected), "archive block:\n{body}");
+        // With observed stats too: the observed block is unchanged and comes first.
+        let spend = SpendSummary { sessions_with_stats: 2, input_tokens: 10, output_tokens: 5, ..Default::default() };
+        let body = render_digest(
+            "2026-09-16", &[], &[], &[], &[], &[], &HashMap::new(),
+            Some(&spend), Some(&archive), &HashMap::new(), &no_issues(), &BTreeMap::new(),
+        );
+        assert!(
+            body.contains("## Spend\n\n- **Total**: no cost data (2 session(s) with usage; unpriced models)\n- **Tokens**: 10 in / 5 out\n\n### Archive spend (agentsview)\n"),
+            "{body}"
+        );
+        // Yesterday absent.
+        let mut no_yesterday = archive.clone();
+        no_yesterday.yesterday = None;
+        let body = render_digest(
+            "2026-09-16", &[], &[], &[], &[], &[], &HashMap::new(),
+            None, Some(&no_yesterday), &HashMap::new(), &no_issues(), &BTreeMap::new(),
+        );
+        assert!(body.contains("- **Yesterday (2026-09-15)**: no archive rows\n"), "{body}");
+    }
+
+    #[test]
+    fn digest_without_archive_spend_is_unchanged() {
+        let body = render_digest(
+            "2026-09-16", &[], &[], &[], &[], &[], &HashMap::new(),
+            None, None, &HashMap::new(), &no_issues(), &BTreeMap::new(),
+        );
+        assert!(!body.contains("## Spend"), "{body}");
+        assert!(body.ends_with("## Patterns\n\n_No patterns detected._\n\n"), "{body}");
+    }
+
+    // -----------------------------------------------------------------------
     // Agent + machine tags and cross-reader dedupe (jilog#heyg)
     // -----------------------------------------------------------------------
 
@@ -2435,6 +2581,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.corrections[0].agent.as_deref(), Some("claude"));
@@ -2486,6 +2633,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
             dry_run: false,
             create_issues: false,
+            archive_spend: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "the archive copy is skipped in-run");
@@ -2532,6 +2680,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
             dry_run: false,
             create_issues: true,
+            archive_spend: None,
         };
         // OpenTitlesTracker refuses every create → tracker failure → session unmarked.
         let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
