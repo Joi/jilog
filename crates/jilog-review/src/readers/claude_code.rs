@@ -91,7 +91,12 @@ impl ClaudeCodeReader {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                // A stray file or a permission problem under $HOME must not
+                // cost the explicit roots their scan: skip this parent.
+                Err(e) => tracing::warn!(
+                    "claude-code: profile parent {} skipped: {e}",
+                    parent.display()
+                ),
             }
         }
         profiles.sort();
@@ -374,6 +379,22 @@ mod tests {
         assert_eq!(reader.discover(since).unwrap().len(), 1);
         // Empty roots scan nothing.
         assert!(ClaudeCodeReader::from_roots(vec![]).discover(since).unwrap().is_empty());
+        // A profile parent that is a FILE is skipped with a warning; the
+        // explicit root still scans.
+        let reader = ClaudeCodeReader::from_roots(vec![tree.path().join(".claude/projects")])
+            .with_profile_parents(vec![pool.join("README")]);
+        assert_eq!(reader.discover(since).unwrap().len(), 1);
+        // Glob metacharacters in a root or a profile name match literally.
+        let weird = tree.path().join("we[i]rd*");
+        let wp = weird.join("q?/projects/-p");
+        fs::create_dir_all(&wp).unwrap();
+        fs::write(wp.join("weird-session.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        let reader = ClaudeCodeReader::from_roots(vec![]).with_profile_parents(vec![weird.clone()]);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1, "metacharacter paths are escaped, not interpreted");
+        assert_eq!(reader.seat(&handles[0]).as_deref(), Some("q?"));
+        let reader = ClaudeCodeReader::from_roots(vec![weird.join("q?/projects")]);
+        assert_eq!(reader.discover(since).unwrap().len(), 1);
         // An explicit root that is ALSO reachable through a profile parent
         // carries no seat and is scanned once: explicit roots win.
         let reader = ClaudeCodeReader::from_roots(vec![pool.join("seat-06").join("projects")])

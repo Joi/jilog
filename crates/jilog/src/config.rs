@@ -38,7 +38,9 @@ pub enum ReaderConfig {
     ClaudeCode {
         #[serde(default)]
         path: Option<String>,
-        /// Explicit roots; takes precedence over `path`. An empty list scans nothing.
+        /// Explicit roots; takes precedence over `path`. An empty list scans
+        /// no explicit root (profile roots from `discover_profiles` are
+        /// unaffected).
         #[serde(default)]
         paths: Option<Vec<String>>,
         /// Also scan every `~/.claude-pool/profiles/*/projects` and

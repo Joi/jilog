@@ -59,11 +59,36 @@ pub struct AgentsviewReader {
     base_url: String,
     token_file: PathBuf,
     since_days: u32,
-    timeout: Duration,
+    /// One agent for the reader's lifetime, carrying the connect/read
+    /// timeouts: connections are reused across the ~2 requests per
+    /// archived session a nightly makes.
+    http: ureq::Agent,
     /// id → (agent, machine key), filled by `discover`.
     sessions: Mutex<HashMap<String, (String, String)>>,
     /// machine key → label, filled by `discover`.
     labels: Mutex<HashMap<String, String>>,
+}
+
+/// Why a request failed: an HTTP status (typed, so callers can treat a 404
+/// as "no data" without parsing prose) or anything else.
+enum GetError {
+    Status(u16),
+    Other(JilogReviewError),
+}
+
+/// Percent-encode a value for a path segment or query parameter: the
+/// unreserved set (RFC 3986) passes through, everything else is `%XX`.
+/// Session ids are plain uuids or `<agent>:<uuid>` and cursors are opaque,
+/// so neither may be spliced into a URL verbatim.
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 /// The daemon ORIGIN, normalized: `http://<ip>[:port]` with an IP-literal
@@ -92,7 +117,14 @@ pub fn validate_url(url: &str) -> Result<String, JilogReviewError> {
             let (h, after) = rest
                 .split_once(']')
                 .ok_or_else(|| bad("unterminated IPv6 literal"))?;
-            (h.to_string(), after.strip_prefix(':'))
+            let port = match after {
+                "" => None,
+                p => Some(
+                    p.strip_prefix(':')
+                        .ok_or_else(|| bad("only a :port may follow an IPv6 literal"))?,
+                ),
+            };
+            (h.to_string(), port)
         }
         None => match authority.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), Some(p)),
@@ -281,11 +313,15 @@ impl AgentsviewReader {
         timeout: Duration,
     ) -> Result<Self, JilogReviewError> {
         let base_url = validate_url(url)?;
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout(timeout)
+            .build();
         Ok(Self {
             base_url,
             token_file,
             since_days,
-            timeout,
+            http,
             sessions: Mutex::new(HashMap::new()),
             labels: Mutex::new(HashMap::new()),
         })
@@ -294,38 +330,39 @@ impl AgentsviewReader {
     /// GET `<base>/api/v1<path_and_query>` with the bearer token, parsed as
     /// JSON. Errors name the url and the failure class, never the header.
     fn get(&self, path_and_query: &str) -> Result<serde_json::Value, JilogReviewError> {
-        let token = read_token(&self.token_file)?;
+        self.get_typed(path_and_query).map_err(|e| e.into())
+    }
+
+    fn get_typed(&self, path_and_query: &str) -> Result<serde_json::Value, GetError> {
+        let token = read_token(&self.token_file).map_err(GetError::Other)?;
         let url = format!("{}/api/v1{}", self.base_url, path_and_query);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(self.timeout)
-            .timeout(self.timeout)
-            .build();
-        let resp = match agent
+        let resp = match self
+            .http
             .get(&url)
             .set("Authorization", &format!("Bearer {}", token))
             .set("Accept", "application/json")
             .call()
         {
             Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) => {
-                return Err(JilogReviewError::Reader(format!(
-                    "agentsview: {} → HTTP {}",
-                    url, code
-                )));
-            }
+            Err(ureq::Error::Status(code, _)) => return Err(GetError::Status(code)),
             Err(ureq::Error::Transport(t)) => {
-                return Err(JilogReviewError::Reader(format!(
+                return Err(GetError::Other(JilogReviewError::Reader(format!(
                     "agentsview: {} unreachable: {:?}",
                     url,
                     t.kind()
-                )));
+                ))));
             }
         };
         let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)
-            .map_err(|e| JilogReviewError::Reader(format!("agentsview: {} read: {}", url, e)))?;
-        serde_json::from_slice(&body)
-            .map_err(|e| JilogReviewError::Reader(format!("agentsview: {} bad JSON: {}", url, e)))
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body).map_err(|e| {
+            GetError::Other(JilogReviewError::Reader(format!("agentsview: {} read: {}", url, e)))
+        })?;
+        serde_json::from_slice(&body).map_err(|e| {
+            GetError::Other(JilogReviewError::Reader(format!(
+                "agentsview: {} bad JSON: {}",
+                url, e
+            )))
+        })
     }
 
     /// Bounded reachability check (`GET /api/v1/machines`). The CLI runs
@@ -333,6 +370,15 @@ impl AgentsviewReader {
     /// answer from a stale local archive while the daemon is down.
     pub fn probe(&self) -> Result<(), JilogReviewError> {
         self.get("/machines").map(|_| ())
+    }
+}
+
+impl From<GetError> for JilogReviewError {
+    fn from(e: GetError) -> Self {
+        match e {
+            GetError::Status(code) => JilogReviewError::Reader(format!("agentsview: HTTP {}", code)),
+            GetError::Other(err) => err,
+        }
     }
 }
 
@@ -361,7 +407,7 @@ impl Reader for AgentsviewReader {
             );
             if let Some(c) = &cursor {
                 query.push_str("&cursor=");
-                query.push_str(c);
+                query.push_str(&encode(c));
             }
             let (page, next) = parse_sessions_page(&self.get(&query)?);
             for s in page {
@@ -398,7 +444,9 @@ impl Reader for AgentsviewReader {
         for _ in 0..MAX_PAGES {
             let v = self.get(&format!(
                 "/sessions/{}/messages?from={}&limit={}&direction=asc",
-                handle.session_id, from, PAGE_LIMIT
+                encode(&handle.session_id),
+                from,
+                PAGE_LIMIT
             ))?;
             let (msgs, count, last) = parse_messages_page(&v);
             out.extend(msgs);
@@ -414,12 +462,15 @@ impl Reader for AgentsviewReader {
         &self,
         handle: &TranscriptHandle,
     ) -> Result<Option<SessionStats>, JilogReviewError> {
-        match self.get(&format!("/sessions/{}/usage?breakdown=true", handle.session_id)) {
+        match self.get_typed(&format!(
+            "/sessions/{}/usage?breakdown=true",
+            encode(&handle.session_id)
+        )) {
             Ok(v) => Ok(parse_usage(&v)),
             // Usage is advisory: a session the archive cannot price is
             // simply a session without stats.
-            Err(JilogReviewError::Reader(msg)) if msg.contains("HTTP 404") => Ok(None),
-            Err(e) => Err(e),
+            Err(GetError::Status(404)) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -453,7 +504,7 @@ mod tests {
     const SESSIONS_PAGE_1: &str = r#"{"sessions":[
       {"id":"codex:01a0a70d-eb7f-7b52-9433-c9f5eca9d373","project":"i_wa","machine":"4a70f2a82b531088b36678f1b96a47f8","agent":"codex","started_at":"2026-09-15T21:52:03.487Z","ended_at":"2026-09-16T00:00:19.938Z","is_automated":false},
       {"id":"a37ffc87-2799-4a09-830b-a92fde71d768","project":"jibot","machine":"4a70f2a82b531088b36678f1b96a47f8","agent":"claude","started_at":"2026-09-11T21:57:31.589Z","ended_at":"2026-09-11T23:10:00Z","is_automated":true}
-    ],"next_cursor":"CURSOR1","total":3}"#;
+    ],"next_cursor":"c+u/r=s&or 1","total":3}"#;
     const SESSIONS_PAGE_2: &str = r#"{"sessions":[
       {"id":"cowork:53c9fd03-e50a-4baa-aadd-cb1c75c60f07","project":"x","machine":"deadbeef","agent":"cowork","started_at":"2026-09-15T01:00:00Z","ended_at":null}
     ],"next_cursor":null,"total":3}"#;
@@ -474,7 +525,9 @@ mod tests {
     #[test]
     fn parses_sessions_messages_usage_and_machines() {
         let (page, cursor) = parse_sessions_page(&serde_json::from_str(SESSIONS_PAGE_1).unwrap());
-        assert_eq!(cursor.as_deref(), Some("CURSOR1"));
+        assert_eq!(cursor.as_deref(), Some("c+u/r=s&or 1"));
+        assert_eq!(encode("c+u/r=s&or 1"), "c%2Bu%2Fr%3Ds%26or%201");
+        assert_eq!(encode("codex:01a0-a70d_x.y~z"), "codex%3A01a0-a70d_x.y~z");
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].agent, "codex");
         assert!(page[0].ended_at.is_some());
@@ -552,6 +605,8 @@ mod tests {
             "http://user@127.0.0.1:8080",
             "http://127.0.0.1:99999",
             "http://[::1",
+            "http://[::1]x",
+            "http://[::1]:x",
             "http://",
             "127.0.0.1:8080",
         ] {
@@ -623,12 +678,14 @@ mod tests {
         let token_file = dir.path().join("config.toml");
         std::fs::write(&token_file, "auth_token = \"secret-1\"\n").unwrap();
         let (base, seen) = stub_server(vec![
-            ("cursor=CURSOR1", SESSIONS_PAGE_2.to_string()),
+            // The cursor reaches the daemon percent-encoded; so does the
+            // `:` in a prefixed session id.
+            ("cursor=c%2Bu%2Fr%3Ds%26or%201", SESSIONS_PAGE_2.to_string()),
             ("/api/v1/sessions?limit=500", SESSIONS_PAGE_1.to_string()),
             ("/api/v1/machines", MACHINES.to_string()),
             ("a37ffc87-2799-4a09-830b-a92fde71d768/messages", MESSAGES_PAGE.to_string()),
             ("a37ffc87-2799-4a09-830b-a92fde71d768/usage", USAGE.to_string()),
-            ("cowork:53c9fd03-e50a-4baa-aadd-cb1c75c60f07/usage", USAGE_EMPTY.to_string()),
+            ("cowork%3A53c9fd03-e50a-4baa-aadd-cb1c75c60f07/usage", USAGE_EMPTY.to_string()),
         ]);
         let reader = AgentsviewReader::new(&base, token_file, 3650, Duration::from_secs(5)).unwrap();
         let since = DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z").unwrap().with_timezone(&Utc);
@@ -686,7 +743,14 @@ mod tests {
                 "{seen:?}"
             );
             assert!(seen.iter().any(|(p, _)| p == "/api/v1/machines"), "{seen:?}");
-            assert!(seen.iter().any(|(p, _)| p.contains("cursor=CURSOR1")), "second page requested");
+            assert!(
+                seen.iter().any(|(p, _)| p.contains("cursor=c%2Bu%2Fr%3Ds%26or%201")),
+                "second page requested with an encoded cursor: {seen:?}"
+            );
+            assert!(
+                seen.iter().any(|(p, _)| p == "/api/v1/sessions/cowork%3A53c9fd03-e50a-4baa-aadd-cb1c75c60f07/usage?breakdown=true"),
+                "prefixed ids are encoded in the path: {seen:?}"
+            );
         }
         // A narrower window: the finished Claude session (ended 2026-09-11)
         // drops out; the codex session (ended 2026-09-16T00:00:19Z) stays;

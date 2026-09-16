@@ -2640,8 +2640,13 @@ mod tests {
         assert_eq!(report.corrections.len(), 1);
         assert_eq!(report.corrections[0].machine, None, "the raw reader won");
         let saved = std::fs::read_to_string(&processed).unwrap();
-        assert!(saved.contains("00000000-0000-4000-8000-000000000001\n"), "key persisted: {saved}");
-        assert!(saved.contains("rollout-2026-09-16T00-00-00-00000000-0000-4000-8000-000000000001\n"));
+        assert!(
+            saved.lines().any(|l| l == "00000000-0000-4000-8000-000000000001"),
+            "key persisted as its own line: {saved}"
+        );
+        assert!(saved
+            .lines()
+            .any(|l| l == "rollout-2026-09-16T00-00-00-00000000-0000-4000-8000-000000000001"));
         // Next run: only the archive reader is configured; the persisted key skips it.
         let archive_only: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
             session_id: "codex:00000000-0000-4000-8000-000000000001".into(),

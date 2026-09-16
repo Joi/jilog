@@ -576,6 +576,10 @@ mod tests {
         if std::env::var_os("UPDATE_GOLDEN").is_some() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &got).unwrap();
+            panic!(
+                "golden regenerated at {} — re-run without UPDATE_GOLDEN to compare",
+                path.display()
+            );
         }
         let want = std::fs::read_to_string(&path)
             .expect("golden missing — generate once with UPDATE_GOLDEN=1");
