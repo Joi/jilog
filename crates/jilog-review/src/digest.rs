@@ -579,9 +579,10 @@ pub fn run_review(
     // merge source for the prior run's signal lists.
     let retry_only_run = sessions_scanned > 0
         && scanned_modified.keys().all(|sid| pending_ids.contains(sid));
+    // An existing same-date digest is preserved when this run scanned
+    // nothing new (sessions_scanned == 0) or only retried sessions.
     let should_write = !args.dry_run
-        && !(sessions_scanned == 0 && digest_path.exists())
-        && !(retry_only_run && digest_path.exists());
+        && !(digest_path.exists() && (sessions_scanned == 0 || retry_only_run));
 
     if should_write {
         write_digest(
@@ -649,6 +650,7 @@ pub fn run_review(
 /// `signal_title`), the bullet line for that signal is annotated with
 /// ` (→ backend#N)` before the trailing newline. Lines for signals without
 /// a matching IssueRef are byte-identical to the pre-improvement-4 output.
+#[allow(clippy::too_many_arguments)]
 pub fn render_digest(
     date: &str,
     corrections: &[Correction],
@@ -898,6 +900,7 @@ pub fn render_digest(
 ///
 /// `issue_index` is forwarded to `render_digest` for bidirectional linking
 /// annotations. Pass `&HashMap::new()` when no tracker is active.
+#[allow(clippy::too_many_arguments)]
 pub fn write_digest(
     date: &str,
     corrections: &[Correction],

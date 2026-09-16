@@ -20,7 +20,6 @@
 //!   first error. It's like a list comprehension that can fail.
 
 use rusqlite::{params, Connection};
-use tracing;
 
 use ledger_core::{Event, EventClass, PayloadTier, Segment, SegmentStore};
 
@@ -194,7 +193,7 @@ impl LedgerDb {
 
             for event in &segment.events {
                 let payload_json = event.payload.as_ref()
-                    .map(|p| serde_json::to_string(p))
+                    .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| SqliteError::Serialization(e.to_string()))?;
 
@@ -269,7 +268,7 @@ impl LedgerDb {
         let mut total = 0;
 
         for segment in &segments {
-            total += self.ingest_segment(&mut segment.clone())?;
+            total += self.ingest_segment(segment)?;
         }
 
         tracing::info!(

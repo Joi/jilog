@@ -276,7 +276,7 @@ pub(crate) fn load_events_jsonl(path: &std::path::Path) -> Result<Vec<Message>, 
 /// - `context:compaction` → `Compaction`
 /// - `session:resume`     → `Resume`
 /// - `tool:pre`           → `ToolCall` (tool_name = `data.tool_name`,
-///                           detail = key-sorted JSON of `data.tool_input`)
+///   detail = key-sorted JSON of `data.tool_input`)
 /// - `llm:response`       → `LlmResponse`
 /// - `prompt:submit`      → `UserMessage`
 ///

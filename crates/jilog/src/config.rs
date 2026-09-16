@@ -275,6 +275,7 @@ impl JilogConfig {
     }
 
     /// Build Reader implementations from config.
+    #[allow(clippy::wrong_self_convention)]
     pub fn into_readers(&self) -> Vec<Box<dyn Reader>> {
         if self.readers.is_empty() {
             // Default: Amplifier reader.
@@ -376,6 +377,7 @@ impl JilogConfig {
     /// its filename — so issue bodies backlink correctly on hosts whose
     /// `--digest-dir` deviates from the default and never mix date sources
     /// (jilog#re4k). Only the kata tracker uses it today.
+    #[allow(clippy::wrong_self_convention)]
     pub fn into_tracker(&self, run_context: Option<(&str, &str)>) -> Box<dyn Tracker> {
         match &self.tracker {
             TrackerConfig::Beads { .. } => {
