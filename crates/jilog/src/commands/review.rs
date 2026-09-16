@@ -492,10 +492,17 @@ mod tests {
 
     #[test]
     fn nightly_survives_an_unreachable_agentsview() {
-        // The agentsview reader points at a closed port: the probe fails,
-        // the block is hidden, and a full (non-dry) run still writes a
-        // digest and exits Ok.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // The agentsview reader points at a listener that drops every
+        // connection (deterministic, unlike a freed ephemeral port another
+        // process could claim): the probe fails, the block is hidden, and
+        // a full (non-dry) run still writes a digest and exits Ok.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
         std::fs::write(&token, "t").unwrap();

@@ -72,7 +72,8 @@ pub struct AgentsviewReader {
 /// Why a request failed: an HTTP status (typed, so callers can treat a 404
 /// as "no data" without parsing prose) or anything else.
 enum GetError {
-    Status(u16),
+    /// HTTP status and the url that returned it.
+    Status(u16, String),
     Other(JilogReviewError),
 }
 
@@ -373,7 +374,7 @@ impl AgentsviewReader {
             .call()
         {
             Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) => return Err(GetError::Status(code)),
+            Err(ureq::Error::Status(code, _)) => return Err(GetError::Status(code, url)),
             Err(ureq::Error::Transport(t)) => {
                 return Err(GetError::Other(JilogReviewError::Reader(format!(
                     "agentsview: {} unreachable: {:?}",
@@ -405,7 +406,9 @@ impl AgentsviewReader {
 impl From<GetError> for JilogReviewError {
     fn from(e: GetError) -> Self {
         match e {
-            GetError::Status(code) => JilogReviewError::Reader(format!("agentsview: HTTP {}", code)),
+            GetError::Status(code, url) => {
+                JilogReviewError::Reader(format!("agentsview: {} → HTTP {}", url, code))
+            }
             GetError::Other(err) => err,
         }
     }
@@ -512,7 +515,7 @@ impl Reader for AgentsviewReader {
             Ok(v) => Ok(parse_usage(&v)),
             // Usage is advisory: a session the archive cannot price is
             // simply a session without stats.
-            Err(GetError::Status(404)) => Ok(None),
+            Err(GetError::Status(404, _)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }

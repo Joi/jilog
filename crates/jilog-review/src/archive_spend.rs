@@ -209,7 +209,10 @@ pub fn fetch_daily_usage(
         let reason = lines
             .iter()
             .rev()
-            .find(|l| l.starts_with("error") || l.starts_with("fatal"))
+            .find(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("error:") || l.starts_with("fatal:")
+            })
             .or(lines.last())
             .copied()
             .unwrap_or("");
@@ -353,14 +356,19 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
         // Missing binary → Err.
         assert!(fetch_daily_usage(&dir.path().join("missing"), from, to, Duration::from_secs(1)).is_err());
-        // Non-zero exit → Err naming the status and the first stderr line.
+        // Non-zero exit → Err naming the status and the CLI's `error:`
+        // line (any case), else the last non-empty line — never a progress
+        // line, and not a trailing hint when an error line exists.
         let bad = script(
             dir.path(),
             "bad",
-            "#!/bin/sh\necho 'Reading archived sessions (1s)' >&2\necho 'error: usage summary: internal error' >&2\necho '' >&2\nexit 3\n",
+            "#!/bin/sh\necho 'Reading archived sessions (1s)' >&2\necho 'errors: 0' >&2\necho 'Error: usage summary: internal error' >&2\necho 'hint: run agentsview sync' >&2\necho '' >&2\nexit 3\n",
         );
         let err = fetch_daily_usage(&bad, from, to, Duration::from_secs(5)).unwrap_err().to_string();
         assert!(err.contains("exit 3") && err.contains("internal error"), "{err}");
-        assert!(!err.contains("Reading archived"), "progress lines are not the reason: {err}");
+        assert!(!err.contains("Reading archived") && !err.contains("errors: 0") && !err.contains("hint:"), "{err}");
+        let noerr = script(dir.path(), "noerr", "#!/bin/sh\necho 'step one' >&2\necho 'gave up' >&2\nexit 2\n");
+        let err = fetch_daily_usage(&noerr, from, to, Duration::from_secs(5)).unwrap_err().to_string();
+        assert!(err.contains("exit 2") && err.contains("gave up"), "last line when no error line: {err}");
     }
 }

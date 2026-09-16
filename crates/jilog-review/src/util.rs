@@ -149,10 +149,6 @@ pub(crate) fn json_decimal(v: &serde_json::Value) -> Option<rust_decimal::Decima
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — ported from opsctl/src/review_nightly.rs
-// ---------------------------------------------------------------------------
-
 /// Run `cmd` with stdin closed and both pipes captured, bounded by
 /// `timeout` end to end: the child runs in its own process group (unix) so
 /// a descendant that inherited a pipe dies with it, the exit wait and the
@@ -182,6 +178,7 @@ pub fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    #[cfg(unix)]
     let pgid = child.id();
     let kill_group = |child: &mut std::process::Child| {
         #[cfg(unix)]
@@ -214,8 +211,8 @@ pub fn run_with_timeout(
         if Instant::now() >= deadline {
             kill_group(&mut child);
             return Err(JilogReviewError::Reader(format!(
-                "command timed out after {}s",
-                timeout.as_secs()
+                "command timed out after {:?}",
+                timeout
             )));
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -231,8 +228,8 @@ pub fn run_with_timeout(
             Err(_) => {
                 kill_group(&mut child);
                 return Err(JilogReviewError::Reader(format!(
-                    "command timed out after {}s waiting for output (a descendant kept the pipe open)",
-                    timeout.as_secs()
+                    "command timed out after {:?} waiting for output (a descendant kept the pipe open)",
+                    timeout
                 )));
             }
         }
@@ -281,6 +278,10 @@ mod timeout_tests {
         assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests — ported from opsctl/src/review_nightly.rs
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
