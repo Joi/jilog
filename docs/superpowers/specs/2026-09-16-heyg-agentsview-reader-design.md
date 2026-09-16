@@ -10,7 +10,7 @@ agentsview 0.43.0 (kenn-io, friend project) already archives every one of those 
 
 ## Facts established against the live daemon (2026-09-16, v0.43.0)
 
-- REST base `http://127.0.0.1:8080/api/v1`, bearer token = `auth_token` in `~/.agentsview/config.toml` (`require_auth = true`). Env `AGENTSVIEW_AUTH_TOKEN` overrides the file for the daemon's own CLI. The daemon answered loopback requests without a header as well; jilog sends the header regardless.
+- REST base `http://127.0.0.1:8080/api/v1`, bearer token = `auth_token` in `~/.agentsview/config.toml` (`require_auth = true`). Env `AGENTSVIEW_AUTH_TOKEN` overrides the file for the daemon's own CLI. Auth is enforced: a request without the header gets 401 (an early-morning daemon still running an older config answered without one; after its 06:23 restart it did not). The token can be rotated by fleet-join scripts, so it is read per request.
 - `GET /sessions?limit=500&active_since=<RFC3339>&include_automated=true&include_one_shot=true&include_children=true[&cursor=…]` → `{sessions: [...], next_cursor, total}`. Session fields used: `id`, `agent`, `machine` (opaque hash), `started_at`, `ended_at`, `is_automated`, `cwd`, `project`. Ids: Claude sessions are the bare transcript uuid (identical to the raw claude-code reader's session id); every other agent is `<agent>:<id>` (`codex:<uuid>`, `cowork:<uuid>`). Default listing hides automated and one-shot sessions; the reader asks for all three.
 - `GET /sessions/{id}/messages?from=<ordinal>&limit=500&direction=asc` → `{count, first_ordinal, last_ordinal, messages: [{ordinal, role, content (string), timestamp, model, output_tokens, …}]}`. With `archive_content = "transcripts"` (this Mac) only `user`/`assistant` rows exist; tool rows are dropped by the archive.
 - `GET /sessions/{id}/usage?breakdown=true` → `{total_output_tokens, peak_context_tokens, has_token_data, cost: {microdollars}, has_cost, cost_usd (float), cost_source, models: [...], unpriced_models: [...], breakdown_count, breakdown: [{model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost: {microdollars}, has_cost}]}`. Money is read from `microdollars` (integer), never from the float.
@@ -66,7 +66,7 @@ Tests: parsers on fixture JSON strings (sessions page, messages page incl. dropp
 
 ### 4. Archive spend — the digest block
 
-`readers::agentsview::ArchiveSpend` (pub, `Clone`, `PartialEq`): `{ yesterday: Option<PeriodSpend>, week: PeriodSpend, week_from: NaiveDate, week_to: NaiveDate }` with `PeriodSpend { total_usd: Decimal, days: usize, agents: BTreeMap<String, Decimal>, models: BTreeMap<String, Decimal> }`. `parse_daily_usage(&str) -> Vec<DailyUsage>` reads the CLI JSON above; `ArchiveSpend::summarize(rows, digest_date)` buckets `date == digest_date − 1` into `yesterday` and `digest_date − 7 ..= digest_date − 1` into `week`; microdollars → `Decimal` with scale 6. Money math is `rust_decimal`.
+`archive_spend::ArchiveSpend` (its own module, re-exported as `jilog_review::{ArchiveSpend, DailyUsage, PeriodSpend}`; pub, `Clone`, `PartialEq`): `{ yesterday: Option<PeriodSpend>, week: PeriodSpend, week_from: NaiveDate, week_to: NaiveDate }` with `PeriodSpend { total_usd: Decimal, days: usize, agents: BTreeMap<String, Decimal>, models: BTreeMap<String, Decimal> }`. `parse_daily_usage(&str) -> Vec<DailyUsage>` reads the CLI JSON above; `ArchiveSpend::summarize(rows, digest_date)` buckets `date == digest_date − 1` into `yesterday` and `digest_date − 7 ..= digest_date − 1` into `week`; microdollars → `Decimal` with scale 6. Money math is `rust_decimal`.
 
 `fetch_daily_usage(bin, since, until, timeout) -> Result<Vec<DailyUsage>>` runs `<bin> usage daily --json --breakdown --since <from> --until <to> --no-sync` through `util::run_with_timeout`: stdin closed, the child in its own process group, one deadline shared by the exit wait and the pipe drain, and the whole group killed on expiry — so neither a mid-sync block nor a descendant that inherited a pipe can stall the nightly. Non-zero exit or unparseable output is an `Err`.
 
@@ -122,4 +122,4 @@ Tests: `summarize` at the window edges (digest date − 1 present/absent, a row 
 
 ## Open questions
 
-None blocking. Whether the loopback daemon should enforce `require_auth` is an upstream question for kenn-io/agentsview, recorded in the run manifest for the epic.
+None. (An early observation that the loopback daemon skipped auth turned out to be a daemon running an older config; the restarted daemon enforces `require_auth`. No upstream question.)
