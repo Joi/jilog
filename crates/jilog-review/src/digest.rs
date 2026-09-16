@@ -965,17 +965,25 @@ pub fn render_digest(
 /// models (jilog#heyg). Agents by cost descending; the five most expensive
 /// models.
 fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
+    /// ` — codex $1.00, claude $2.00`, or nothing when the period has no
+    /// per-agent rows.
     fn agents(p: &crate::archive_spend::PeriodSpend) -> String {
-        p.agents_by_cost()
+        let list = p
+            .agents_by_cost()
             .iter()
             .map(|(agent, cost)| format!("{} {}", sanitize_display(agent), format_usd(cost)))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", ");
+        if list.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", list)
+        }
     }
     buf.push_str("### Archive spend (agentsview)\n\n");
     match &a.yesterday {
         Some(y) => buf.push_str(&format!(
-            "- **Yesterday ({})**: {} — {}\n",
+            "- **Yesterday ({})**: {}{}\n",
             a.week_to,
             format_usd(&y.total_usd),
             agents(y)
@@ -983,7 +991,7 @@ fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend
         None => buf.push_str(&format!("- **Yesterday ({})**: no archive rows\n", a.week_to)),
     }
     buf.push_str(&format!(
-        "- **Trailing 7d ({} – {})**: {} across {} day(s) — {}\n",
+        "- **Trailing 7d ({} – {})**: {} across {} day(s){}\n",
         a.week_from,
         a.week_to,
         format_usd(&a.week.total_usd),
@@ -2537,14 +2545,19 @@ mod tests {
             body.contains("## Spend\n\n- **Total**: no cost data (2 session(s) with usage; unpriced models)\n- **Tokens**: 10 in / 5 out\n\n### Archive spend (agentsview)\n"),
             "{body}"
         );
-        // Yesterday absent.
+        // Yesterday absent; a week without per-agent rows has no separator.
         let mut no_yesterday = archive.clone();
         no_yesterday.yesterday = None;
+        no_yesterday.week.agents.clear();
         let body = render_digest(
             "2026-09-16", &[], &[], &[], &[], &[], &HashMap::new(),
             None, Some(&no_yesterday), &HashMap::new(), &no_issues(), &BTreeMap::new(),
         );
         assert!(body.contains("- **Yesterday (2026-09-15)**: no archive rows\n"), "{body}");
+        assert!(
+            body.contains("- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s)\n"),
+            "{body}"
+        );
     }
 
     #[test]

@@ -156,9 +156,10 @@ pub fn parse_daily_usage(raw: &str) -> Result<Vec<DailyUsage>, JilogReviewError>
     Ok(rows)
 }
 
-/// Run `<bin> usage daily --json --since <from> --until <to> --no-sync`
-/// under `timeout` and parse it. `--no-sync` keeps the CLI from spawning
-/// or waiting on a daemon sync of its own.
+/// Run `<bin> usage daily --json --breakdown --since <from> --until <to>
+/// --no-sync` under `timeout` and parse it. `--breakdown` is what fills
+/// `agentBreakdowns` (model rows are always present); `--no-sync` keeps the
+/// CLI from spawning or waiting on a daemon sync of its own.
 pub fn fetch_daily_usage(
     bin: &Path,
     from: NaiveDate,
@@ -170,6 +171,7 @@ pub fn fetch_daily_usage(
         "usage",
         "daily",
         "--json",
+        "--breakdown",
         "--since",
         &from.to_string(),
         "--until",
@@ -307,7 +309,7 @@ mod tests {
         let argv = std::fs::read_to_string(&calls).unwrap();
         assert_eq!(
             argv.trim(),
-            "usage daily --json --since 2026-09-09 --until 2026-09-15 --no-sync"
+            "usage daily --json --breakdown --since 2026-09-09 --until 2026-09-15 --no-sync"
         );
 
         // A hung binary is killed at the deadline.

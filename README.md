@@ -290,7 +290,7 @@ Boundary: jilog reports spend it **observed** in session files. It does not fetc
 
 ### Archive spend (agentsview)
 
-With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --since <date−7> --until <date−1> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models:
+With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --breakdown --since <date−7> --until <date−1> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models:
 
 ```markdown
 ### Archive spend (agentsview)
