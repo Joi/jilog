@@ -180,14 +180,25 @@ pub fn fetch_daily_usage(
         JilogReviewError::Reader(format!("agentsview usage daily ({}): {}", bin.display(), e))
     })?;
     if !out.status.success() {
+        // The CLI streams progress lines ("Calculating daily totals …")
+        // before its `error:` line, so quote the error line when there is
+        // one, else the last non-empty line.
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let reason = lines
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("error") || l.starts_with("fatal"))
+            .or(lines.last())
+            .copied()
+            .unwrap_or("");
         return Err(JilogReviewError::Reader(format!(
             "agentsview usage daily exit {}: {}",
             out.status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into()),
-            stderr.lines().next().unwrap_or("").trim()
+            reason
         )));
     }
     parse_daily_usage(&String::from_utf8_lossy(&out.stdout))
@@ -310,8 +321,13 @@ mod tests {
         // Missing binary → Err.
         assert!(fetch_daily_usage(&dir.path().join("missing"), from, to, Duration::from_secs(1)).is_err());
         // Non-zero exit → Err naming the status and the first stderr line.
-        let bad = script(dir.path(), "bad", "#!/bin/sh\necho 'fatal: no archive' >&2\nexit 3\n");
+        let bad = script(
+            dir.path(),
+            "bad",
+            "#!/bin/sh\necho 'Reading archived sessions (1s)' >&2\necho 'error: usage summary: internal error' >&2\necho '' >&2\nexit 3\n",
+        );
         let err = fetch_daily_usage(&bad, from, to, Duration::from_secs(5)).unwrap_err().to_string();
-        assert!(err.contains("exit 3") && err.contains("no archive"), "{err}");
+        assert!(err.contains("exit 3") && err.contains("internal error"), "{err}");
+        assert!(!err.contains("Reading archived"), "progress lines are not the reason: {err}");
     }
 }
