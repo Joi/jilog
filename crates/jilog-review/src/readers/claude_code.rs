@@ -10,7 +10,10 @@
 //! (`~/.claude-pool/profiles/seat-NN`, `~/.claude-profiles/glm`, …).
 //! Sessions found under a profile parent carry `seat = <name>`; sessions
 //! under an explicit root carry no seat, so the single-root default is
-//! unchanged (jilog#heyg).
+//! unchanged (jilog#heyg) — unless `default_seat` is set, in which case
+//! every explicit-root session carries that label (`default_seat = "main"`
+//! for `~/.claude/projects`; jilog#d77k). Profile seats are never
+//! overridden by it.
 
 use std::path::PathBuf;
 
@@ -29,11 +32,17 @@ pub const DEFAULT_PROFILE_PARENTS: [&str; 2] = ["~/.claude-pool/profiles", "~/.c
 /// Glob: `<root>/**/*.jsonl` (recursive) for every root.
 /// Session ID = filename stem of the .jsonl file.
 pub struct ClaudeCodeReader {
-    /// Explicit roots. Walked first; a session under one never carries a seat.
+    /// Explicit roots. Walked first; a session under one carries
+    /// `default_seat` (none by default), never a profile seat.
     pub roots: Vec<PathBuf>,
     /// Parents whose `<name>/projects` children are scanned as roots, each
     /// tagged `seat = <name>`.
     pub profile_parents: Vec<PathBuf>,
+    /// Seat label for sessions under an explicit root (`"main"` for the
+    /// default `~/.claude/projects`). `None` keeps them unlabelled, which
+    /// is the pre-0.8.1 output; opt-in so existing digests stay
+    /// byte-identical (jilog#d77k).
+    pub default_seat: Option<String>,
 }
 
 impl ClaudeCodeReader {
@@ -44,12 +53,20 @@ impl ClaudeCodeReader {
 
     /// Explicit roots replace the default and do not imply profile discovery.
     pub fn from_roots(roots: Vec<PathBuf>) -> Self {
-        Self { roots, profile_parents: Vec::new() }
+        Self { roots, profile_parents: Vec::new(), default_seat: None }
     }
 
     /// Add parents whose `<name>/projects` children are scanned as roots.
     pub fn with_profile_parents(mut self, parents: Vec<PathBuf>) -> Self {
         self.profile_parents = parents;
+        self
+    }
+
+    /// Label every session under an explicit root `seat = <seat>`. Profile
+    /// seats are unaffected. An empty label means no label.
+    pub fn with_default_seat(mut self, seat: impl Into<String>) -> Self {
+        let seat = seat.into();
+        self.default_seat = if seat.is_empty() { None } else { Some(seat) };
         self
     }
 
@@ -195,10 +212,11 @@ impl Reader for ClaudeCodeReader {
     }
 
     fn seat(&self, handle: &TranscriptHandle) -> Option<String> {
-        // Explicit roots win: a session under one carries no seat even when
-        // the same directory is reachable through a profile parent.
+        // Explicit roots win: a session under one carries `default_seat`
+        // (usually none) even when the same directory is reachable through
+        // a profile parent.
         if self.roots.iter().any(|root| handle.path.starts_with(root)) {
-            return None;
+            return self.default_seat.clone();
         }
         // `<parent>/<name>/projects/...` → `<name>`.
         self.profile_parents.iter().find_map(|parent| {
@@ -470,5 +488,59 @@ mod tests {
         let r = ClaudeCodeReader::from_default();
         assert_eq!(r.roots.len(), 1);
         assert!(r.profile_parents.is_empty(), "profile discovery is opt-in");
+        assert_eq!(r.default_seat, None, "the 'main' label is opt-in");
+    }
+
+    #[test]
+    fn default_seat_labels_explicit_roots_only() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().join("projects");
+        let pool = tree.path().join("pool");
+        for (dir, file) in [
+            (root.join("-Users-joi-x"), "main-session.jsonl"),
+            (pool.join("seat-06").join("projects/-Users-joi-y"), "seat-06-session.jsonl"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(file), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        }
+        let since = Utc::now() - Duration::days(1);
+
+        // Off (the default): the explicit root carries no seat — jilog#heyg output.
+        let off = ClaudeCodeReader::new(&root).with_profile_parents(vec![pool.clone()]);
+        let handles = off.discover(since).unwrap();
+        assert_eq!(handles.len(), 2);
+        for h in &handles {
+            match h.session_id.as_str() {
+                "main-session" => assert_eq!(off.seat(h), None),
+                "seat-06-session" => assert_eq!(off.seat(h).as_deref(), Some("seat-06")),
+                other => panic!("unexpected session {other}"),
+            }
+        }
+
+        // On: explicit-root sessions carry the label; profile seats are untouched.
+        let on = ClaudeCodeReader::new(&root)
+            .with_profile_parents(vec![pool.clone()])
+            .with_default_seat("main");
+        let handles = on.discover(since).unwrap();
+        assert_eq!(handles.len(), 2);
+        for h in &handles {
+            match h.session_id.as_str() {
+                "main-session" => assert_eq!(on.seat(h).as_deref(), Some("main")),
+                "seat-06-session" => assert_eq!(on.seat(h).as_deref(), Some("seat-06")),
+                other => panic!("unexpected session {other}"),
+            }
+        }
+
+        // An explicit root that is also a profile home: the label wins over
+        // the profile name, because explicit roots win.
+        let explicit_profile = ClaudeCodeReader::from_roots(vec![pool.join("seat-06").join("projects")])
+            .with_profile_parents(vec![pool.clone()])
+            .with_default_seat("main");
+        let handles = explicit_profile.discover(since).unwrap();
+        let h = handles.iter().find(|h| h.session_id == "seat-06-session").unwrap();
+        assert_eq!(explicit_profile.seat(h).as_deref(), Some("main"));
+
+        // An empty label is no label.
+        assert_eq!(ClaudeCodeReader::new(&root).with_default_seat("").default_seat, None);
     }
 }

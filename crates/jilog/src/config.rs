@@ -48,6 +48,11 @@ pub enum ReaderConfig {
         /// `seat = <profile dir>` (opt-in; jilog#heyg).
         #[serde(default)]
         discover_profiles: bool,
+        /// Seat label for sessions under the explicit root(s) — `"main"`
+        /// for `~/.claude/projects`. Unset (the default) keeps them
+        /// unlabelled, so existing digests do not change (jilog#d77k).
+        #[serde(default)]
+        default_seat: Option<String>,
     },
     Codex {
         #[serde(default)]
@@ -384,7 +389,7 @@ impl JilogConfig {
                             .unwrap_or_else(|| expand_tilde("~/.amplifier/projects"));
                         Box::new(AmplifierReader::new(dir))
                     }
-                    ReaderConfig::ClaudeCode { path, paths, discover_profiles } => {
+                    ReaderConfig::ClaudeCode { path, paths, discover_profiles, default_seat } => {
                         let roots = match (paths, path) {
                             (Some(paths), _) => paths.iter().map(|p| expand_tilde(p)).collect(),
                             (None, Some(path)) => vec![expand_tilde(path)],
@@ -395,6 +400,9 @@ impl JilogConfig {
                             reader = reader.with_profile_parents(
                                 DEFAULT_PROFILE_PARENTS.iter().map(|p| expand_tilde(p)).collect(),
                             );
+                        }
+                        if let Some(seat) = default_seat {
+                            reader = reader.with_default_seat(seat.clone());
                         }
                         Box::new(reader)
                     }
@@ -547,11 +555,30 @@ mod tests {
             other => panic!("expected claude-code, got {other:?}"),
         }
         assert_eq!(cfg.into_readers()[0].name(), "claude-code");
-        // Legacy single path still parses; profiles default off; empty paths scans nothing.
+        // Legacy single path still parses; profiles and the seat label default off; empty paths scans nothing.
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"claude-code\"\npath = \"/one\"\n").unwrap();
-        assert!(matches!(cfg.readers[0], ReaderConfig::ClaudeCode { discover_profiles: false, .. }));
+        assert!(matches!(
+            cfg.readers[0],
+            ReaderConfig::ClaudeCode { discover_profiles: false, default_seat: None, .. }
+        ));
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"claude-code\"\npaths = []\n").unwrap();
         assert!(cfg.into_readers()[0].discover(chrono::Utc::now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_code_reader_default_seat_reaches_the_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("projects/-p");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("s.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        let toml = format!(
+            "[[reader]]\ntype = \"claude-code\"\npath = \"{}\"\ndefault_seat = \"main\"\n",
+            dir.path().join("projects").display()
+        );
+        let reader = JilogConfig::from_toml_str(&toml).unwrap().into_readers().remove(0);
+        let handles = reader.discover(chrono::Utc::now() - chrono::Duration::days(1)).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(reader.seat(&handles[0]).as_deref(), Some("main"));
     }
 
     #[test]

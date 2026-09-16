@@ -124,7 +124,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 
 | Reader | Scans | Health signals | Status |
 |---|---|---|---|
-| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format). `paths = [...]` scans several roots; `discover_profiles = true` adds every `~/.claude-pool/profiles/*/projects` and `~/.claude-profiles/*/projects` found at scan time, tagged `seat = <profile dir>` (explicit roots carry no seat) | — | ✅ built-in |
+| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format). `paths = [...]` scans several roots; `discover_profiles = true` adds every `~/.claude-pool/profiles/*/projects` and `~/.claude-profiles/*/projects` found at scan time, tagged `seat = <profile dir>`; `default_seat = "main"` tags the sessions under `path`/`paths` too (off by default: explicit roots carry no seat) | — | ✅ built-in |
 | `agentsview` | The [agentsview](https://github.com/kenn-io/agentsview) archive over its REST API (`http://127.0.0.1:8080` by default; bearer token from `~/.agentsview/config.toml` read per request): every agent it syncs (Claude Code seats and profiles, Codex pool, cowork, cursor, copilot, hermes, pi, …) and every machine it collects from, tagged `agent` + `machine`; per-session usage → spend; the digest's Archive spend block. List it after the raw readers (session-id dedupe) | — | ✅ built-in |
 | `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ (events.jsonl sessions) | ✅ built-in |
 | `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ | ✅ built-in |
@@ -160,10 +160,13 @@ agentsview archive for everything else:
 type = "claude-code"
 path = "~/.claude/projects"
 discover_profiles = true      # + ~/.claude-pool/profiles/*/projects, ~/.claude-profiles/*/projects
+default_seat = "main"         # seat label for the sessions under path/paths
 # or: paths = ["~/.claude/projects", "/archive/seat-01/projects"]
 # (paths wins over path; an empty paths scans no explicit root — profile
-# roots from discover_profiles are unaffected; explicit roots never carry
-# a seat, even when the same directory is reachable through a profile parent)
+# roots from discover_profiles are unaffected; explicit roots carry no seat
+# unless default_seat is set, even when the same directory is reachable
+# through a profile parent. default_seat is off by default so a config
+# without it produces the same digest as before 0.8.1.)
 
 # The agentsview archive: other machines and agents without a raw reader,
 # plus the digest's "Archive spend" block. Keep it LAST — a session both a

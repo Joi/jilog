@@ -165,7 +165,9 @@ pub trait Reader: Send + Sync {
     /// Implementations MUST silently skip unparseable lines.
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError>;
 
-    /// Codex profile that produced this transcript, when known.
+    /// Seat (pool profile) that produced this transcript, when known:
+    /// the Codex or Claude profile directory name, `main` for the
+    /// default root when the reader labels it.
     fn seat(&self, _handle: &TranscriptHandle) -> Option<String> {
         None
     }

@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "MIT"
 # 1.88: ureq 2 → url → idna_adapter → ICU4X need 1.86–1.88 (edition 2024);
