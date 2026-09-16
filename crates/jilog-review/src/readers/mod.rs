@@ -1,5 +1,6 @@
 //! Built-in session-log readers.
 
+pub mod agentsview;
 pub mod amplifier;
 pub mod claude_code;
 pub mod codex;
@@ -9,6 +10,7 @@ pub mod generic;
 pub mod nanoclaw;
 pub mod pi;
 
+pub use agentsview::AgentsviewReader;
 pub use amplifier::AmplifierReader;
 pub use claude_code::{ClaudeCodeReader, DEFAULT_PROFILE_PARENTS};
 pub use codex::CodexReader;

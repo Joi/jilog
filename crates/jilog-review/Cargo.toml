@@ -18,6 +18,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
 rusqlite = { workspace = true }
+ureq = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

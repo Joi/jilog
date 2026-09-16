@@ -52,6 +52,10 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 # File globbing (used by readers to discover transcripts)
 glob = "0.3"
 
+# Plain-HTTP client for the agentsview reader (no TLS: the daemon is
+# loopback or tailnet HTTP; the url must be an IP-literal origin)
+ureq = { version = "2", default-features = false }
+
 # Tempfile (for tests)
 tempfile = "3"
 

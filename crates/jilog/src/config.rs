@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource, DEFAULT_PROFILE_PARENTS},
+    readers::{agentsview, AgentsviewReader, AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource, DEFAULT_PROFILE_PARENTS},
     trackers::{GithubTracker, KataTracker, NoneTracker},
     util::{expand_tilde, expand_tilde_glob},
 };
@@ -81,6 +81,29 @@ pub enum ReaderConfig {
     },
     /// Recorded dispatch failures and local Codex pool allocation failures.
     WorkerSignals,
+    /// agentsview archive (kenn-io/agentsview): sessions, messages and
+    /// per-session usage over the daemon's REST API; also the source of the
+    /// digest's archive Spend block (`agentsview usage daily`, run via `bin`).
+    /// List it AFTER the raw readers: a session both a raw reader and the
+    /// archive know is scanned once, by the raw reader (jilog#heyg).
+    Agentsview {
+        /// Daemon origin, `http://<ip>[:port]` only (default `http://127.0.0.1:8080`).
+        #[serde(default)]
+        url: Option<String>,
+        /// File holding the bearer token: a TOML with `auth_token` (default
+        /// `~/.agentsview/config.toml`) or a bare token. Read per request.
+        #[serde(default)]
+        token_file: Option<String>,
+        /// Archive window cap in days, 1..=3650 (default 7).
+        #[serde(default)]
+        since_days: Option<u32>,
+        /// Per-request and per-CLI-call timeout, 1..=3600 (default 30).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        /// `agentsview` binary for the daily usage fetch (default: `agentsview` on PATH).
+        #[serde(default)]
+        bin: Option<String>,
+    },
     /// pi coding agent (pi.dev) session files
     /// (`~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl`).
     Pi {
@@ -177,6 +200,45 @@ fn default_true() -> bool {
     true
 }
 
+/// The first `agentsview` reader's settings with defaults applied. Used by
+/// `into_readers` and by the CLI's archive-spend probe + fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsviewSettings {
+    pub url: String,
+    pub token_file: PathBuf,
+    pub since_days: u32,
+    pub timeout: std::time::Duration,
+    pub bin: PathBuf,
+}
+
+impl AgentsviewSettings {
+    fn from_reader(rc: &ReaderConfig) -> Option<Self> {
+        match rc {
+            ReaderConfig::Agentsview { url, token_file, since_days, timeout_secs, bin } => {
+                Some(Self {
+                    url: url
+                        .as_deref()
+                        .unwrap_or(agentsview::DEFAULT_URL)
+                        .trim_end_matches('/')
+                        .to_string(),
+                    token_file: expand_tilde(
+                        token_file.as_deref().unwrap_or(agentsview::DEFAULT_TOKEN_FILE),
+                    ),
+                    since_days: since_days.unwrap_or(agentsview::DEFAULT_SINCE_DAYS),
+                    timeout: std::time::Duration::from_secs(
+                        timeout_secs.unwrap_or(agentsview::DEFAULT_TIMEOUT_SECS),
+                    ),
+                    bin: bin
+                        .as_deref()
+                        .map(expand_tilde)
+                        .unwrap_or_else(|| PathBuf::from("agentsview")),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Lexically normalize a path: drop `.` components and resolve `..`
 /// against the preceding component, WITHOUT touching the filesystem.
 /// Used by config validation, where the paths may not exist yet.
@@ -236,6 +298,34 @@ impl JilogConfig {
         // hazard note stands regardless. The spool=true DEFAULT index
         // location is exempt for opsctl compatibility — it predates
         // syncing.
+        // agentsview: an http:// IP-literal origin (no TLS, no DNS in the
+        // client) and bounded numbers — since_days feeds chrono day
+        // arithmetic, timeout_secs feeds Instant + Duration; both must
+        // never overflow at run time. Fail at load with the key named.
+        for rc in &cfg.readers {
+            if let ReaderConfig::Agentsview { url, since_days, timeout_secs, .. } = rc {
+                if let Some(url) = url {
+                    agentsview::validate_url(url)
+                        .map_err(|e| anyhow::anyhow!("reader \"agentsview\": {}", e))?;
+                }
+                if let Some(d) = since_days {
+                    if !(1..=3650).contains(d) {
+                        anyhow::bail!(
+                            "reader \"agentsview\": since_days must be 1..=3650, got {}",
+                            d
+                        );
+                    }
+                }
+                if let Some(t) = timeout_secs {
+                    if !(1..=3600).contains(t) {
+                        anyhow::bail!(
+                            "reader \"agentsview\": timeout_secs must be 1..=3600, got {}",
+                            t
+                        );
+                    }
+                }
+            }
+        }
         for z in &cfg.zones {
             if let Some(ip) = &z.index_path {
                 let idx = normalize_lexical(&expand_tilde(ip));
@@ -346,6 +436,16 @@ impl JilogConfig {
                     ReaderConfig::WorkerSignals => {
                         Box::new(jilog_review::readers::WorkerSignalsReader::default())
                     }
+                    rc @ ReaderConfig::Agentsview { .. } => {
+                        let s = AgentsviewSettings::from_reader(rc)
+                            .expect("matched the agentsview variant");
+                        // The url was validated in from_toml_str; a failure
+                        // here is a programming error.
+                        Box::new(
+                            AgentsviewReader::new(&s.url, s.token_file, s.since_days, s.timeout)
+                                .expect("agentsview url validated at config load"),
+                        )
+                    }
                     ReaderConfig::Pi { path } => {
                         let dir = path
                             .as_deref()
@@ -368,6 +468,13 @@ impl JilogConfig {
                 }
             })
             .collect()
+    }
+
+    /// The first `agentsview` reader's resolved settings (for the CLI's
+    /// archive-spend probe + fetch); None when none is configured.
+    #[allow(dead_code)] // wired into commands/review.rs by the archive-spend chunk
+    pub fn agentsview_settings(&self) -> Option<AgentsviewSettings> {
+        self.readers.iter().find_map(AgentsviewSettings::from_reader)
     }
 
     /// Build a Tracker implementation from config.
@@ -444,6 +551,51 @@ mod tests {
         assert!(matches!(cfg.readers[0], ReaderConfig::ClaudeCode { discover_profiles: false, .. }));
         let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"claude-code\"\npaths = []\n").unwrap();
         assert!(cfg.into_readers()[0].discover(chrono::Utc::now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agentsview_reader_parses_with_defaults_and_overrides() {
+        let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"agentsview\"\n").unwrap();
+        assert!(matches!(
+            cfg.readers[0],
+            ReaderConfig::Agentsview { url: None, token_file: None, since_days: None, timeout_secs: None, bin: None }
+        ));
+        assert_eq!(cfg.into_readers()[0].name(), "agentsview");
+        let s = cfg.agentsview_settings().expect("agentsview configured");
+        assert_eq!(s.url, "http://127.0.0.1:8080");
+        assert!(s.token_file.ends_with(".agentsview/config.toml"));
+        assert_eq!(s.since_days, 7);
+        assert_eq!(s.timeout, std::time::Duration::from_secs(30));
+        assert_eq!(s.bin, std::path::PathBuf::from("agentsview"));
+
+        let cfg = JilogConfig::from_toml_str(
+            "[[reader]]\ntype = \"agentsview\"\nurl = \"http://100.64.0.9:8080/\"\ntoken_file = \"~/.agentsview/token\"\nsince_days = 3\ntimeout_secs = 5\nbin = \"/opt/homebrew/bin/agentsview\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.into_readers().len(), 1);
+        let s = cfg.agentsview_settings().unwrap();
+        assert_eq!(s.url, "http://100.64.0.9:8080", "trailing slash trimmed");
+        assert_eq!(s.bin, std::path::PathBuf::from("/opt/homebrew/bin/agentsview"));
+        assert_eq!(s.since_days, 3);
+        // No agentsview reader → no settings.
+        assert!(JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap().agentsview_settings().is_none());
+        // https, hostnames and out-of-range numbers are refused at config load, loudly.
+        let err = JilogConfig::from_toml_str("[[reader]]\ntype = \"agentsview\"\nurl = \"https://x\"\n")
+            .expect_err("https must be rejected")
+            .to_string();
+        assert!(err.contains("http://"), "{err}");
+        for bad in [
+            "[[reader]]\ntype = \"agentsview\"\nsince_days = 0\n",
+            "[[reader]]\ntype = \"agentsview\"\nsince_days = 4000\n",
+            "[[reader]]\ntype = \"agentsview\"\ntimeout_secs = 0\n",
+            "[[reader]]\ntype = \"agentsview\"\ntimeout_secs = 86400\n",
+            "[[reader]]\ntype = \"agentsview\"\nurl = \"http://localhost:8080\"\n",
+        ] {
+            let err = JilogConfig::from_toml_str(bad)
+                .expect_err("out-of-range or hostname must be rejected")
+                .to_string();
+            assert!(err.contains("agentsview"), "{bad}: {err}");
+        }
     }
 
     #[test]
