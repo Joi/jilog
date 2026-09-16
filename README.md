@@ -24,7 +24,7 @@ The output of a nightly run is:
 
 jilog is the **observation and structuring layer**. LLM synthesis, prompt rewrites, and triage decisions sit one level up — in the agent or workflow that wraps jilog. This keeps jilog Rust-pure, usable without an API key, and integrable with any agent stack.
 
-**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them — including NanoClaw cell bots, whose signals carry persona + channel dimensions. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle: every machine runs `jilog spool emit` (own-host segments into a synced spool directory), one always-on authority runs `jilog spool ingest` (validate, deduplicate, commit into the single-writer fleet store), and any file-sync tool you already run (Syncthing here) is the transport.
+**Cross-machine and cross-harness by design.** Pluggable readers normalize sessions from Claude Code, Amplifier, Codex, GitHub Copilot, the [agentsview](https://github.com/kenn-io/agentsview) archive (every agent and machine it syncs, with spend), or any JSONL agent stack into one `Signal` type, so the same nightly loop runs across all of them — including NanoClaw cell bots, whose signals carry persona + channel dimensions. `ledger-spool` replicates segment files between hosts, giving you one logical event ledger across a fleet — desktop, laptop, cloud worker, agent host — without a server in the middle: every machine runs `jilog spool emit` (own-host segments into a synced spool directory), one always-on authority runs `jilog spool ingest` (validate, deduplicate, commit into the single-writer fleet store), and any file-sync tool you already run (Syncthing here) is the transport.
 
 ### Why not LangSmith / Langfuse?
 
@@ -124,7 +124,8 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 
 | Reader | Scans | Health signals | Status |
 |---|---|---|---|
-| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format) | — | ✅ built-in |
+| `claude-code` | `~/.claude/projects/**/*.jsonl` (`{type, message: {role, content}}` wrapper format). `paths = [...]` scans several roots; `discover_profiles = true` adds every `~/.claude-pool/profiles/*/projects` and `~/.claude-profiles/*/projects` found at scan time, tagged `seat = <profile dir>` (explicit roots carry no seat) | — | ✅ built-in |
+| `agentsview` | The [agentsview](https://github.com/kenn-io/agentsview) archive over its REST API (`http://127.0.0.1:8080` by default; bearer token from `~/.agentsview/config.toml` read per request): every agent it syncs (Claude Code seats and profiles, Codex pool, cowork, cursor, copilot, hermes, pi, …) and every machine it collects from, tagged `agent` + `machine`; per-session usage → spend; the digest's Archive spend block. List it after the raw readers (session-id dedupe) | — | ✅ built-in |
 | `amplifier` | `~/.amplifier/projects/<project>/sessions/<sess>/{transcript,events}.jsonl` (both legacy flat and current nested layouts; `events.jsonl` is synthesized into Schema-B on the fly) | ✅ (events.jsonl sessions) | ✅ built-in |
 | `context-intelligence` | `~/.amplifier/projects/<project>/sessions/<sess>/context-intelligence/events.jsonl` (amplifier-bundle-context-intelligence event streams; sibling `metadata.json` is version-gated per contract — format `context-intelligence`, semver major 1 — incompatible sessions are skipped with a warning) | ✅ | ✅ built-in |
 | `codex` | Main `~/.codex/sessions` and every `~/.codex-pool/profiles/*/sessions` discovered at scan time; user + assistant rollout messages, tagged with `seat` | — | ✅ built-in |
@@ -150,6 +151,52 @@ Explicit `path` or `paths` replaces automatic root discovery; an empty `paths`
 list scans nothing. Seat tags appear on signals, digest lines, and Kata issue
 bodies without changing coding-session correction heuristics. See
 [Codex worker signals](docs/codex-worker-signals.md) for evidence and rollout limits.
+
+Claude Code across the pool seats and context profiles on one Mac, plus the
+agentsview archive for everything else:
+
+```toml
+[[reader]]
+type = "claude-code"
+path = "~/.claude/projects"
+discover_profiles = true      # + ~/.claude-pool/profiles/*/projects, ~/.claude-profiles/*/projects
+# or: paths = ["~/.claude/projects", "/archive/seat-01/projects"]
+# (paths wins over path; an empty paths scans no explicit root — profile
+# roots from discover_profiles are unaffected; explicit roots never carry
+# a seat, even when the same directory is reachable through a profile parent)
+
+# The agentsview archive: other machines and agents without a raw reader,
+# plus the digest's "Archive spend" block. Keep it LAST — a session both a
+# raw reader and the archive know is scanned once, by the raw reader.
+[[reader]]
+type = "agentsview"
+# url = "http://127.0.0.1:8080"            # http://<ip>[:port] only: no TLS, no DNS
+# token_file = "~/.agentsview/config.toml"  # auth_token = "…", or a bare token file
+# since_days = 7                            # archive window cap, 1..=3650
+# timeout_secs = 30                         # per request and for `agentsview usage daily`, 1..=3600
+# bin = "agentsview"                        # for the daily spend fetch
+```
+
+The archive reader talks plain HTTP to an IP-literal origin (the daemon is
+loopback or tailnet-HTTP; a hostname would put DNS resolution outside the
+request timeout, and the client has no TLS), sends `Authorization: Bearer
+<token>` on every request with the token read from `token_file` at request
+time (a TOML config's `auth_token`, or a bare token; a TOML without
+`auth_token` is an error, never a fallback), and asks for automated,
+one-shot and child sessions too. It loads `user`/`assistant` rows only —
+the archive's message rows carry no tool name, so archive sessions produce
+corrections, workarounds and deferrals, never error signals. Dedupe: a
+Claude session's archive id is its transcript uuid and a Codex session's is
+`codex:<rollout uuid>`, so a session a raw reader listed earlier in the
+config already scanned is skipped, in-run and across runs through the
+processed file (both the id and the shared key are recorded; a tracker
+failure unmarks both). One-time effect on upgrade: Codex sessions processed
+before 0.8.0 are recorded under their rollout stem only, so the archive may
+report those still inside its window once more. Signals from the archive
+carry `` `agent:<name>` `machine:<label>` `` spans on their digest lines and
+`agent`/`machine` fields in JSON; local readers leave both absent, so their
+output is unchanged. A daemon that is down is one warning line; the rest of
+the run is unaffected.
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
 
@@ -240,6 +287,20 @@ Amplifier providers stamp `cost_usd` per LLM call into the session files jilog a
 - A **week-over-week cost annotation** — a signal whose issue was already open before the run is a recurrence, and its digest line gains the summed cost of the sessions it recurred in: `(recurred in sessions totaling $4.20)`. Cost as weight: the recurring problems burning the most money surface first.
 
 Boundary: jilog reports spend it **observed** in session files. It does not fetch prices, maintain rate tables, or reconcile with provider billing.
+
+### Archive spend (agentsview)
+
+With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --since <date−7> --until <date−1> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models:
+
+```markdown
+### Archive spend (agentsview)
+
+- **Yesterday (2026-09-15)**: $332.138392 — codex $224.55406, claude $104.943456, cowork $2.640876
+- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s) — codex $1300.25, claude $800.25, cowork $1.00
+- **Top models (7d)**: `gpt-6-astra` $900.00, `claude-opus-5` $700.50, `gpt-5.6-sol` $400.00
+```
+
+Costs come from agentsview's own pricing (integer `microdollars`, summed with `rust_decimal`); jilog still keeps no price tables. The daemon is probed first (`GET /api/v1/machines`) because `usage daily` answers from the local archive even when the daemon is down, and the CLI runs under `timeout_secs` in its own process group (a daemon mid-sync blocks the command for minutes; the nightly never waits on it). The block — and the `archive_spend` key in `--json` (`yesterday`, `week`, `week_from`, `week_to`; costs as decimal strings) — is absent when agentsview is not configured, the daemon is unreachable, the binary is missing, the call exceeds the timeout, the output is unparseable, or the window has no rows. None of those fail the run, and a host without agentsview emits exactly the digest and JSON it emitted before (two golden files under `crates/*/tests/golden/` pin the bytes).
 
 ---
 
