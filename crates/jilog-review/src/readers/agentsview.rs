@@ -105,10 +105,11 @@ pub fn validate_url(url: &str) -> Result<String, JilogReviewError> {
             why, url
         ))
     };
-    let authority = url
+    let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| bad("scheme must be http://"))?
-        .trim_end_matches('/');
+        .ok_or_else(|| bad("scheme must be http://"))?;
+    // At most ONE trailing slash is tolerated; a second one is a path.
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
     if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
         return Err(bad("origin only — no path, query, fragment or userinfo"));
     }
@@ -193,63 +194,73 @@ fn time_field(v: &serde_json::Value, key: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// One `/api/v1/sessions` page → (sessions, next cursor).
-pub fn parse_sessions_page(v: &serde_json::Value) -> (Vec<ArchiveSession>, Option<String>) {
-    let sessions: Vec<ArchiveSession> = v
+/// One `/api/v1/sessions` page → (sessions, next cursor). A 200 whose
+/// body has no `sessions` array is schema drift, not an empty page: it is
+/// an error, so nothing gets marked processed on the strength of it.
+pub fn parse_sessions_page(
+    v: &serde_json::Value,
+) -> Result<(Vec<ArchiveSession>, Option<String>), JilogReviewError> {
+    let rows = v
         .get("sessions")
         .and_then(|s| s.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    Some(ArchiveSession {
-                        id: str_field(row, "id")?,
-                        agent: str_field(row, "agent").unwrap_or_default(),
-                        machine: str_field(row, "machine").unwrap_or_default(),
-                        started_at: time_field(row, "started_at"),
-                        ended_at: time_field(row, "ended_at"),
-                    })
-                })
-                .collect()
+        .ok_or_else(|| JilogReviewError::Reader("agentsview: sessions page has no `sessions` array".into()))?;
+    let sessions: Vec<ArchiveSession> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(ArchiveSession {
+                id: str_field(row, "id")?,
+                agent: str_field(row, "agent").unwrap_or_default(),
+                machine: str_field(row, "machine").unwrap_or_default(),
+                started_at: time_field(row, "started_at"),
+                ended_at: time_field(row, "ended_at"),
+            })
         })
-        .unwrap_or_default();
-    (sessions, str_field(v, "next_cursor").filter(|c| !c.is_empty()))
+        .collect();
+    Ok((sessions, str_field(v, "next_cursor").filter(|c| !c.is_empty())))
 }
 
 /// One `/api/v1/sessions/{id}/messages` page → (messages, `count`,
 /// `last_ordinal`). Only `user` and `assistant` rows become messages: the
 /// archive's rows carry no tool name, so a `tool` row would reach
 /// `detect_errors` as tool "unknown" and bypass the expected-noise rules.
-pub fn parse_messages_page(v: &serde_json::Value) -> (Vec<Message>, usize, Option<i64>) {
-    let messages: Vec<Message> = v
+pub fn parse_messages_page(
+    v: &serde_json::Value,
+) -> Result<(Vec<Message>, usize, Option<i64>), JilogReviewError> {
+    // A 200 without a `messages` array is schema drift: an error, so the
+    // session is not scanned as "no messages" and marked processed.
+    let rows = v
         .get("messages")
         .and_then(|m| m.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let role = str_field(row, "role")?;
-                    if role != "user" && role != "assistant" {
-                        return None;
-                    }
-                    let content = row
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    Some(Message {
-                        role: Some(role),
-                        content: Some(serde_json::Value::String(content)),
-                        name: None,
-                    })
-                })
-                .collect()
+        .ok_or_else(|| JilogReviewError::Reader("agentsview: messages page has no `messages` array".into()))?;
+    let messages: Vec<Message> = rows
+        .iter()
+        .filter_map(|row| {
+            let role = str_field(row, "role")?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content = row
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(Message {
+                role: Some(role),
+                content: Some(serde_json::Value::String(content)),
+                name: None,
+            })
         })
-        .unwrap_or_default();
+        .collect();
+    // `count` is the page's row count (all roles); fall back to the raw row
+    // count, never the filtered one, so a page of tool rows does not end
+    // pagination early.
     let count = v
         .get("count")
         .and_then(|c| c.as_u64())
-        .unwrap_or(messages.len() as u64) as usize;
+        .map(|c| c as usize)
+        .unwrap_or(rows.len());
     let last = v.get("last_ordinal").and_then(|c| c.as_i64());
-    (messages, count, last)
+    Ok((messages, count, last))
 }
 
 /// `/api/v1/sessions/{id}/usage?breakdown=true` → stats, or `None` when the
@@ -313,9 +324,27 @@ impl AgentsviewReader {
         timeout: Duration,
     ) -> Result<Self, JilogReviewError> {
         let base_url = validate_url(url)?;
+        // The same bounds the config loader enforces, for library callers:
+        // since_days feeds day arithmetic, the timeout feeds Instant math.
+        if !(1..=3650).contains(&since_days) {
+            return Err(JilogReviewError::Reader(format!(
+                "agentsview: since_days must be 1..=3650, got {}",
+                since_days
+            )));
+        }
+        if timeout.as_secs() == 0 || timeout.as_secs() > 3600 {
+            return Err(JilogReviewError::Reader(format!(
+                "agentsview: timeout must be 1..=3600 seconds, got {:?}",
+                timeout
+            )));
+        }
+        // No redirects: a redirect to a hostname would put DNS resolution
+        // back outside the timeout, which the IP-literal rule exists to
+        // prevent (and the daemon never redirects its API).
         let http = ureq::AgentBuilder::new()
             .timeout_connect(timeout)
             .timeout(timeout)
+            .redirects(0)
             .build();
         Ok(Self {
             base_url,
@@ -409,7 +438,7 @@ impl Reader for AgentsviewReader {
                 query.push_str("&cursor=");
                 query.push_str(&encode(c));
             }
-            let (page, next) = parse_sessions_page(&self.get(&query)?);
+            let (page, next) = parse_sessions_page(&self.get(&query)?)?;
             for s in page {
                 // A session without `ended_at` is still active: it was
                 // modified "now", whatever its `started_at` says — a
@@ -448,10 +477,24 @@ impl Reader for AgentsviewReader {
                 from,
                 PAGE_LIMIT
             ))?;
-            let (msgs, count, last) = parse_messages_page(&v);
+            let (msgs, count, last) = parse_messages_page(&v)?;
             out.extend(msgs);
             match last {
-                Some(l) if count >= PAGE_LIMIT => from = l + 1,
+                Some(l) if count >= PAGE_LIMIT => {
+                    // Ordinals must advance; anything else is a protocol
+                    // failure that degrades to a warning, never a panic or
+                    // a repeated request.
+                    let next = l.checked_add(1).ok_or_else(|| {
+                        JilogReviewError::Reader("agentsview: message ordinal overflow".into())
+                    })?;
+                    if next <= from {
+                        return Err(JilogReviewError::Reader(format!(
+                            "agentsview: messages page did not advance (from {} → last_ordinal {})",
+                            from, l
+                        )));
+                    }
+                    from = next;
+                }
                 _ => break,
             }
         }
@@ -524,18 +567,27 @@ mod tests {
 
     #[test]
     fn parses_sessions_messages_usage_and_machines() {
-        let (page, cursor) = parse_sessions_page(&serde_json::from_str(SESSIONS_PAGE_1).unwrap());
+        let (page, cursor) = parse_sessions_page(&serde_json::from_str(SESSIONS_PAGE_1).unwrap()).unwrap();
         assert_eq!(cursor.as_deref(), Some("c+u/r=s&or 1"));
         assert_eq!(encode("c+u/r=s&or 1"), "c%2Bu%2Fr%3Ds%26or%201");
         assert_eq!(encode("codex:01a0-a70d_x.y~z"), "codex%3A01a0-a70d_x.y~z");
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].agent, "codex");
         assert!(page[0].ended_at.is_some());
-        let (page2, cursor2) = parse_sessions_page(&serde_json::from_str(SESSIONS_PAGE_2).unwrap());
+        let (page2, cursor2) = parse_sessions_page(&serde_json::from_str(SESSIONS_PAGE_2).unwrap()).unwrap();
         assert_eq!(cursor2, None);
         assert_eq!(page2[0].ended_at, None, "null ended_at is None");
+        // Structural drift on a 200 is an error, never an empty page.
+        assert!(parse_sessions_page(&serde_json::json!({})).is_err());
+        assert!(parse_sessions_page(&serde_json::json!({"sessions": 5})).is_err());
+        assert!(parse_messages_page(&serde_json::json!({"count": 1})).is_err());
+        let (empty, count, _) = parse_messages_page(&serde_json::json!({"messages": []})).unwrap();
+        assert!(empty.is_empty() && count == 0);
+        // The count fallback is the raw row count, not the filtered one.
+        let (msgs, count, _) = parse_messages_page(&serde_json::json!({"messages": [{"role":"tool","content":"x"}]})).unwrap();
+        assert!(msgs.is_empty() && count == 1);
 
-        let (msgs, count, last) = parse_messages_page(&serde_json::from_str(MESSAGES_PAGE).unwrap());
+        let (msgs, count, last) = parse_messages_page(&serde_json::from_str(MESSAGES_PAGE).unwrap()).unwrap();
         assert_eq!((count, last), (4, Some(3)));
         assert_eq!(msgs.len(), 2, "role-less and tool rows are dropped: no tool identity, so no error signals");
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
@@ -608,6 +660,7 @@ mod tests {
             "http://[::1]x",
             "http://[::1]:x",
             "http://",
+            "http://127.0.0.1:8080//", // two trailing slashes are a path
             "127.0.0.1:8080",
         ] {
             let err = validate_url(bad).unwrap_err().to_string();
@@ -615,6 +668,11 @@ mod tests {
         }
         assert!(AgentsviewReader::new("https://x", PathBuf::from("/nonexistent"), 7, Duration::from_secs(1)).is_err());
         assert!(AgentsviewReader::new("http://127.0.0.1:8080/", PathBuf::from("/x"), 7, Duration::from_secs(1)).is_ok());
+        // The constructor enforces the same numeric bounds as the config loader.
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 0, Duration::from_secs(1)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 3651, Duration::from_secs(1)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_millis(0)).is_err());
+        assert!(AgentsviewReader::new("http://127.0.0.1:8080", PathBuf::from("/x"), 7, Duration::from_secs(3601)).is_err());
     }
 
     /// Minimal HTTP/1.1 stub: serves canned JSON by path substring (first
@@ -714,7 +772,10 @@ mod tests {
         let stats = reader.load_stats(claude).unwrap().expect("priced");
         assert_eq!(stats.cost_usd.as_deref(), Some("0.717783"));
         assert_eq!(reader.load_stats(cowork).unwrap(), None, "no token data → None");
-        // A 404 usage is advisory → None, not an error.
+        // A 404 usage is advisory → None, not an error. A 200 messages
+        // page without a `messages` array (the stub's `{}` for unknown
+        // routes returns 404 here, so use the codex route below) is an
+        // error, so the session is never marked processed on drift.
         let missing = TranscriptHandle {
             session_id: "codex:01a0a70d-eb7f-7b52-9433-c9f5eca9d373".into(),
             path: PathBuf::from("agentsview://x"),
@@ -724,6 +785,7 @@ mod tests {
             channel: None,
         };
         assert_eq!(reader.load_stats(&missing).unwrap(), None);
+        assert!(reader.load(&missing).is_err(), "404 on messages is an error, not an empty session");
         {
             let seen = seen.lock().unwrap();
             assert!(seen.iter().all(|(_, auth)| auth == "Bearer secret-1"), "{seen:?}");
@@ -763,6 +825,34 @@ mod tests {
             ["codex:01a0a70d-eb7f-7b52-9433-c9f5eca9d373", "cowork:53c9fd03-e50a-4baa-aadd-cb1c75c60f07"],
             "{ids:?}"
         );
+    }
+
+    #[test]
+    fn drifted_200_responses_are_errors_not_empty_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("t");
+        std::fs::write(&token_file, "x").unwrap();
+        let (base, _seen) = stub_server(vec![
+            ("/api/v1/machines", MACHINES.to_string()),
+            ("/api/v1/sessions?limit=500", "{\"total\": 1}".to_string()),
+            ("drift-1/messages", "{\"ok\": true}".to_string()),
+            ("stuck-1/messages", "{\"count\":500,\"last_ordinal\":0,\"messages\":[]}".to_string()),
+        ]);
+        let reader = AgentsviewReader::new(&base, token_file, 7, Duration::from_secs(5)).unwrap();
+        assert!(reader.discover(Utc::now()).is_err(), "a sessions page without `sessions` is an error");
+        let handle = |id: &str| TranscriptHandle {
+            session_id: id.into(),
+            path: PathBuf::from(format!("agentsview://{id}")),
+            modified: Utc::now(),
+            reader_name: "agentsview".into(),
+            persona: None,
+            channel: None,
+        };
+        assert!(reader.load(&handle("drift-1")).is_err(), "a messages page without `messages` is an error");
+        // A full page whose last_ordinal never advances stops with an error
+        // instead of looping to the page cap.
+        let err = reader.load(&handle("stuck-1")).unwrap_err().to_string();
+        assert!(err.contains("did not advance"), "{err}");
     }
 
     #[test]

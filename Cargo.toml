@@ -12,7 +12,9 @@ members = [
 version = "0.8.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.75"
+# 1.88: ureq 2 → url → idna_adapter → ICU4X need 1.86–1.88 (edition 2024);
+# the fleet toolchain is 1.91 (jilog#heyg).
+rust-version = "1.88"
 repository = "https://github.com/Joi/jilog"
 description = "Pluggable session-log review and append-only event ledger"
 

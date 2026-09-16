@@ -689,7 +689,14 @@ pub fn run_review(
         patterns: all_patterns,
         p0_alerts,
         spend,
-        archive_spend: args.archive_spend.clone(),
+        // Echoed only when the digest carrying it was written (or nothing is
+        // written at all, in a dry run): a same-date rerun that preserved an
+        // earlier digest must not report a block that file does not have.
+        archive_spend: if should_write || args.dry_run {
+            args.archive_spend.clone()
+        } else {
+            None
+        },
         personas,
         digest_path,
         created_issues,
@@ -2558,6 +2565,49 @@ mod tests {
             body.contains("- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s)\n"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn preserved_digest_does_not_report_archive_spend() {
+        // First run writes the digest (no archive block). A same-date rerun
+        // with nothing new to scan preserves that file, so the report must
+        // not carry the freshly fetched block the file does not have.
+        let dir = test_dir("preserved-archive-spend");
+        let processed = dir.join("processed.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+            session_id: "s-preserved".into(),
+            messages: correction_messages("no, wrong branch"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: None,
+            machine: None,
+            dedupe_key: None,
+        })];
+        let mut args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed),
+            date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            dry_run: false,
+            create_issues: false,
+            archive_spend: None,
+        };
+        let first = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert_eq!(first.sessions_scanned, 1);
+        args.archive_spend = Some(sample_archive_spend());
+        let second = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert_eq!(second.sessions_scanned, 0, "already processed");
+        assert!(second.archive_spend.is_none(), "digest preserved → no block reported");
+        let body = std::fs::read_to_string(&second.digest_path).unwrap();
+        assert!(!body.contains("Archive spend"), "{body}");
+        // A dry run writes nothing, so the report is the only output and
+        // carries the block.
+        args.dry_run = true;
+        let dry = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert!(dry.archive_spend.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

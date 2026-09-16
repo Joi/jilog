@@ -195,7 +195,8 @@ before 0.8.0 are recorded under their rollout stem only, so the archive may
 report those still inside its window once more. Signals from the archive
 carry `` `agent:<name>` `machine:<label>` `` spans on their digest lines and
 `agent`/`machine` fields in JSON; local readers leave both absent, so their
-output is unchanged. A daemon that is down is one warning line; the rest of
+output is unchanged. A daemon that is down costs a few warning lines (the
+spend probe, the machine-label lookup, the session listing); the rest of
 the run is unaffected.
 
 Each reader emits normalized `Signal` types: corrections, errors, workarounds, deferrals, patterns. The nightly loop doesn't know which reader produced them. See the `Reader` trait in `crates/jilog-review/src/reader.rs` to implement your own.
@@ -295,9 +296,9 @@ With an `agentsview` reader configured, the nightly also runs `agentsview usage 
 ```markdown
 ### Archive spend (agentsview)
 
-- **Yesterday (2026-09-15)**: $332.138392 — codex $224.55406, claude $104.943456, cowork $2.640876
-- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s) — codex $1300.25, claude $800.25, cowork $1.00
-- **Top models (7d)**: `gpt-6-astra` $900.00, `claude-opus-5` $700.50, `gpt-5.6-sol` $400.00
+- **Yesterday (2026-09-15)**: $332.138392 — codex $224.554060, claude $104.943456, cowork $2.640876
+- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.500000 across 7 day(s) — codex $1300.250000, claude $800.250000, cowork $1.000000
+- **Top models (7d)**: `gpt-6-astra` $900.000000, `claude-opus-5` $700.500000, `gpt-5.6-sol` $400.000000
 ```
 
 Costs come from agentsview's own pricing (integer `microdollars`, summed with `rust_decimal`); jilog still keeps no price tables. The daemon is probed first (`GET /api/v1/machines`) because `usage daily` answers from the local archive even when the daemon is down, and the CLI runs under `timeout_secs` in its own process group (a daemon mid-sync blocks the command for minutes; the nightly never waits on it). The block — and the `archive_spend` key in `--json` (`yesterday`, `week`, `week_from`, `week_to`; costs as decimal strings) — is absent when agentsview is not configured, the daemon is unreachable, the binary is missing, the call exceeds the timeout, the output is unparseable, or the window has no rows. None of those fail the run, and a host without agentsview emits exactly the digest and JSON it emitted before (two golden files under `crates/*/tests/golden/` pin the bytes).

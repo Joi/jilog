@@ -105,52 +105,71 @@ impl ArchiveSpend {
     }
 }
 
-fn micro(v: &serde_json::Value, key: &str) -> Decimal {
-    Decimal::new(
-        v.get(key)
-            .and_then(|c| c.get("microdollars"))
-            .and_then(|m| m.as_i64())
-            .unwrap_or(0),
-        6,
-    )
+/// The `agentsview usage daily --json` schema this parser understands. A
+/// different version is an error (block hidden), never a guess.
+pub const SUPPORTED_SCHEMA_VERSION: u64 = 6;
+
+/// `<key>.microdollars` as a Decimal; missing or non-integer is an error,
+/// never zero — a plausible `$0.00` block would hide real schema drift.
+fn micro(v: &serde_json::Value, key: &str, what: &str) -> Result<Decimal, JilogReviewError> {
+    v.get(key)
+        .and_then(|c| c.get("microdollars"))
+        .and_then(|m| m.as_i64())
+        .map(|m| Decimal::new(m, 6))
+        .ok_or_else(|| {
+            JilogReviewError::Reader(format!(
+                "agentsview usage daily: {} has no integer `{}.microdollars`",
+                what, key
+            ))
+        })
 }
 
-fn breakdown(v: &serde_json::Value, list: &str, name: &str) -> BTreeMap<String, Decimal> {
+fn breakdown(
+    v: &serde_json::Value,
+    list: &str,
+    name: &str,
+) -> Result<BTreeMap<String, Decimal>, JilogReviewError> {
     let mut out = BTreeMap::new();
     for row in v.get(list).and_then(|b| b.as_array()).into_iter().flatten() {
-        if let Some(k) = row.get(name).and_then(|n| n.as_str()) {
-            *out.entry(k.to_string()).or_insert(Decimal::ZERO) += micro(row, "cost");
-        }
+        let k = row.get(name).and_then(|n| n.as_str()).ok_or_else(|| {
+            JilogReviewError::Reader(format!("agentsview usage daily: a {} row has no `{}`", list, name))
+        })?;
+        *out.entry(k.to_string()).or_insert(Decimal::ZERO) += micro(row, "cost", &format!("{} row {}", list, k))?;
     }
-    out
+    Ok(out)
 }
 
-/// Parse `agentsview usage daily --json` output (schema_version 6).
+/// Parse `agentsview usage daily --json` output (schema_version 6). Every
+/// row needs a date and an integer `totalCost.microdollars`; every
+/// breakdown row a name and an integer cost. Anything else is an error.
 pub fn parse_daily_usage(raw: &str) -> Result<Vec<DailyUsage>, JilogReviewError> {
     let v: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| JilogReviewError::Reader(format!("agentsview usage daily: bad JSON: {}", e)))?;
+    match v.get("schema_version").and_then(|s| s.as_u64()) {
+        Some(SUPPORTED_SCHEMA_VERSION) => {}
+        other => {
+            return Err(JilogReviewError::Reader(format!(
+                "agentsview usage daily: schema_version {:?}, expected {}",
+                other, SUPPORTED_SCHEMA_VERSION
+            )))
+        }
+    }
     let daily = v
         .get("daily")
         .and_then(|d| d.as_array())
         .ok_or_else(|| JilogReviewError::Reader("agentsview usage daily: no `daily` array".into()))?;
     let mut rows = Vec::with_capacity(daily.len());
     for row in daily {
-        let date = match row
+        let date = row
             .get("date")
             .and_then(|d| d.as_str())
             .and_then(|s| s.parse::<NaiveDate>().ok())
-        {
-            Some(d) => d,
-            None => {
-                tracing::warn!("agentsview usage daily: row without a date skipped");
-                continue;
-            }
-        };
+            .ok_or_else(|| JilogReviewError::Reader("agentsview usage daily: a daily row has no `date`".into()))?;
         rows.push(DailyUsage {
             date,
-            total_usd: micro(row, "totalCost"),
-            agents: breakdown(row, "agentBreakdowns", "agent"),
-            models: breakdown(row, "modelBreakdowns", "modelName"),
+            total_usd: micro(row, "totalCost", &format!("daily row {}", date))?,
+            agents: breakdown(row, "agentBreakdowns", "agent")?,
+            models: breakdown(row, "modelBreakdowns", "modelName")?,
         });
     }
     Ok(rows)
@@ -257,7 +276,19 @@ mod tests {
         // Nothing in window → None; an empty daily array → no rows → None.
         assert!(ArchiveSpend::summarize(&rows, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()).is_none());
         assert!(ArchiveSpend::summarize(&[], digest).is_none());
-        assert_eq!(parse_daily_usage("{\"daily\": []}").unwrap().len(), 0);
+        assert_eq!(parse_daily_usage("{\"schema_version\": 6, \"daily\": []}").unwrap().len(), 0);
+        // Structurally wrong but syntactically valid output is an error,
+        // never a plausible $0.00 block.
+        for bad in [
+            "{\"daily\": []}",                                                                       // no schema_version
+            "{\"schema_version\": 7, \"daily\": []}",                                                // unsupported version
+            "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\"}]}",                       // no totalCost
+            "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":\"1\"}}]}", // wrong type
+            "{\"schema_version\": 6, \"daily\": [{\"totalCost\":{\"microdollars\":1}}]}",           // no date
+            "{\"schema_version\": 6, \"daily\": [{\"date\":\"2026-09-15\",\"totalCost\":{\"microdollars\":1},\"agentBreakdowns\":[{\"agent\":\"codex\"}]}]}", // breakdown row without cost
+        ] {
+            assert!(parse_daily_usage(bad).is_err(), "must reject: {bad}");
+        }
         // Window edges: a row dated exactly digest − 7 is in, digest − 8 is out.
         let edge = |d: u32| DailyUsage {
             date: day(d),

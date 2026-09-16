@@ -458,7 +458,7 @@ fn rollout_index(roots: &[PathBuf], since: DateTime<Utc>) -> BTreeMap<String, Ve
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|d| Utc.timestamp_opt(d.as_secs() as i64, 0).single())
-                .map_or(true, |modified| modified >= since);
+                .is_none_or(|modified| modified >= since);
             if !fresh {
                 continue;
             }
@@ -822,8 +822,8 @@ impl Reader for WorkerSignalsReader {
             if !live_codex
                 && timestamp(&issue["updated_at"]).is_some_and(|t| t < since)
                 && timestamp(&issue["metadata"]["dispatch"]["dispatched_at"])
-                    .map_or(true, |t| t < since)
-                && timestamp(&issue["metadata"]["kickoff"]["at"]).map_or(true, |t| t < since)
+                    .is_none_or(|t| t < since)
+                && timestamp(&issue["metadata"]["kickoff"]["at"]).is_none_or(|t| t < since)
             {
                 continue;
             }

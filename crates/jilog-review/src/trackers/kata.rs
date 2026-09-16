@@ -568,6 +568,16 @@ fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String 
         .seat()
         .map(|s| format!("- Seat: {}\n", s.replace(['\n', '\r'], " ")))
         .unwrap_or_default();
+    // Archive signals (agentsview) say which agent and machine produced the
+    // session; local readers leave both absent and the body unchanged.
+    let agent_line = signal
+        .agent()
+        .map(|s| format!("- Agent: {}\n", s.replace(['\n', '\r'], " ")))
+        .unwrap_or_default();
+    let machine_line = signal
+        .machine()
+        .map(|s| format!("- Machine: {}\n", s.replace(['\n', '\r'], " ")))
+        .unwrap_or_default();
     let digest_path = match digest_path {
         Some(p) => p.to_string(),
         None => format!("~/.amplifier/health/learning-digest-{}.md", date),
@@ -587,6 +597,8 @@ fn build_body(signal: &Signal, date: &str, digest_path: Option<&str>) -> String 
 - Session: {session_id}\n\
 - Kind: {kind}\n\
 {seat_line}\
+{agent_line}\
+{machine_line}\
 - See `{digest_path}` for the full digest window this signal came from.\n\n\
 ## Signal\n\
 {kind_specific}"
@@ -1135,6 +1147,21 @@ mod tests {
         for r in ["wontfix", "duplicate", "superseded", "audit-no-change", "anything-else"] {
             assert!(!reopen_allowed(Some(r)), "{} must not reopen", r);
         }
+    }
+
+    #[test]
+    fn body_carries_agent_and_machine_lines_only_when_set() {
+        let mut c = crate::signal::Correction {
+            session_id: "cowork:53c9fd03".into(),
+            context: "no, the other one".into(),
+            ..Default::default()
+        };
+        let body = build_body(&Signal::Correction(c.clone()), "2026-09-16", None);
+        assert!(!body.contains("- Agent:") && !body.contains("- Machine:"), "{body}");
+        c.agent = Some("cowork".into());
+        c.machine = Some("macazbd\nx".into());
+        let body = build_body(&Signal::Correction(c), "2026-09-16", None);
+        assert!(body.contains("- Kind: correction\n- Agent: cowork\n- Machine: macazbd x\n- See "), "{body}");
     }
 
     /// A recording `kata` stub: appends every argv line to `<dir>/calls`
