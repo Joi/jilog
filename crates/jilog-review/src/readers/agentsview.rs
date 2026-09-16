@@ -729,6 +729,7 @@ mod tests {
                     .find(|(p, _)| path.contains(p))
                     .map(|(_, b)| b.clone());
                 let (status, body) = match body {
+                    Some(b) if b == "HTTP-500" => ("500 Internal Server Error", "{}".to_string()),
                     Some(b) => ("200 OK", b),
                     None => ("404 Not Found", "{}".to_string()),
                 };
@@ -855,6 +856,7 @@ mod tests {
             // Every page claims to be full and advances: the page cap is an error.
             ("endless-1/messages?from=0&", "{\"count\":500,\"last_ordinal\":499,\"messages\":[]}".to_string()),
             ("endless-1/messages", "{\"count\":500,\"last_ordinal\":99999999,\"messages\":[]}".to_string()),
+            ("boom-1/messages", "HTTP-500".to_string()),
         ]);
         let reader = AgentsviewReader::new(&base, token_file, 7, Duration::from_secs(5)).unwrap();
         assert!(reader.discover(Utc::now()).is_err(), "a sessions page without `sessions` is an error");
@@ -880,6 +882,10 @@ mod tests {
         // check ends it with an error, never Ok.
         let err = reader.load(&handle("endless-1")).unwrap_err().to_string();
         assert!(err.contains("did not advance") || err.contains("exceeds"), "{err}");
+        // A non-404 status names the url and the code, never the header.
+        let err = reader.load(&handle("boom-1")).unwrap_err().to_string();
+        assert!(err.contains("/api/v1/sessions/boom-1/messages") && err.contains("HTTP 500"), "{err}");
+        assert!(!err.contains("Bearer"), "{err}");
     }
 
     #[test]
@@ -887,8 +893,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("t");
         std::fs::write(&token_file, "x").unwrap();
-        // Port from a listener we immediately drop → connection refused.
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // A listener that drops every connection (deterministic, unlike a
+        // freed ephemeral port another process could claim): the request
+        // ends in a transport error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
         let reader = AgentsviewReader::new(&format!("http://127.0.0.1:{port}"), token_file, 7, Duration::from_secs(2)).unwrap();
         let err = reader.discover(Utc::now()).unwrap_err().to_string();
         assert!(err.contains("unreachable"), "{err}");
