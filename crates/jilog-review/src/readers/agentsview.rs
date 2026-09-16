@@ -474,7 +474,10 @@ impl Reader for AgentsviewReader {
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
         let mut out = Vec::new();
         let mut from: i64 = 0;
-        for _ in 0..MAX_PAGES {
+        // Up to MAX_PAGES full pages plus one more request, which must be
+        // short: a transcript of exactly MAX_PAGES × PAGE_LIMIT rows is
+        // complete, a longer one is refused.
+        for page in 0..=MAX_PAGES {
             let v = self.get(&format!(
                 "/sessions/{}/messages?from={}&limit={}&direction=asc",
                 encode(&handle.session_id),
@@ -485,6 +488,9 @@ impl Reader for AgentsviewReader {
             out.extend(msgs);
             if count < PAGE_LIMIT {
                 return Ok(out);
+            }
+            if page == MAX_PAGES {
+                break;
             }
             // A full page must carry an advancing `last_ordinal`; anything
             // else is a protocol failure that degrades to a warning (the
@@ -505,8 +511,9 @@ impl Reader for AgentsviewReader {
             from = next;
         }
         Err(JilogReviewError::Reader(format!(
-            "agentsview: session {} exceeds {} message pages; not scanned",
+            "agentsview: session {} exceeds {} messages ({} full pages); not scanned",
             handle.session_id,
+            MAX_PAGES * PAGE_LIMIT,
             MAX_PAGES
         )))
     }
@@ -727,7 +734,21 @@ mod tests {
                 let body = routes
                     .iter()
                     .find(|(p, _)| path.contains(p))
-                    .map(|(_, b)| b.clone());
+                    .map(|(_, b)| b.clone())
+                    .map(|b| {
+                        if b == "FULL-PAGE-FROM" {
+                            // A full page that always advances: last_ordinal = from + 499.
+                            let from: i64 = path
+                                .split("from=")
+                                .nth(1)
+                                .and_then(|s| s.split('&').next())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            format!("{{\"count\":500,\"last_ordinal\":{},\"messages\":[]}}", from + 499)
+                        } else {
+                            b
+                        }
+                    });
                 let (status, body) = match body {
                     Some(b) if b == "HTTP-500" => ("500 Internal Server Error", "{}".to_string()),
                     Some(b) => ("200 OK", b),
@@ -853,9 +874,11 @@ mod tests {
             ("drift-1/messages", "{\"ok\": true}".to_string()),
             ("stuck-1/messages", "{\"count\":500,\"last_ordinal\":0,\"messages\":[]}".to_string()),
             ("noord-1/messages", "{\"count\":500,\"messages\":[]}".to_string()),
-            // Every page claims to be full and advances: the page cap is an error.
+            // Page 2 and 3 repeat the same last_ordinal: the monotonic check fires on page 3.
             ("endless-1/messages?from=0&", "{\"count\":500,\"last_ordinal\":499,\"messages\":[]}".to_string()),
             ("endless-1/messages", "{\"count\":500,\"last_ordinal\":99999999,\"messages\":[]}".to_string()),
+            // Every page is full and advances: the cap is an error.
+            ("cap-1/messages", "FULL-PAGE-FROM".to_string()),
             ("boom-1/messages", "HTTP-500".to_string()),
         ]);
         let reader = AgentsviewReader::new(&base, token_file, 7, Duration::from_secs(5)).unwrap();
@@ -877,11 +900,14 @@ mod tests {
         // partial transcript reported as complete.
         let err = reader.load(&handle("noord-1")).unwrap_err().to_string();
         assert!(err.contains("without last_ordinal"), "{err}");
-        // The second endless page repeats last_ordinal 99999999 forever, so
-        // page 3 fails to advance — either way the cap or the monotonic
-        // check ends it with an error, never Ok.
+        // The second endless page repeats last_ordinal 99999999, so page 3
+        // fails to advance.
         let err = reader.load(&handle("endless-1")).unwrap_err().to_string();
-        assert!(err.contains("did not advance") || err.contains("exceeds"), "{err}");
+        assert!(err.contains("did not advance"), "{err}");
+        // Every page full and advancing: after MAX_PAGES full pages and one
+        // more full one, the cap is an error, never a partial Ok.
+        let err = reader.load(&handle("cap-1")).unwrap_err().to_string();
+        assert!(err.contains("exceeds 20000 messages"), "{err}");
         // A non-404 status names the url and the code, never the header.
         let err = reader.load(&handle("boom-1")).unwrap_err().to_string();
         assert!(err.contains("/api/v1/sessions/boom-1/messages") && err.contains("HTTP 500"), "{err}");
