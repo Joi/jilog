@@ -1,8 +1,16 @@
-//! ClaudeCodeReader — scans `~/.claude/projects/**/*.jsonl`.
+//! ClaudeCodeReader — scans one or more Claude Code project roots
+//! (`<root>/**/*.jsonl`).
 //!
 //! Claude Code nests projects by hashed cwd and stores multiple event shapes
 //! per file. Only Schema-B-shaped lines (those with `role`/`content`/`name`
 //! fields) are kept; everything else is silently skipped.
+//!
+//! Roots come from `roots` plus, for each `profile_parents` entry, every
+//! `<parent>/<name>/projects` directory that exists at scan time
+//! (`~/.claude-pool/profiles/seat-NN`, `~/.claude-profiles/glm`, …).
+//! Sessions found under a profile parent carry `seat = <name>`; sessions
+//! under an explicit root carry no seat, so the single-root default is
+//! unchanged (jilog#heyg).
 
 use std::path::PathBuf;
 
@@ -12,22 +20,84 @@ use crate::error::JilogReviewError;
 use crate::reader::{Message, Reader, TranscriptHandle};
 use crate::util::expand_tilde;
 
+/// Profile parents `discover_profiles = true` adds (tilde-expanded at
+/// config time): the Claude pool seats and the context profiles.
+pub const DEFAULT_PROFILE_PARENTS: [&str; 2] = ["~/.claude-pool/profiles", "~/.claude-profiles"];
+
 /// Reader for Claude Code session transcripts.
 ///
-/// Glob: `<projects_dir>/**/*.jsonl` (recursive).
+/// Glob: `<root>/**/*.jsonl` (recursive) for every root.
 /// Session ID = filename stem of the .jsonl file.
 pub struct ClaudeCodeReader {
-    pub projects_dir: PathBuf,
+    /// Explicit roots. Walked first; a session under one never carries a seat.
+    pub roots: Vec<PathBuf>,
+    /// Parents whose `<name>/projects` children are scanned as roots, each
+    /// tagged `seat = <name>`.
+    pub profile_parents: Vec<PathBuf>,
 }
 
 impl ClaudeCodeReader {
+    /// One explicit root, no profile discovery.
     pub fn new(projects_dir: impl Into<PathBuf>) -> Self {
-        Self { projects_dir: projects_dir.into() }
+        Self::from_roots(vec![projects_dir.into()])
+    }
+
+    /// Explicit roots replace the default and do not imply profile discovery.
+    pub fn from_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots, profile_parents: Vec::new() }
+    }
+
+    /// Add parents whose `<name>/projects` children are scanned as roots.
+    pub fn with_profile_parents(mut self, parents: Vec<PathBuf>) -> Self {
+        self.profile_parents = parents;
+        self
     }
 
     /// Use the default Claude Code projects directory: `~/.claude/projects`.
     pub fn from_default() -> Self {
         Self::new(expand_tilde("~/.claude/projects"))
+    }
+
+    /// Explicit roots FIRST (sorted, deduplicated), then the profile roots
+    /// discovered under each parent (sorted, deduplicated, minus any that
+    /// is also explicit). `discover` walks them in this order and keeps the
+    /// first occurrence of each canonical file, so an explicit root always
+    /// wins over a profile copy of the same directory — including when the
+    /// explicit root is a symlink to a profile home (the retained handle
+    /// path is the explicit one, and `seat()` sees it as explicit).
+    fn scan_roots(&self) -> Result<Vec<PathBuf>, JilogReviewError> {
+        let mut explicit = self.roots.clone();
+        explicit.sort();
+        explicit.dedup();
+        let mut profiles = Vec::new();
+        for parent in &self.profile_parents {
+            match std::fs::read_dir(parent) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "claude-code: profile entry under {}: {error}",
+                                    parent.display()
+                                );
+                                continue;
+                            }
+                        };
+                        let projects = entry.path().join("projects");
+                        if projects.is_dir() && !explicit.contains(&projects) {
+                            profiles.push(projects);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        profiles.sort();
+        profiles.dedup();
+        explicit.extend(profiles);
+        Ok(explicit)
     }
 }
 
@@ -38,61 +108,95 @@ impl Reader for ClaudeCodeReader {
 
     fn discover(&self, since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
         let mut handles = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
-        if !self.projects_dir.exists() {
-            return Ok(handles);
-        }
-
-        // Recursive walk for all .jsonl files.
-        let pattern = format!("{}/**/*.jsonl", self.projects_dir.display());
-        let entries = match glob::glob(&pattern) {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(JilogReviewError::Reader(format!(
-                    "claude-code: glob error: {}",
-                    e
-                )));
-            }
-        };
-
-        for entry in entries.flatten() {
-            if entry.is_dir() {
+        for root in self.scan_roots()? {
+            if !root.is_dir() {
                 continue;
             }
-
-            let session_id = entry
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| entry.display().to_string());
-
-            let modified = match entry.metadata().and_then(|m| m.modified()) {
-                Ok(st) => {
-                    let secs = st
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    Utc.timestamp_opt(secs as i64, 0).single().unwrap_or(Utc::now())
+            // Recursive walk for all .jsonl files; the root is escaped so a
+            // glob metacharacter in a path matches literally.
+            let pattern =
+                format!("{}/**/*.jsonl", glob::Pattern::escape(&root.to_string_lossy()));
+            let entries = match glob::glob(&pattern) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Err(JilogReviewError::Reader(format!(
+                        "claude-code: glob error: {}",
+                        e
+                    )));
                 }
-                Err(_) => Utc::now(),
             };
 
-            if modified < since {
-                continue;
-            }
+            for entry in entries.flatten() {
+                if entry.is_dir() {
+                    continue;
+                }
+                // One canonical file is scanned once even when two roots
+                // reach it (an explicit symlink root plus its profile copy).
+                let canonical = match std::fs::canonicalize(&entry) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        tracing::warn!("claude-code: {}: {error}", entry.display());
+                        continue;
+                    }
+                };
+                if !seen.insert(canonical) {
+                    continue;
+                }
 
-            handles.push(TranscriptHandle {
-                session_id,
-                path: entry,
-                modified,
-                reader_name: self.name().to_string(),
-                persona: None,
-                channel: None,
-            });
+                let session_id = entry
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| entry.display().to_string());
+
+                let modified = match entry.metadata().and_then(|m| m.modified()) {
+                    Ok(st) => {
+                        let secs = st
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Utc.timestamp_opt(secs as i64, 0).single().unwrap_or(Utc::now())
+                    }
+                    Err(_) => Utc::now(),
+                };
+
+                if modified < since {
+                    continue;
+                }
+
+                handles.push(TranscriptHandle {
+                    session_id,
+                    path: entry,
+                    modified,
+                    reader_name: self.name().to_string(),
+                    persona: None,
+                    channel: None,
+                });
+            }
         }
 
         handles.sort_by_key(|h| h.path.clone());
         Ok(handles)
+    }
+
+    fn seat(&self, handle: &TranscriptHandle) -> Option<String> {
+        // Explicit roots win: a session under one carries no seat even when
+        // the same directory is reachable through a profile parent.
+        if self.roots.iter().any(|root| handle.path.starts_with(root)) {
+            return None;
+        }
+        // `<parent>/<name>/projects/...` → `<name>`.
+        self.profile_parents.iter().find_map(|parent| {
+            handle
+                .path
+                .strip_prefix(parent)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .and_then(|c| c.as_os_str().to_str())
+                .map(|s| s.to_string())
+        })
     }
 
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
@@ -222,5 +326,98 @@ mod tests {
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
         assert_eq!(msgs[1].role.as_deref(), Some("assistant"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paths_and_profiles_are_scanned_and_seat_tagged() {
+        let tree = tempfile::tempdir().unwrap();
+        let main = tree.path().join(".claude/projects/-Users-joi-x");
+        let pool = tree.path().join(".claude-pool/profiles");
+        let ctx = tree.path().join(".claude-profiles");
+        fs::create_dir_all(&main).unwrap();
+        fs::write(main.join("main-session.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        for seat in ["seat-01", "seat-06"] {
+            let p = pool.join(seat).join("projects/-Users-joi-y");
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join(format!("{seat}-session.jsonl")), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        }
+        // A profile dir without projects/ and a stray file are ignored.
+        fs::create_dir_all(pool.join("seat-12")).unwrap();
+        fs::write(pool.join("README"), "not a profile").unwrap();
+        let glm = ctx.join("glm/projects/-p");
+        fs::create_dir_all(&glm).unwrap();
+        fs::write(glm.join("glm-session.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+
+        let reader = ClaudeCodeReader::from_roots(vec![tree.path().join(".claude/projects")])
+            .with_profile_parents(vec![pool.clone(), ctx.clone()]);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        let mut ids: Vec<&str> = handles.iter().map(|h| h.session_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["glm-session", "main-session", "seat-01-session", "seat-06-session"]);
+        for h in &handles {
+            let seat = reader.seat(h);
+            match h.session_id.as_str() {
+                "main-session" => assert_eq!(seat, None, "explicit roots carry no seat"),
+                "glm-session" => assert_eq!(seat.as_deref(), Some("glm")),
+                "seat-01-session" => assert_eq!(seat.as_deref(), Some("seat-01")),
+                "seat-06-session" => assert_eq!(seat.as_deref(), Some("seat-06")),
+                other => panic!("unexpected {other}"),
+            }
+        }
+        // A missing profile parent is not an error; duplicate roots scan once.
+        let reader = ClaudeCodeReader::from_roots(vec![
+            tree.path().join(".claude/projects"),
+            tree.path().join(".claude/projects"),
+        ])
+        .with_profile_parents(vec![tree.path().join("nope")]);
+        assert_eq!(reader.discover(since).unwrap().len(), 1);
+        // Empty roots scan nothing.
+        assert!(ClaudeCodeReader::from_roots(vec![]).discover(since).unwrap().is_empty());
+        // An explicit root that is ALSO reachable through a profile parent
+        // carries no seat and is scanned once: explicit roots win.
+        let reader = ClaudeCodeReader::from_roots(vec![pool.join("seat-06").join("projects")])
+            .with_profile_parents(vec![pool.clone()]);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 2, "seat-01 (profile) + seat-06 (explicit), each once");
+        for h in &handles {
+            match h.session_id.as_str() {
+                "seat-06-session" => assert_eq!(reader.seat(h), None, "explicit root wins over the profile parent"),
+                "seat-01-session" => assert_eq!(reader.seat(h).as_deref(), Some("seat-01")),
+                other => panic!("unexpected {other}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_symlink_root_beats_the_profile_copy() {
+        let tree = tempfile::tempdir().unwrap();
+        let pool = tree.path().join(".claude-pool/profiles");
+        let home = pool.join("seat-06");
+        let proj = home.join("projects/-p");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("s.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        // Lexical order is irrelevant: explicit roots are walked first.
+        let link = tree.path().join("zzz-link-to-seat-06");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let reader = ClaudeCodeReader::from_roots(vec![link.join("projects")])
+            .with_profile_parents(vec![pool.clone()]);
+        let since = Utc::now() - Duration::days(1);
+        let handles = reader.discover(since).unwrap();
+        assert_eq!(handles.len(), 1, "one canonical file, scanned once");
+        assert!(
+            handles[0].path.starts_with(link.join("projects")),
+            "the explicit (symlink) path is retained: {}",
+            handles[0].path.display()
+        );
+        assert_eq!(reader.seat(&handles[0]), None, "explicit root wins, even through a symlink");
+    }
+
+    #[test]
+    fn default_reader_has_no_profile_parents() {
+        let r = ClaudeCodeReader::from_default();
+        assert_eq!(r.roots.len(), 1);
+        assert!(r.profile_parents.is_empty(), "profile discovery is opt-in");
     }
 }

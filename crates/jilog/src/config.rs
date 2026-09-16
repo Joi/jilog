@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use jilog_review::{
     Reader, Tracker,
-    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource},
+    readers::{AmplifierReader, ClaudeCodeReader, CodexReader, ContextIntelligenceReader, CopilotReader, GenericReader, NanoclawReader, PiReader, SessionIdSource, DEFAULT_PROFILE_PARENTS},
     trackers::{GithubTracker, KataTracker, NoneTracker},
     util::{expand_tilde, expand_tilde_glob},
 };
@@ -38,6 +38,14 @@ pub enum ReaderConfig {
     ClaudeCode {
         #[serde(default)]
         path: Option<String>,
+        /// Explicit roots; takes precedence over `path`. An empty list scans nothing.
+        #[serde(default)]
+        paths: Option<Vec<String>>,
+        /// Also scan every `~/.claude-pool/profiles/*/projects` and
+        /// `~/.claude-profiles/*/projects` present at scan time, tagged
+        /// `seat = <profile dir>` (opt-in; jilog#heyg).
+        #[serde(default)]
+        discover_profiles: bool,
     },
     Codex {
         #[serde(default)]
@@ -283,12 +291,19 @@ impl JilogConfig {
                             .unwrap_or_else(|| expand_tilde("~/.amplifier/projects"));
                         Box::new(AmplifierReader::new(dir))
                     }
-                    ReaderConfig::ClaudeCode { path } => {
-                        let dir = path
-                            .as_deref()
-                            .map(expand_tilde)
-                            .unwrap_or_else(|| expand_tilde("~/.claude/projects"));
-                        Box::new(ClaudeCodeReader::new(dir))
+                    ReaderConfig::ClaudeCode { path, paths, discover_profiles } => {
+                        let roots = match (paths, path) {
+                            (Some(paths), _) => paths.iter().map(|p| expand_tilde(p)).collect(),
+                            (None, Some(path)) => vec![expand_tilde(path)],
+                            (None, None) => vec![expand_tilde("~/.claude/projects")],
+                        };
+                        let mut reader = ClaudeCodeReader::from_roots(roots);
+                        if *discover_profiles {
+                            reader = reader.with_profile_parents(
+                                DEFAULT_PROFILE_PARENTS.iter().map(|p| expand_tilde(p)).collect(),
+                            );
+                        }
+                        Box::new(reader)
                     }
                     ReaderConfig::Codex { path, paths } => {
                         if let Some(paths) = paths {
@@ -403,6 +418,30 @@ mod tests {
             assert!(err.contains("\"github\""), "error names github: {err}");
             assert!(err.contains("\"none\""), "error names none: {err}");
         }
+    }
+
+    #[test]
+    fn claude_code_reader_paths_and_profiles_parse() {
+        let cfg = JilogConfig::from_toml_str(
+            "[[reader]]\ntype = \"claude-code\"\npaths = [\"/a/projects\", \"/b/projects\"]\ndiscover_profiles = true\n",
+        )
+        .unwrap();
+        match &cfg.readers[0] {
+            ReaderConfig::ClaudeCode { paths, discover_profiles, .. } => {
+                assert_eq!(
+                    paths.as_deref(),
+                    Some(&["/a/projects".to_string(), "/b/projects".to_string()][..])
+                );
+                assert!(discover_profiles);
+            }
+            other => panic!("expected claude-code, got {other:?}"),
+        }
+        assert_eq!(cfg.into_readers()[0].name(), "claude-code");
+        // Legacy single path still parses; profiles default off; empty paths scans nothing.
+        let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"claude-code\"\npath = \"/one\"\n").unwrap();
+        assert!(matches!(cfg.readers[0], ReaderConfig::ClaudeCode { discover_profiles: false, .. }));
+        let cfg = JilogConfig::from_toml_str("[[reader]]\ntype = \"claude-code\"\npaths = []\n").unwrap();
+        assert!(cfg.into_readers()[0].discover(chrono::Utc::now()).unwrap().is_empty());
     }
 
     #[test]

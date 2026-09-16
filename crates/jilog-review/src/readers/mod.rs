@@ -10,7 +10,7 @@ pub mod nanoclaw;
 pub mod pi;
 
 pub use amplifier::AmplifierReader;
-pub use claude_code::ClaudeCodeReader;
+pub use claude_code::{ClaudeCodeReader, DEFAULT_PROFILE_PARENTS};
 pub use codex::CodexReader;
 pub use context_intelligence::ContextIntelligenceReader;
 pub use copilot::CopilotReader;
