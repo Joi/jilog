@@ -440,7 +440,7 @@ impl SegmentStore {
                 continue;
             }
 
-            let failure = match Segment::read_from_file(&path) {
+            let failure = match Segment::read_from_file(path) {
                 Ok(segment) => match segment.verify() {
                     Ok(true) => None,
                     Ok(false) => Some("checksum mismatch".to_string()),
