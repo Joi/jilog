@@ -36,6 +36,26 @@ impl Signal {
         }
     }
 
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            Self::Correction(s) => s.agent.as_deref(),
+            Self::Error(s) => s.agent.as_deref(),
+            Self::Workaround(s) => s.agent.as_deref(),
+            Self::Pattern(s) => s.agent.as_deref(),
+            Self::Deferral(s) => s.agent.as_deref(),
+        }
+    }
+
+    pub fn machine(&self) -> Option<&str> {
+        match self {
+            Self::Correction(s) => s.machine.as_deref(),
+            Self::Error(s) => s.machine.as_deref(),
+            Self::Workaround(s) => s.machine.as_deref(),
+            Self::Pattern(s) => s.machine.as_deref(),
+            Self::Deferral(s) => s.machine.as_deref(),
+        }
+    }
+
     /// Returns a stable lowercase kind string matching the serde tag.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -56,6 +76,16 @@ pub struct Correction {
     /// Codex profile name; independent of fleet persona and channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    /// Which agent produced the session, when the reader knows it (archive
+    /// readers stamp agentsview's `agent`). Absent for local transcript
+    /// readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Machine the session ran on, when the reader knows it (archive
+    /// readers stamp the agentsview machine label). Absent for local
+    /// transcript readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// The short user message following an assistant turn.
     pub context: String,
     /// Which bot ran the session (fleet sessions only; see
@@ -75,6 +105,16 @@ pub struct ErrorSignal {
     /// Codex profile name; independent of fleet persona and channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    /// Which agent produced the session, when the reader knows it (archive
+    /// readers stamp agentsview's `agent`). Absent for local transcript
+    /// readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Machine the session ran on, when the reader knows it (archive
+    /// readers stamp the agentsview machine label). Absent for local
+    /// transcript readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     pub tool_name: String,
     pub message: String,
     /// Which bot ran the session (fleet sessions only).
@@ -92,6 +132,16 @@ pub struct Workaround {
     /// Codex profile name; independent of fleet persona and channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    /// Which agent produced the session, when the reader knows it (archive
+    /// readers stamp agentsview's `agent`). Absent for local transcript
+    /// readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Machine the session ran on, when the reader knows it (archive
+    /// readers stamp the agentsview machine label). Absent for local
+    /// transcript readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// Human-readable pattern label (e.g. "for now", "TODO", "hack").
     pub pattern: String,
     /// First 200 chars of the matching assistant text.
@@ -116,6 +166,16 @@ pub struct PatternSignal {
     /// Codex profile name; independent of fleet persona and channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    /// Which agent produced the session, when the reader knows it (archive
+    /// readers stamp agentsview's `agent`). Absent for local transcript
+    /// readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Machine the session ran on, when the reader knows it (archive
+    /// readers stamp the agentsview machine label). Absent for local
+    /// transcript readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     /// Human-readable one-line summary (used in issue titles).
     pub description: String,
     /// Stable snake_case detector id, e.g. "compaction_storm".
@@ -139,6 +199,16 @@ pub struct DeferralSignal {
     /// Codex profile name; independent of fleet persona and channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+    /// Which agent produced the session, when the reader knows it (archive
+    /// readers stamp agentsview's `agent`). Absent for local transcript
+    /// readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Machine the session ran on, when the reader knows it (archive
+    /// readers stamp the agentsview machine label). Absent for local
+    /// transcript readers, so their JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     pub item: String,
     /// Which bot ran the session (fleet sessions only).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -104,6 +104,22 @@ pub fn is_sub_agent_session(session_id: &str) -> bool {
     session_id.starts_with(SUB_AGENT_PREFIX)
 }
 
+/// The `8-4-4-4-12` hex uuid `s` ends with, if it ends with one. Used to
+/// recognise one Codex session through two readers: the raw rollout stem
+/// `rollout-<ts>-<uuid>` and the agentsview archive id `codex:<uuid>`
+/// (jilog#heyg).
+pub fn trailing_uuid(s: &str) -> Option<&str> {
+    if !s.is_ascii() || s.len() < 36 {
+        return None;
+    }
+    let tail = &s[s.len() - 36..];
+    let ok = tail.bytes().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    });
+    ok.then_some(tail)
+}
+
 // ---------------------------------------------------------------------------
 // TranscriptHandle — a discovered transcript file
 // ---------------------------------------------------------------------------
@@ -152,6 +168,30 @@ pub trait Reader: Send + Sync {
     /// Codex profile that produced this transcript, when known.
     fn seat(&self, _handle: &TranscriptHandle) -> Option<String> {
         None
+    }
+
+    /// Which agent produced the session (`claude`, `codex`, `cowork`, …),
+    /// when the source records it (archive readers). None for local
+    /// transcript readers, whose reader name already says which agent.
+    fn agent(&self, _handle: &TranscriptHandle) -> Option<String> {
+        None
+    }
+
+    /// Machine the session ran on, when the source records it (archive
+    /// readers). None for local transcript readers.
+    fn machine(&self, _handle: &TranscriptHandle) -> Option<String> {
+        None
+    }
+
+    /// Key under which two readers recognise the same session. The default
+    /// is the session id; readers whose ids wrap a shared identifier
+    /// (`rollout-<ts>-<uuid>`, `codex:<uuid>`) return that identifier so a
+    /// session scanned by a raw reader is not scanned again from the
+    /// archive. `run_review` skips a handle whose key was already scanned
+    /// this run or is in the processed file, and marks both id and key
+    /// (jilog#heyg).
+    fn dedupe_key(&self, handle: &TranscriptHandle) -> String {
+        handle.session_id.clone()
     }
 
     /// Optional richer event stream for health-pattern detection.
@@ -440,6 +480,22 @@ mod tests {
         assert_eq!(parse_session_role("abc-123"), None);
         assert_eq!(parse_session_role("abc-123_"), None);
         assert_eq!(parse_session_role(""), None);
+    }
+
+    #[test]
+    fn trailing_uuid_extracts_only_a_well_formed_suffix() {
+        assert_eq!(
+            trailing_uuid("rollout-2026-03-24T09-02-55-00000000-0000-4000-8000-000000000001"),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            trailing_uuid("00000000-0000-4000-8000-000000000001"),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(trailing_uuid("rollout-2026-03-24T09-02-55-test"), None);
+        assert_eq!(trailing_uuid("short"), None);
+        assert_eq!(trailing_uuid("rollout-x-ZZZZZZZZ-0000-4000-8000-000000000001"), None);
+        assert_eq!(trailing_uuid("rollout-é-00000000-0000-4000-8000-00000000000"), None);
     }
 
     #[test]

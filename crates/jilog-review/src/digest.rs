@@ -266,6 +266,12 @@ pub fn run_review(
     let mut scanned_modified: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
     let pending_ids: HashSet<String> =
         pending_retries.entries().keys().cloned().collect();
+    // Dedupe keys scanned this run, and session id → key for the sessions
+    // whose key differs from their id (jilog#heyg): one session seen through
+    // two readers (raw transcript + archive) is scanned once, and an unmark
+    // for a failed session clears its alias too.
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut aliases: HashMap<String, String> = HashMap::new();
 
     for reader in readers {
         let handles = match reader.discover(effective_since) {
@@ -285,9 +291,16 @@ pub fn run_review(
                 continue;
             }
 
-            // Skip already-processed sessions.
+            // One session, two readers: the first reader in config order
+            // wins; the later copy is skipped by its dedupe key, in-run and
+            // across runs via the processed file.
+            let key = reader.dedupe_key(&handle);
+            if seen_keys.contains(&key) {
+                continue;
+            }
+            // Skip already-processed sessions (by id or by key).
             if let Some(ref ps) = processed {
-                if ps.contains(&handle.session_id) {
+                if ps.contains(&handle.session_id) || ps.contains(&key) {
                     continue;
                 }
             }
@@ -331,8 +344,15 @@ pub fn run_review(
                         );
                         sessions_scanned += 1;
                         scanned_modified.insert(handle.session_id.clone(), handle.modified);
+                        seen_keys.insert(key.clone());
+                        if key != handle.session_id {
+                            aliases.insert(handle.session_id.clone(), key.clone());
+                        }
                         if let Some(ref mut ps) = processed {
                             ps.mark(&handle.session_id);
+                            if key != handle.session_id {
+                                ps.mark(&key);
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -371,6 +391,31 @@ pub fn run_review(
             }
             for signal in &mut patterns {
                 signal.seat.clone_from(&seat);
+            }
+
+            // Archive readers know which agent and machine produced the
+            // session; local readers leave both None (jilog#heyg).
+            let agent = reader.agent(&handle);
+            let machine = reader.machine(&handle);
+            for signal in &mut corrections {
+                signal.agent.clone_from(&agent);
+                signal.machine.clone_from(&machine);
+            }
+            for signal in &mut errors {
+                signal.agent.clone_from(&agent);
+                signal.machine.clone_from(&machine);
+            }
+            for signal in &mut workarounds {
+                signal.agent.clone_from(&agent);
+                signal.machine.clone_from(&machine);
+            }
+            for signal in &mut deferrals {
+                signal.agent.clone_from(&agent);
+                signal.machine.clone_from(&machine);
+            }
+            for signal in &mut patterns {
+                signal.agent.clone_from(&agent);
+                signal.machine.clone_from(&machine);
             }
 
             // Stamp fleet dimensions onto this session's signals and fold
@@ -441,9 +486,16 @@ pub fn run_review(
 
             sessions_scanned += 1;
             scanned_modified.insert(handle.session_id.clone(), handle.modified);
+            seen_keys.insert(key.clone());
+            if key != handle.session_id {
+                aliases.insert(handle.session_id.clone(), key.clone());
+            }
 
             if let Some(ref mut ps) = processed {
                 ps.mark(&handle.session_id);
+                if key != handle.session_id {
+                    ps.mark(&key);
+                }
             }
         }
     }
@@ -609,11 +661,13 @@ pub fn run_review(
     // failed (fresheyes rounds 2+4).
     if !args.dry_run {
         if let (Some(ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
-            for sid in &failed_sessions {
+            // Unmark the alias too: with the id-or-key skip above, a stale
+            // key line would silently drop the retry (jilog#heyg).
+            for sid in failed_sessions.iter().chain(unresolved_pending.iter()) {
                 ps.unmark(sid);
-            }
-            for sid in &unresolved_pending {
-                ps.unmark(sid);
+                if let Some(alias) = aliases.get(sid) {
+                    ps.unmark(alias);
+                }
             }
             ps.save(pf)?;
         }
@@ -713,7 +767,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` — {}{}\n",
-                dims_prefix(&c.persona, &c.channel, &c.seat),
+                dims_prefix(&c.persona, &c.channel, &c.seat, &c.agent, &c.machine),
                 c.session_id,
                 python_repr(&c.context),
                 annotation
@@ -736,7 +790,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` / `{}`: {}{}\n",
-                dims_prefix(&e.persona, &e.channel, &e.seat),
+                dims_prefix(&e.persona, &e.channel, &e.seat, &e.agent, &e.machine),
                 e.session_id,
                 e.tool_name,
                 msg,
@@ -759,7 +813,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` pattern=`{}`: {}{}\n",
-                dims_prefix(&w.persona, &w.channel, &w.seat),
+                dims_prefix(&w.persona, &w.channel, &w.seat, &w.agent, &w.machine),
                 w.session_id,
                 w.pattern,
                 python_repr(&w.context),
@@ -777,7 +831,7 @@ pub fn render_digest(
         for d in deferrals {
             buf.push_str(&format!(
                 "- {}`{}` pattern=`{}`\n",
-                dims_prefix(&d.persona, &d.channel, &d.seat),
+                dims_prefix(&d.persona, &d.channel, &d.seat, &d.agent, &d.machine),
                 d.session_id,
                 d.item
             ));
@@ -798,7 +852,7 @@ pub fn render_digest(
             );
             buf.push_str(&format!(
                 "- {}`{}` kind=`{}`: {}{}\n",
-                dims_prefix(&p.persona, &p.channel, &p.seat),
+                dims_prefix(&p.persona, &p.channel, &p.seat, &p.agent, &p.machine),
                 p.session_id,
                 p.pattern_kind,
                 p.evidence,
@@ -936,6 +990,8 @@ fn dims_prefix(
     persona: &Option<String>,
     channel: &Option<String>,
     seat: &Option<String>,
+    agent: &Option<String>,
+    machine: &Option<String>,
 ) -> String {
     let mut prefix = match persona_key(persona, channel) {
         Some(key) => format!("`{}` ", key),
@@ -943,6 +999,12 @@ fn dims_prefix(
     };
     if let Some(seat) = seat {
         prefix.push_str(&format!("`seat:{}` ", sanitize_display(seat)));
+    }
+    if let Some(agent) = agent {
+        prefix.push_str(&format!("`agent:{}` ", sanitize_display(agent)));
+    }
+    if let Some(machine) = machine {
+        prefix.push_str(&format!("`machine:{}` ", sanitize_display(machine)));
     }
     prefix
 }
@@ -1400,11 +1462,23 @@ mod tests {
         stats: Option<SessionStats>,
         persona: Option<String>,
         channel: Option<String>,
+        agent: Option<String>,
+        machine: Option<String>,
+        dedupe_key: Option<String>,
     }
 
     impl Reader for FixtureReader {
         fn name(&self) -> &str {
             "fixture"
+        }
+        fn agent(&self, _handle: &TranscriptHandle) -> Option<String> {
+            self.agent.clone()
+        }
+        fn machine(&self, _handle: &TranscriptHandle) -> Option<String> {
+            self.machine.clone()
+        }
+        fn dedupe_key(&self, handle: &TranscriptHandle) -> String {
+            self.dedupe_key.clone().unwrap_or_else(|| handle.session_id.clone())
         }
         fn discover(&self, _since: DateTime<Utc>) -> Result<Vec<TranscriptHandle>, JilogReviewError> {
             Ok(vec![TranscriptHandle {
@@ -1477,6 +1551,7 @@ mod tests {
         let already_open = signal_title(&Signal::Correction(correction));
 
         let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-r_explore".into(),
             messages: correction_messages(context),
             stats: Some(SessionStats {
@@ -1523,6 +1598,7 @@ mod tests {
         let dir = test_dir("personas");
         // Fleet session with a chat correction (corrective marker present).
         let jibot = FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-jibot".into(),
             messages: correction_messages("no, use the gog cli for calendar"),
             stats: None,
@@ -1531,6 +1607,7 @@ mod tests {
         };
         // Fleet session with no signals at all.
         let bifbot = FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-bifbot".into(),
             messages: vec![Message {
                 role: Some("assistant".into()),
@@ -1543,6 +1620,7 @@ mod tests {
         };
         // Coding session — must stay dimension-free.
         let coding = FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-coding".into(),
             messages: correction_messages("no, use the gog cli for calendar"),
             stats: None,
@@ -1604,6 +1682,7 @@ mod tests {
         // Short polite reply: correction under the coding heuristic, NOT
         // under the chat-tuned one.
         let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-chat".into(),
             messages: correction_messages("thanks, that looks really great"),
             stats: None,
@@ -1636,6 +1715,8 @@ mod tests {
             context: "no, wrong channel entirely".into(),
             persona: Some("jibot".into()),
             channel: Some("vibez`\ninjected".into()),
+            agent: None,
+            machine: None,
             seat: None,
         };
         let key = persona_key(&correction.persona, &correction.channel).unwrap();
@@ -1701,6 +1782,7 @@ mod tests {
     fn run_review_no_recurrence_annotation_for_new_signals() {
         let dir = test_dir("recurrence-none");
         let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-n".into(),
             messages: correction_messages("please stop doing that thing"),
             stats: Some(SessionStats {
@@ -1825,6 +1907,7 @@ mod tests {
         // Cell-style session: tokens, NO cost field (cell transcripts never
         // carry cost — jilog keeps no price tables).
         let cell = FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-cell".into(),
             messages: correction_messages("jibot no, answer in the thread"),
             stats: Some(SessionStats {
@@ -1839,6 +1922,7 @@ mod tests {
         };
         // Priced fleet session: tokens AND cost, no signals.
         let priced = FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
             session_id: "sess-priced".into(),
             messages: vec![Message {
                 role: Some("assistant".to_string()),
@@ -2238,6 +2322,7 @@ mod tests {
 
         let readers: Vec<Box<dyn Reader>> = vec![
             Box::new(FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
                 session_id: "sess-ok".into(),
                 messages: correction_messages("no, use the gog cli for calendar"),
                 stats: None,
@@ -2245,6 +2330,7 @@ mod tests {
                 channel: None,
             }),
             Box::new(FixtureReader {
+                agent: None, machine: None, dedupe_key: None,
                 session_id: "sess-bad".into(),
                 messages: correction_messages("no, stop rewriting the config"),
                 stats: None,
@@ -2307,9 +2393,157 @@ mod tests {
             dims_prefix(
                 &Some("bot".into()),
                 &Some("chat".into()),
-                &Some("seat`\t\n01".into())
+                &Some("seat`\t\n01".into()),
+                &None,
+                &None,
             ),
             "`bot@chat` `seat:seat'  01` "
         );
+        assert_eq!(
+            dims_prefix(
+                &None,
+                &None,
+                &None,
+                &Some("cowork".into()),
+                &Some("mac`1\n".into()),
+            ),
+            "`agent:cowork` `machine:mac'1 ` "
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent + machine tags and cross-reader dedupe (jilog#heyg)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_and_machine_tags_are_stamped_and_rendered() {
+        let dir = test_dir("machine-tag");
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+            session_id: "a37ffc87-2799-4a09-830b-a92fde71d768".into(),
+            messages: correction_messages("no, use the other path"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: Some("claude".into()),
+            machine: Some("macazbd".into()),
+            dedupe_key: None,
+        })];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert_eq!(report.corrections[0].agent.as_deref(), Some("claude"));
+        assert_eq!(report.corrections[0].machine.as_deref(), Some("macazbd"));
+        let body = std::fs::read_to_string(&report.digest_path).unwrap();
+        assert!(
+            body.contains("- `agent:claude` `machine:macazbd` `a37ffc87-2799-4a09-830b-a92fde71d768` — 'no, use the other path'"),
+            "{body}"
+        );
+        // JSON: absent fields are not serialized, present ones are.
+        let json = serde_json::to_string(&report.corrections[0]).unwrap();
+        assert!(json.contains("\"agent\":\"claude\"") && json.contains("\"machine\":\"macazbd\""), "{json}");
+        let bare = Correction { session_id: "s".into(), context: "c".into(), ..Default::default() };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("agent") && !json.contains("machine"), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedupe_key_skips_a_session_seen_through_two_readers() {
+        let dir = test_dir("dedupe-key");
+        let processed = dir.join("processed.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = FixtureReader {
+            session_id: "rollout-2026-09-16T00-00-00-00000000-0000-4000-8000-000000000001".into(),
+            messages: correction_messages("no, wrong branch"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: None,
+            machine: None,
+            dedupe_key: Some("00000000-0000-4000-8000-000000000001".into()),
+        };
+        let archive = FixtureReader {
+            session_id: "codex:00000000-0000-4000-8000-000000000001".into(),
+            messages: correction_messages("no, wrong branch"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: Some("codex".into()),
+            machine: Some("macazbd".into()),
+            dedupe_key: Some("00000000-0000-4000-8000-000000000001".into()),
+        };
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(raw), Box::new(archive)];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed.clone()),
+            date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            dry_run: false,
+            create_issues: false,
+        };
+        let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 1, "the archive copy is skipped in-run");
+        assert_eq!(report.corrections.len(), 1);
+        assert_eq!(report.corrections[0].machine, None, "the raw reader won");
+        let saved = std::fs::read_to_string(&processed).unwrap();
+        assert!(saved.contains("00000000-0000-4000-8000-000000000001\n"), "key persisted: {saved}");
+        assert!(saved.contains("rollout-2026-09-16T00-00-00-00000000-0000-4000-8000-000000000001\n"));
+        // Next run: only the archive reader is configured; the persisted key skips it.
+        let archive_only: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+            session_id: "codex:00000000-0000-4000-8000-000000000001".into(),
+            messages: correction_messages("no, wrong branch"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: Some("codex".into()),
+            machine: Some("macazbd".into()),
+            dedupe_key: Some("00000000-0000-4000-8000-000000000001".into()),
+        })];
+        let report = run_review(&archive_only, &crate::trackers::NoneTracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracker_failure_unmarks_the_session_and_its_alias() {
+        let dir = test_dir("dedupe-retry");
+        let processed = dir.join("processed.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+            session_id: "codex:00000000-0000-4000-8000-000000000002".into(),
+            messages: correction_messages("no, wrong branch"),
+            stats: None,
+            persona: None,
+            channel: None,
+            agent: Some("codex".into()),
+            machine: None,
+            dedupe_key: Some("00000000-0000-4000-8000-000000000002".into()),
+        })];
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: Some(processed.clone()),
+            date: NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            dry_run: false,
+            create_issues: true,
+        };
+        // OpenTitlesTracker refuses every create → tracker failure → session unmarked.
+        let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
+        assert_eq!(report.tracker_failures, 1);
+        let saved = std::fs::read_to_string(&processed).unwrap();
+        assert!(
+            !saved.contains("00000000-0000-4000-8000-000000000002"),
+            "neither the id nor the alias may stay processed: {saved}"
+        );
+        // The retried run scans it again.
+        let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 1, "retry rescans the session");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -169,6 +169,14 @@ impl Reader for CodexReader {
             .map(|n| if n == ".codex" { "main" } else { n }.to_string())
     }
 
+    fn dedupe_key(&self, handle: &TranscriptHandle) -> String {
+        // The rollout uuid is what the agentsview archive id `codex:<uuid>`
+        // carries, so the same session seen through both readers dedupes.
+        crate::reader::trailing_uuid(&handle.session_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| handle.session_id.clone())
+    }
+
     fn load(&self, handle: &TranscriptHandle) -> Result<Vec<Message>, JilogReviewError> {
         let content = std::fs::read_to_string(&handle.path)?;
         let mut out = Vec::new();
@@ -264,6 +272,11 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert!(handles[0].session_id.starts_with("rollout-2026-03-24"));
         assert_eq!(handles[0].reader_name, "codex");
+        assert_eq!(
+            reader.dedupe_key(&handles[0]),
+            "00000000-0000-4000-8000-000000000001",
+            "codex dedupe key is the rollout uuid, shared with the archive id"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -288,6 +301,11 @@ mod tests {
         let since = Utc::now() - Duration::days(1);
         let handles = reader.discover(since).unwrap();
         assert_eq!(handles.len(), 1);
+        assert_eq!(
+            reader.dedupe_key(&handles[0]),
+            handles[0].session_id,
+            "no uuid suffix → the stem itself"
+        );
 
         let msgs = reader.load(&handles[0]).unwrap();
         assert_eq!(msgs.len(), 2);
