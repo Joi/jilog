@@ -1,0 +1,125 @@
+# agentsview reader + Spend section — design (jilog#heyg)
+
+Child of epic jibot-code#mdxg (plan section B, `/Users/joi/workspaces/jibot/docs/plans/2026-09-16-agentsview-integration.md`). Repo: jilog, direct push, roborev-enrolled. Prior art searched: kata (`agentsview`, `claude-code reader pool seats`, `experiment` label in jilog — no prior issues besides heyg itself), MEMORY.md, repo docs. The codex reader's `paths` + pool discovery (jibot-code#2qet) is the pattern the claude-code half copies; the pi reader's `load_stats` and the kata tracker's shell-out + stub-binary tests are the patterns the archive half copies.
+
+## Problem
+
+The nightly loop (`jilog review nightly`, launchd `com.amplifier.nightly-learning`) reads Claude Code sessions from one root, `~/.claude/projects`. On macazbd that root is nearly empty: the 12 pool seats write under `~/.claude-pool/profiles/seat-NN/projects` and the 4 context profiles under `~/.claude-profiles/{glm,ito,gidc,chiba}/projects`. None of those sessions reach the detectors. Signals carry no token or cost data for Claude Code or Codex sessions, so the digest's Spend section only ever reflects Amplifier and pi sessions.
+
+agentsview 0.43.0 (kenn-io, friend project) already archives every one of those homes (config `[agents.claude] homes`, `[agents.codex] homes`), knows which machine each session came from, and prices usage. jilog should read from it: sessions it has no raw reader for (other machines, cowork, cursor, copilot, hermes) become signals, and the digest gets a real daily spend view.
+
+## Facts established against the live daemon (2026-09-16, v0.43.0)
+
+- REST base `http://127.0.0.1:8080/api/v1`, bearer token = `auth_token` in `~/.agentsview/config.toml` (`require_auth = true`). Env `AGENTSVIEW_AUTH_TOKEN` overrides the file for the daemon's own CLI. The daemon answered loopback requests without a header as well; jilog sends the header regardless.
+- `GET /sessions?limit=500&active_since=<RFC3339>&include_automated=true&include_one_shot=true&include_children=true[&cursor=…]` → `{sessions: [...], next_cursor, total}`. Session fields used: `id`, `agent`, `machine` (opaque hash), `started_at`, `ended_at`, `is_automated`, `cwd`, `project`. Ids: Claude sessions are the bare transcript uuid (identical to the raw claude-code reader's session id); every other agent is `<agent>:<id>` (`codex:<uuid>`, `cowork:<uuid>`). Default listing hides automated and one-shot sessions; the reader asks for all three.
+- `GET /sessions/{id}/messages?from=<ordinal>&limit=500&direction=asc` → `{count, first_ordinal, last_ordinal, messages: [{ordinal, role, content (string), timestamp, model, output_tokens, …}]}`. With `archive_content = "transcripts"` (this Mac) only `user`/`assistant` rows exist; tool rows are dropped by the archive.
+- `GET /sessions/{id}/usage?breakdown=true` → `{total_output_tokens, peak_context_tokens, has_token_data, cost: {microdollars}, has_cost, cost_usd (float), cost_source, models: [...], unpriced_models: [...], breakdown_count, breakdown: [{model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost: {microdollars}, has_cost}]}`. Money is read from `microdollars` (integer), never from the float.
+- `GET /machines` → `{machines: [<hash>...], machine_labels: {<hash>: "macazbd"}, machine_aliases: {local: <hash>}}`.
+- `agentsview usage daily --json --breakdown --since YYYY-MM-DD --until YYYY-MM-DD --no-sync` → `{schema_version: 6, pricing: {...}, projects: {...}, daily: [{date, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalCost: {microdollars}, modelsUsed, modelBreakdowns: [{modelName, …, cost: {microdollars}}], agentBreakdowns: [{agent, …, cost: {microdollars}}], machineBreakdowns, projectBreakdowns}], totals: {...}, sessionCounts: {...}}`. Both breakdown arrays are always present, but `agentBreakdowns` (and machine/project) are EMPTY unless `--breakdown` is passed; `modelBreakdowns` is populated regardless (verified live 2026-09-16). The command has NO `--server` flag: it reads the local archive, and it BLOCKS on "pending startup ingestion" while a daemon is (re)syncing — observed for minutes on 2026-09-16 06:23 after a sibling worker restarted the daemon.
+- The codex rollout stem `rollout-<ts>-<uuid>` ends in the same uuid the archive id `codex:<uuid>` carries.
+
+## Success criteria
+
+1. `[[reader]] type = "claude-code"` accepts `paths = [...]` (precedence over `path`; empty list scans nothing) and `discover_profiles = true` (adds every `~/.claude-pool/profiles/*/projects` and `~/.claude-profiles/*/projects` that exists at scan time). Sessions found under a profile root carry `seat = <profile dir name>` (`seat-06`, `glm`); sessions under an explicit root carry no seat, so the default config's output is unchanged. Unit tests on a temp tree.
+2. `[[reader]] type = "agentsview"` with `url`, `token_file`, `since_days`, `timeout_secs` (all optional) discovers sessions from the daemon over HTTP with `Authorization: Bearer <token>`, the token read from `token_file` at request time (a TOML file's `auth_token`, or a bare token file). It emits corrections, workarounds and deferrals for every agent in the archive (no error signals: the archive's message rows carry no tool identity — see §3), each signal tagged with the agent and the machine label, and reports per-session `SessionStats` from the usage endpoint. A session already covered by a raw reader in the same run, or already in the processed file, is skipped by dedupe key; a tracker failure unmarks every id the session was marked under, so the retry is never lost. The daemon being down is a few warning lines (spend probe, machine labels, session listing), never an error, and the rest of the run is unaffected. Tests run against fixture JSON and a loopback stub server; no external network.
+3. The digest's `## Spend` section gains an archive block — yesterday and the trailing 7 days, total, per agent, top models — built from `agentsview usage daily --json`. The fetch runs only after a bounded probe of the daemon (`GET /api/v1/machines`) succeeds, so the block is absent when agentsview is not configured, the daemon is unreachable, the probe or the CLI times out, the CLI fails, or the window has no rows. `review nightly --json` carries the same numbers under an `archive_spend` key that is present only when the block is present (no key otherwise — the document for an unconfigured host is unchanged).
+4. README documents the two readers' keys and the Spend block. Version bumps to 0.8.0 — a source-breaking pre-1.0 minor for library consumers (see Blast radius): new fields on public structs, one more renderer parameter, `ClaudeCodeReader.projects_dir` replaced. Trait implementors are unaffected.
+5. Verification on this Mac: `cargo build --release`, `cargo test --workspace`, `cargo clippy --workspace -- -D warnings`; `./target/release/jilog review nightly --digest-dir /tmp/jilog-heyg-digest` against the live config (no `--create-issues`) shows pool-seat sessions (seat-tagged lines or a scanned count that includes them) and the Spend block; `~/.local/bin/jilog --version` reports 0.8.0 after `cargo install --path crates/jilog` (the method `cargo install --list` shows today).
+6. Lens: configurations without the new keys produce byte-identical digests and JSON — proven by two golden files generated on the pre-change code (a fully populated digest with every section, and the full `--json` document) and compared byte-for-byte by tests that every chunk must keep green.
+
+## Design
+
+### 1. claude-code reader — roots and profiles
+
+`ClaudeCodeReader { roots: Vec<PathBuf>, profile_parents: Vec<PathBuf> }` replaces the single `projects_dir` (the field is pub today; the crate's only constructor callers are `config.rs` and the reader's tests). Constructors: `new(dir)` (one root, no profiles), `from_roots(Vec<PathBuf>)`, `with_profile_parents(self, Vec<PathBuf>)`, `from_default()` (root `~/.claude/projects`, no profiles — opt-in only).
+
+`scan_roots()`: explicit roots plus, for each profile parent that exists, every child whose `projects` subdirectory is a directory. Sorted and deduplicated. Discovery globs `<escaped root>/**/*.jsonl` per root, deduplicates files by canonical path (a symlinked profile home must not double-count), keeps the mtime `since` filter and the file-stem session id.
+
+`seat(handle)`: a handle whose path starts with any explicit root gives `None` (explicit roots win, even when the same directory is also reachable through a profile parent — `paths = ["~/.claude-pool/profiles/seat-06/projects"]` carries no seat); otherwise the first profile parent the path starts with gives the seat as the path component immediately after that parent. `discover_profiles = true` in config adds `~/.claude-pool/profiles` and `~/.claude-profiles`; `paths` takes precedence over `path`; an empty `paths` scans nothing (mirrors codex). Tested with an explicit root that is also discoverable through a profile parent.
+
+### 2. Reader trait, signals, dedupe
+
+Three default trait methods on `Reader`:
+
+- `fn agent(&self, _handle) -> Option<String>` — `None` by default. The archive reader returns the archive's `agent` field (`claude`, `codex`, `cowork`, …).
+- `fn machine(&self, _handle) -> Option<String>` — `None` by default. The archive reader returns the machine label.
+- `fn dedupe_key(&self, handle) -> String` — the session id by default. The codex reader returns the trailing uuid of the rollout stem when the stem ends in one (`8-4-4-4-12` hex), the archive reader strips the `<agent>:` prefix (a prefix is anything before the first `:` when the remainder is non-empty). Claude sessions already share the bare uuid on both sides.
+
+Every signal struct gains `agent: Option<String>` and `machine: Option<String>` (`serde(default, skip_serializing_if = "Option::is_none")`, so JSON for existing sessions is unchanged) plus `Signal::agent()` / `Signal::machine()`; `run_review` stamps them next to `seat`; `dims_prefix` renders `` `agent:<a>` `` then `` `machine:<m>` `` (sanitized) after the seat span, so a remote Claude session's line is distinguishable by agent even though its id is a bare uuid.
+
+`run_review` keeps a per-run `HashSet<String>` of dedupe keys and a per-run `HashMap<session_id, key>` (the alias map). A handle is skipped when its key was already scanned this run, or when the processed file contains its session id OR its key; on mark, both the session id and the key are recorded when they differ. Every place the run unmarks a session (tracker failures, unresolved pending retries) unmarks its alias too, via the alias map, so a failed session is rescanned next run by whichever reader lists it first. The retry sidecar keeps recording the session id the reader reported (the raw stem or the archive id); rediscovery goes through that reader's own discover, and the in-run key set keeps the second reader from scanning the same session again. Readers run in config order, so raw readers listed before the archive reader win the session (they have the richer transcript). One-time effect: codex sessions processed before this release are recorded only under their rollout stem, so the archive reader may rescan those still inside its window once.
+
+### 3. agentsview reader (`readers/agentsview.rs`)
+
+Config: `ReaderConfig::Agentsview { url: Option<String>, token_file: Option<String>, since_days: Option<u32>, timeout_secs: Option<u64>, bin: Option<String> }`. Defaults: `http://127.0.0.1:8080`, `~/.agentsview/config.toml`, 7, 30, `agentsview`. `bin` is only used by the spend fetch (section 4). `url` is the daemon ORIGIN `http://<ip>[:port]` — an IP-literal host (v4 or bracketed v6), no path, query, fragment or userinfo; a trailing `/` is trimmed. Hostnames are refused because ureq cannot bound DNS resolution by its timeout, and the nightly must not hang on a dead resolver (the fleet's kata rule already uses IP literals over MagicDNS). The reader appends `/api/v1` itself, so every request is `<url>/api/v1/<route>` — the stub test asserts the exact `/api/v1/sessions?…`, `/api/v1/sessions/{id}/messages?…`, `/api/v1/sessions/{id}/usage?breakdown=true` and `/api/v1/machines` paths. `since_days` must be 1..=3650 and `timeout_secs` 1..=3600 (bounded so day arithmetic and `Instant + Duration` cannot overflow).
+
+HTTP: crate `ureq` 2 with `default-features = false` (plain HTTP; the daemon is loopback or tailnet-HTTP by design in the epic). The url and the numeric bounds are validated in `JilogConfig::from_toml_str`, the same place zone paths are validated today, so a bad config fails at load with a message naming the key; `into_readers` stays infallible (`AgentsviewReader::new` re-checks with the same validator and `expect`s the config-time guarantee). Each request: `Authorization: Bearer <token>`, connect + read timeouts from `timeout_secs`. The token is read from `token_file` on every request (rotation without restart) by this rule: if the body parses as a TOML table, the file IS a config file and `auth_token` MUST be a non-empty string — a parsed table without it is an error ("token file <path> has no auth_token"), never a fallback to the body (a one-line TOML holding some other setting must never be sent as a bearer); if it does not parse as TOML, the trimmed body is the token; empty → error. Errors name the path, never the value or the header.
+
+- `discover(since)`: `since_eff = max(since, now − since_days)`; fetch `/machines` once (failure → labels stay empty, hashes are used); page `/sessions` with `active_since=since_eff`, the three include flags, `limit=500`, following `next_cursor` (cap 40 pages). Handle: `session_id = id`, `path = agentsview://<id>` (opaque; nothing opens it), `modified = ended_at`, or now when `ended_at` is null — a session without an end is still active and must not be dropped because it started before the window; `reader_name = "agentsview"`, `persona/channel = None`. Sessions whose `modified < since` are dropped like every other reader. Agent and machine key are kept in an internal `HashMap<id, (agent, machine)>` behind a `Mutex`.
+- `load(handle)`: page `/sessions/{id}/messages` from ordinal 0, `limit=500`, `direction=asc`, `from = last_ordinal + 1` until `count < limit`. Only `user` and `assistant` rows become `Message { role, content: String(content), name: None }`; rows with another `role` (`system`, `tool`) are skipped; a row without a string `role`, or a chat row without string `content`, is schema drift and an error (the session is not scanned, so it is never marked processed with a silently empty transcript). A full page without `last_ordinal`, a non-advancing ordinal, or more than 40 pages is likewise an error. The archive's message rows carry no tool name (tool identity lives under `/sessions/{id}/tool-calls`, out of scope), so `detect_errors` is deliberately not fed: archive sessions produce corrections, workarounds and deferrals, never error signals.
+- `load_stats(handle)`: `/sessions/{id}/usage?breakdown=true` → `SessionStats { cost_usd: microdollars → Decimal string when has_cost, input_tokens = Σ breakdown.input_tokens, output_tokens = total_output_tokens, role: None, model_costs: Σ per model over rows with has_cost }`. A 404 or a usage error is `Ok(None)` (advisory data), any other failure is `Err` (logged as a warning by `run_review`, which already treats stats as advisory).
+- `agent(handle)`: the archive's `agent` field. `machine(handle)`: label for the session's machine key, else the key.
+- `probe()`: `GET /machines` under the timeout; `Ok(())` on 2xx. Used by the CLI to gate the spend fetch (section 4).
+- `discover` errors (connection refused, timeout, non-2xx, bad JSON) surface as `Err(Reader(...))`; `run_review` already logs `reader 'agentsview' discover failed` and continues.
+
+Tests: parsers on fixture JSON strings (sessions page, messages page incl. dropped `tool`/role-less rows, usage with and without cost, machines); a loopback `TcpListener` stub that serves canned responses per exact path, asserts the bearer header, the `/api/v1` prefix and pagination; a connection-refused case that yields `Err` from `discover`; token-file parsing (TOML with `auth_token`, TOML without it → error, bare, empty, missing); config parse rejecting `https://`. No external network.
+
+### 4. Archive spend — the digest block
+
+`readers::agentsview::ArchiveSpend` (pub, `Clone`, `PartialEq`): `{ yesterday: Option<PeriodSpend>, week: PeriodSpend, week_from: NaiveDate, week_to: NaiveDate }` with `PeriodSpend { total_usd: Decimal, days: usize, agents: BTreeMap<String, Decimal>, models: BTreeMap<String, Decimal> }`. `parse_daily_usage(&str) -> Vec<DailyUsage>` reads the CLI JSON above; `ArchiveSpend::summarize(rows, digest_date)` buckets `date == digest_date − 1` into `yesterday` and `digest_date − 7 ..= digest_date − 1` into `week`; microdollars → `Decimal` with scale 6. Money math is `rust_decimal`.
+
+`fetch_daily_usage(bin, since, until, timeout) -> Result<Vec<DailyUsage>>` runs `<bin> usage daily --json --breakdown --since <from> --until <to> --no-sync` through `util::run_with_timeout`: stdin closed, the child in its own process group, one deadline shared by the exit wait and the pipe drain, and the whole group killed on expiry — so neither a mid-sync block nor a descendant that inherited a pipe can stall the nightly. Non-zero exit or unparseable output is an `Err`.
+
+`seat()`/root precedence detail for §1: `scan_roots` walks explicit roots before profile roots and discovery keeps the first canonical occurrence, so an explicit root that is a symlink to a profile home still wins.
+
+Gate: `usage daily` reads the local archive and can answer while the daemon is down (stale numbers). The CLI therefore probes the daemon first — `AgentsviewReader::probe()` (`GET /api/v1/machines`, bearer, timeout) — and runs the fetch only on success. Probe failure, fetch failure, timeout and an empty window all log one warning and leave the block out; the run's exit status is unaffected in every case.
+
+Plumbing: `ReviewArgs` gains `archive_spend: Option<ArchiveSpend>` and `DigestReport` echoes it; `render_digest`/`write_digest` take it as a parameter. The CLI (`commands/review.rs`) builds it from `JilogConfig::agentsview_settings()` (the first `agentsview` reader's resolved `url`, `token_file`, `timeout`, `bin`; `None` when none is configured). Rendering inside `## Spend` (section emitted when observed stats OR archive spend exist; the observed block stays byte-identical):
+
+```
+### Archive spend (agentsview)
+
+- **Yesterday (2026-09-15)**: $332.138392 — codex $224.554060, claude $104.943456, cowork $2.640876
+- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.000000 across 7 day(s) — codex $…, claude $…
+- **Top models (7d)**: `gpt-6-astra` $…, `claude-opus-5` $…, `gpt-5.6-sol` $…
+```
+
+Agents sorted by cost descending (name tiebreak); models top 5 by cost. `format_usd` as today (two decimals minimum, sub-cent kept). Yesterday absent → `- **Yesterday (date)**: no archive rows`. `--json` adds `archive_spend` (`{yesterday: {...}|null, week: {...}, week_from, week_to}`, costs as decimal strings) ONLY when the block rendered; a run without it emits exactly today's key set (the existing key-set test in `commands/review.rs` stays as written and is the parity guard). `schema_version` stays 2 (an optional key).
+
+Tests: `summarize` at the window edges (digest date − 1 present/absent, a row dated the digest day excluded, rows older than − 7 excluded, no rows → `None`, empty `daily` array), agent ordering and the top-5 truncation, `render_digest` with archive only / both / neither (neither → no `## Spend`, byte-identical tail), `run_with_timeout` killing a sleeping child inside the deadline, `fetch_daily_usage` argv, non-zero exit and missing binary, the CLI's `run_nightly` with an agentsview reader pointing at a closed port and a missing `bin` returning `Ok` (dry run) with no block and no `archive_spend` key.
+
+### 5. Config, docs, live rollout
+
+- `config.rs`: `ClaudeCode { path, paths, discover_profiles }`, `Agentsview { url, token_file, since_days, timeout_secs, bin }` with `http://`-only validation in `from_toml_str`, `agentsview_settings()`; tests for both.
+- Dedupe + retry test in `digest.rs`: two readers sharing a key, a tracker whose `create` fails → after the run neither the session id nor the key is in the processed file, and a second run with the same readers rescans the session once.
+- README: readers table rows (claude-code updated, agentsview new), a config example, the Spend block, the dedupe rule, the no-TLS note, the "list the archive reader last" rule.
+- Live `~/.jilog.toml` on macazbd: add `discover_profiles = true` to the claude-code reader and an `[[reader]] type = "agentsview"` block after `worker-signals`, keep every other line. The authoritative repo copy (amplifier-bundle-joi, repoman-managed, already drifted) gets a follow-up kata issue with the exact diff.
+- Install: `cargo install --path crates/jilog` (today's method per `cargo install --list`: path install from the primary checkout); verify `~/.local/bin/jilog --version`.
+
+## Alternatives considered
+
+- **Shell out to the `agentsview` CLI for sessions** (`session list/messages/usage --server --server-token-file`): zero new dependencies and the kata-tracker pattern, but two process spawns per session per night (~600 on this Mac) and the CLI's own daemon discovery/auto-start behaviour in the loop. The brief asks for HTTP with the runtime token; ureq without TLS is ~10 small crates. The CLI stays for `usage daily`, which has no REST equivalent.
+- **Read the SQLite archive directly**: schema is undocumented and version-coupled; the daemon owns the write lock during sync. Rejected.
+- **A sibling struct instead of a `machine` field on signals**: the digest renders signals through `dims_prefix`, which already carries seat/persona/channel; one optional field is the smaller change and keeps JSON stable.
+- **Agent only as an id prefix (first draft)**: rejected in review — a remote Claude session's id is a bare uuid, so its line would carry no agent; the `agent` field stays.
+- **Rendering archive spend even when the daemon is down**: `usage daily` can answer from the local archive with stale numbers; the brief says hidden when unreachable, so the probe gates the fetch.
+- **TLS support in the client**: not needed for loopback/tailnet-HTTP; adding rustls doubles the dependency tree. Documented limitation.
+
+## Blast radius and rollback
+
+- `jilog-review` public API — a source-breaking pre-1.0 minor for library consumers, not additive: `ClaudeCodeReader.projects_dir` is replaced by `roots` + `profile_parents`; the five signal structs, `ReviewArgs` and `DigestReport` gain fields (exhaustive struct literals stop compiling — use `..Default::default()` on signals); `render_digest`/`write_digest` take one more positional parameter; `parse_sessions_page`/`parse_messages_page` are new and return `Result`. Trait implementors are unaffected (default methods). Known callers: the jilog CLI and the tests in this repo; opsctl vendors its own copy. 0.7.2 → 0.8.0.
+- Toolchain: `rust-version` moves from 1.75 to 1.88 — ureq 2 pulls `url → idna_adapter → ICU4X`, which declare 1.86/1.88 (edition 2024). The fleet builds with 1.91; CI uses the default stable toolchain and has no MSRV job.
+- Discovery under the lens: canonical-file dedupe runs only when roots can overlap (more than one explicit root, or any profile parent). A legacy single-root configuration keeps its exact pre-0.8 discovery, symlinked duplicates included, so the universal byte-identity claim holds for discovery as well as rendering (reader test `legacy_single_root_keeps_symlink_duplicates_but_multi_root_dedupes`).
+- Corrected fact (2026-09-16, live v0.43.0): `usage daily --json` fills `agentBreakdowns` ONLY with `--breakdown`; the fetch passes it. `modelBreakdowns` are always present.
+- Nightly job: a config with the new keys fails to parse on a pre-0.8 binary (unknown field / variant). Rollback = `git revert` the range, reinstall, and remove `discover_profiles` + the agentsview block from `~/.jilog.toml`.
+- Processed file: extra dedupe-key lines are inert for older binaries.
+- Secrets: the token is read at request time, never logged, never in argv, never in fixtures.
+
+## Assumptions
+
+- The daemon is the local one at 8080 for this Mac; other machines' sessions arrive through agentsview's own fleet collection (epic child A), not through jilog.
+- Digest date buckets: `usage daily` buckets in the daemon's default timezone; jilog labels "yesterday" as digest date − 1 in the same calendar. A skew of one bucket at day boundaries is accepted and documented.
+
+## Open questions
+
+None blocking. Whether the loopback daemon should enforce `require_auth` is an upstream question for kenn-io/agentsview, recorded in the run manifest for the epic.
