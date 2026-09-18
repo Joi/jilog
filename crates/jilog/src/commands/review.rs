@@ -70,6 +70,19 @@ pub fn run(cfg: &JilogConfig, args: ReviewArgs) -> anyhow::Result<()> {
 }
 
 fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
+    let env_override = std::env::var(jilog_review::zone::ENV_OVERRIDE).ok();
+    run_nightly_at(cfg, args, Utc::now(), env_override.as_deref())
+}
+
+/// [`run_nightly`] with the clock and the `JILOG_TZ` reading injected, so
+/// a test can pin an instant where UTC and the configured zone disagree
+/// on the date and prove the zone reaches the digest date and agentsview.
+fn run_nightly_at(
+    cfg: &JilogConfig,
+    args: &NightlyArgs,
+    now: chrono::DateTime<Utc>,
+    env_override: Option<&str>,
+) -> anyhow::Result<()> {
     let since = nightly_since(args)?;
 
     let digest_dir = args
@@ -82,7 +95,7 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| expand_tilde("~/.jilog/digests"));
 
-    let (date, zone) = nightly_date(cfg, args, Utc::now())?;
+    let (date, zone) = nightly_date(cfg, args, now, env_override)?;
 
     let processed_file = args.processed_file.clone().or_else(|| {
         Some(expand_tilde("~/.jilog/telemetry/processed-sessions.txt"))
@@ -238,8 +251,9 @@ fn nightly_date(
     cfg: &JilogConfig,
     args: &NightlyArgs,
     now: chrono::DateTime<Utc>,
+    env_override: Option<&str>,
 ) -> anyhow::Result<(NaiveDate, chrono_tz::Tz)> {
-    let (zone, zone_source) = jilog_review::zone::resolve_zone(cfg.timezone.as_deref())
+    let (zone, zone_source) = jilog_review::zone::resolve_zone(env_override, cfg.timezone.as_deref())
         .with_context(|| "resolve the digest time zone")?;
     if zone_source == jilog_review::zone::ZoneSource::Fallback {
         tracing::warn!("no time zone from JILOG_TZ, jilog.toml, TZ or the system: dating the digest in UTC");
@@ -553,13 +567,10 @@ mod tests {
 
     #[test]
     fn nightly_date_without_date_flag_is_the_local_calendar_day() {
-        // JILOG_TZ would outrank the config under test; the process env is
-        // not part of this test.
-        std::env::remove_var(jilog_review::zone::ENV_OVERRIDE);
         let now = Utc.with_ymd_and_hms(2026, 9, 17, 22, 30, 0).unwrap();
         let args = nightly_args();
         let thimphu = JilogConfig::from_toml_str("timezone = \"Asia/Thimphu\"\n").unwrap();
-        let (date, zone) = nightly_date(&thimphu, &args, now).unwrap();
+        let (date, zone) = nightly_date(&thimphu, &args, now, None).unwrap();
         assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap());
         assert_eq!(zone, chrono_tz::Asia::Thimphu);
         assert_eq!(
@@ -567,12 +578,18 @@ mod tests {
             (chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(), chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap())
         );
         let utc = JilogConfig::from_toml_str("timezone = \"UTC\"\n").unwrap();
-        let (date, _) = nightly_date(&utc, &args, now).unwrap();
+        let (date, _) = nightly_date(&utc, &args, now, None).unwrap();
         assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap());
+        // JILOG_TZ outranks the config.
+        let (date, zone) = nightly_date(&utc, &args, now, Some("Asia/Thimphu")).unwrap();
+        assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap());
+        assert_eq!(zone, chrono_tz::Asia::Thimphu);
+        let err = format!("{:#}", nightly_date(&utc, &args, now, Some("Asia/Thimpu")).unwrap_err());
+        assert!(err.contains("JILOG_TZ") && err.contains("Asia/Thimpu"), "{err}");
         // An explicit --date is used as given, whatever the zone says.
         let mut pinned = nightly_args();
         pinned.date = Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
-        let (date, zone) = nightly_date(&thimphu, &pinned, now).unwrap();
+        let (date, zone) = nightly_date(&thimphu, &pinned, now, None).unwrap();
         assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
         assert_eq!(zone, chrono_tz::Asia::Thimphu);
     }
@@ -580,11 +597,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nightly_threads_the_zone_and_local_date_into_the_agentsview_call() {
-        // The whole path, no --date: the configured zone dates the digest,
-        // the window is derived from that date, and the same zone reaches
-        // agentsview as --timezone. The stub binary records its argv.
+        // The whole path, no --date, at a pinned instant where UTC (the
+        // 17th) and the configured zone (Tokyo, already the 18th) disagree:
+        // the configured zone dates the digest, the window is derived from
+        // that date, and the same zone reaches agentsview as --timezone.
+        // A caller reverting to Utc::now().date_naive() would send
+        // --until 2026-09-16 and fail here. The stub binary records its argv.
         use std::os::unix::fs::PermissionsExt;
-        std::env::remove_var(jilog_review::zone::ENV_OVERRIDE);
         let base = one_shot_daemon(r#"{"machines":[],"machine_labels":{},"machine_aliases":{}}"#);
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
@@ -611,19 +630,12 @@ mod tests {
         args.dry_run = true;
         args.digest_dir = Some(dir.path().join("digests"));
         args.processed_file = Some(dir.path().join("processed.txt"));
-        let before = jilog_review::zone::local_date(Utc::now(), chrono_tz::Asia::Tokyo);
-        run_nightly(&cfg, &args).expect("dry run with an empty archive window");
-        let after = jilog_review::zone::local_date(Utc::now(), chrono_tz::Asia::Tokyo);
+        let now = Utc.with_ymd_and_hms(2026, 9, 17, 22, 30, 0).unwrap();
+        run_nightly_at(&cfg, &args, now, None).expect("dry run with an empty archive window");
         let argv = std::fs::read_to_string(&calls).expect("agentsview was called");
-        let expected = |d: chrono::NaiveDate| {
-            let (from, to) = jilog_review::ArchiveSpend::window(d);
-            format!("usage daily --json --breakdown --since {from} --until {to} --timezone Asia/Tokyo --no-sync")
-        };
-        // Tokyo midnight may pass mid-test; either day is right.
-        assert!(
-            argv.trim() == expected(before) || argv.trim() == expected(after),
-            "argv {argv:?} vs {:?}",
-            expected(before)
+        assert_eq!(
+            argv.trim(),
+            "usage daily --json --breakdown --since 2026-09-11 --until 2026-09-17 --timezone Asia/Tokyo --no-sync"
         );
     }
 

@@ -55,13 +55,19 @@ pub fn parse_zone(name: &str, source: &str) -> Result<Tz, JilogReviewError> {
         .map_err(|_| JilogReviewError::Config(format!("{}: not an IANA time zone: {:?}", source, name)))
 }
 
-/// Resolve the zone from the process environment and the config value.
-pub fn resolve_zone(configured: Option<&str>) -> Result<(Tz, ZoneSource), JilogReviewError> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+/// Resolve the zone. `env_override` is the caller's reading of
+/// [`ENV_OVERRIDE`] (passed in, not read here, so a test never has to
+/// touch the process environment); `TZ` and the system zone are read
+/// here and only matter when neither override nor config is set.
+pub fn resolve_zone(
+    env_override: Option<&str>,
+    configured: Option<&str>,
+) -> Result<(Tz, ZoneSource), JilogReviewError> {
+    let env_tz = std::env::var("TZ").ok().filter(|v| !v.trim().is_empty());
     resolve_zone_from(
-        env(ENV_OVERRIDE).as_deref(),
+        env_override.filter(|v| !v.trim().is_empty()),
         configured,
-        env("TZ").as_deref(),
+        env_tz.as_deref(),
         iana_time_zone::get_timezone().ok().as_deref(),
     )
 }
