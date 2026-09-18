@@ -58,18 +58,18 @@ pub fn parse_zone(name: &str, source: &str) -> Result<Tz, JilogReviewError> {
 /// Resolve the zone. `env_override` is the caller's reading of
 /// [`ENV_OVERRIDE`] (passed in, not read here, so a test never has to
 /// touch the process environment); `TZ` and the system zone are read
-/// here and only matter when neither override nor config is set.
+/// here, and only when neither override nor config decides — a run or a
+/// test with either set never consults the process or the system.
 pub fn resolve_zone(
     env_override: Option<&str>,
     configured: Option<&str>,
 ) -> Result<(Tz, ZoneSource), JilogReviewError> {
+    let env_override = env_override.filter(|v| !v.trim().is_empty());
+    if env_override.is_some() || configured.is_some() {
+        return resolve_zone_from(env_override, configured, None, None);
+    }
     let env_tz = std::env::var("TZ").ok().filter(|v| !v.trim().is_empty());
-    resolve_zone_from(
-        env_override.filter(|v| !v.trim().is_empty()),
-        configured,
-        env_tz.as_deref(),
-        iana_time_zone::get_timezone().ok().as_deref(),
-    )
+    resolve_zone_from(None, None, env_tz.as_deref(), iana_time_zone::get_timezone().ok().as_deref())
 }
 
 /// The pure resolution behind [`resolve_zone`], with every input passed

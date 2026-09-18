@@ -66,6 +66,18 @@ Tests: parsers on fixture JSON strings (sessions page, messages page incl. dropp
 
 ### 4. Archive spend — the digest block
 
+> Amended by jilog#0qpq (2026-09-18): the digest date is no longer a UTC
+> date and the timezone skew accepted under Assumptions below is gone.
+> `jilog_review::zone` resolves one IANA zone (`JILOG_TZ`, then the
+> top-level `timezone` key in jilog.toml, then `TZ`, then the system
+> zone, then UTC with a warning); `run_nightly` dates the digest in it,
+> `ArchiveSpend` carries `timezone: String`, `summarize(rows, digest_date,
+> timezone)` and `fetch_daily_usage(bin, since, until, timezone, timeout)`
+> take it, the CLI call adds `--timezone <zone>`, the rendered trailing
+> line reads `(<from> – <to>, days in <zone>)` and the `--json`
+> `archive_spend` object carries `timezone`. The shapes below are the
+> jilog#heyg originals.
+
 `archive_spend::ArchiveSpend` (its own module, re-exported as `jilog_review::{ArchiveSpend, DailyUsage, PeriodSpend}`; pub, `Clone`, `PartialEq`): `{ yesterday: Option<PeriodSpend>, week: PeriodSpend, week_from: NaiveDate, week_to: NaiveDate }` with `PeriodSpend { total_usd: Decimal, days: usize, agents: BTreeMap<String, Decimal>, models: BTreeMap<String, Decimal> }`. `parse_daily_usage(&str) -> Vec<DailyUsage>` reads the CLI JSON above; `ArchiveSpend::summarize(rows, digest_date)` buckets `date == digest_date − 1` into `yesterday` and `digest_date − 7 ..= digest_date − 1` into `week`; microdollars → `Decimal` with scale 6. Money math is `rust_decimal`.
 
 `fetch_daily_usage(bin, since, until, timeout) -> Result<Vec<DailyUsage>>` runs `<bin> usage daily --json --breakdown --since <from> --until <to> --no-sync` through `util::run_with_timeout`: stdin closed, the child in its own process group, one deadline shared by the exit wait and the pipe drain, and the whole group killed on expiry — so neither a mid-sync block nor a descendant that inherited a pipe can stall the nightly. Non-zero exit or unparseable output is an `Err`.
@@ -118,7 +130,7 @@ Tests: `summarize` at the window edges (digest date − 1 present/absent, a row 
 ## Assumptions
 
 - The daemon is the local one at 8080 for this Mac; other machines' sessions arrive through agentsview's own fleet collection (epic child A), not through jilog.
-- Digest date buckets: `usage daily` buckets in the daemon's default timezone; jilog labels "yesterday" as digest date − 1 in the same calendar. A skew of one bucket at day boundaries is accepted and documented.
+- Digest date buckets: `usage daily` buckets in the daemon's default timezone; jilog labels "yesterday" as digest date − 1 in the same calendar. A skew of one bucket at day boundaries is accepted and documented. *(Superseded by jilog#0qpq — see the amendment under §4: one zone now dates the digest and is passed to agentsview as `--timezone`.)*
 
 ## Open questions
 
