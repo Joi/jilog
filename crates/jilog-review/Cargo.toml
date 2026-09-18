@@ -20,8 +20,8 @@ rust_decimal = { workspace = true }
 rusqlite = { workspace = true }
 ureq = { workspace = true }
 libc = { workspace = true }
-chrono-tz = "0.10"
-iana-time-zone = "0.1"
+chrono-tz = { workspace = true }
+iana-time-zone = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

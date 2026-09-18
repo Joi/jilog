@@ -26,6 +26,8 @@ toml = "0.8"
 
 # Time and IDs
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"          # IANA zones: the digest date and agentsview --timezone (jilog#0qpq)
+iana-time-zone = "0.1"      # the system zone by name
 uuid = { version = "1", features = ["v7", "serde"] }
 
 # Error handling

@@ -156,6 +156,13 @@ Claude Code across the pool seats and context profiles on one Mac, plus the
 agentsview archive for everything else:
 
 ```toml
+# The zone the nightly digest is dated in: the digest date, the archive
+# spend window and agentsview's `--timezone`. Optional — `JILOG_TZ` wins
+# over it, and without either jilog uses `TZ` when it names an IANA zone,
+# then the system zone, then UTC with a warning (jilog#0qpq). Top level:
+# it must come before the first [[reader]] table.
+# timezone = "Asia/Thimphu"
+
 [[reader]]
 type = "claude-code"
 path = "~/.claude/projects"
@@ -167,12 +174,6 @@ default_seat = "main"         # seat label for the sessions under path/paths
 # unless default_seat is set, even when the same directory is reachable
 # through a profile parent. default_seat is off by default so a config
 # without it produces the same digest as before 0.8.1.)
-
-# The zone the nightly digest is dated in: the digest date, the archive
-# spend window and agentsview's `--timezone`. Optional — `JILOG_TZ` wins
-# over it, and without either jilog uses `TZ` when it names an IANA zone,
-# then the system zone, then UTC with a warning (jilog#0qpq).
-# timezone = "Asia/Thimphu"
 
 # The agentsview archive: other machines and agents without a raw reader,
 # plus the digest's "Archive spend" block. Keep it LAST — a session both a
@@ -300,7 +301,7 @@ Boundary: jilog reports spend it **observed** in session files. It does not fetc
 
 ### Archive spend (agentsview)
 
-With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --breakdown --since <date−7> --until <date−1> --timezone <zone> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models. `<date>` is the digest date in the resolved zone (`JILOG_TZ`, then `timezone` in jilog.toml, then `TZ`, then the system zone — never a UTC date on a host that keeps another clock), and the block names that zone so it can be compared with a report bucketed on a different one:
+With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --breakdown --since <date−7> --until <date−1> --timezone <zone> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models. `<date>` is the digest date in the resolved zone (`JILOG_TZ`, then the top-level `timezone` in jilog.toml, then `TZ`, then the system zone; only when none of those names an IANA zone does it fall back to UTC, with a warning), and the block names that zone so it can be compared with a report bucketed on a different one:
 
 ```markdown
 ### Archive spend (agentsview)

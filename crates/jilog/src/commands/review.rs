@@ -82,18 +82,7 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| expand_tilde("~/.jilog/digests"));
 
-    // The digest is dated in the configured zone, never UTC: the 22:50
-    // nightly must call the day it ran "today" and the morning brief's
-    // "yesterday" must be the same calendar day this block calls yesterday
-    // (jilog#0qpq, amplifier-bundle-joi#rvbm).
-    let (zone, zone_source) = jilog_review::zone::resolve_zone(cfg.timezone.as_deref())
-        .with_context(|| "resolve the digest time zone")?;
-    if zone_source == jilog_review::zone::ZoneSource::Fallback {
-        tracing::warn!("no time zone from JILOG_TZ, jilog.toml, TZ or the system: dating the digest in UTC");
-    }
-    let date = args
-        .date
-        .unwrap_or_else(|| jilog_review::zone::local_date(Utc::now(), zone));
+    let (date, zone) = nightly_date(cfg, args, Utc::now())?;
 
     let processed_file = args.processed_file.clone().or_else(|| {
         Some(expand_tilde("~/.jilog/telemetry/processed-sessions.txt"))
@@ -236,6 +225,29 @@ pub fn load_archive_spend(
             None
         }
     }
+}
+
+/// The digest date and the zone it is dated in. `--date` wins; otherwise
+/// `now` in the resolved zone (`JILOG_TZ`, jilog.toml `timezone`, `TZ`,
+/// the system zone, then UTC with a warning) — never a bare UTC date: the
+/// 22:50 nightly must call the day it ran "today", and the morning brief's
+/// "yesterday" must be the same calendar day the archive block calls
+/// yesterday (jilog#0qpq, amplifier-bundle-joi#rvbm). The zone also goes
+/// to agentsview as `--timezone`, so the window and the buckets agree.
+fn nightly_date(
+    cfg: &JilogConfig,
+    args: &NightlyArgs,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<(NaiveDate, chrono_tz::Tz)> {
+    let (zone, zone_source) = jilog_review::zone::resolve_zone(cfg.timezone.as_deref())
+        .with_context(|| "resolve the digest time zone")?;
+    if zone_source == jilog_review::zone::ZoneSource::Fallback {
+        tracing::warn!("no time zone from JILOG_TZ, jilog.toml, TZ or the system: dating the digest in UTC");
+    }
+    let date = args
+        .date
+        .unwrap_or_else(|| jilog_review::zone::local_date(now, zone));
+    Ok((date, zone))
 }
 
 fn nightly_since(args: &NightlyArgs) -> anyhow::Result<chrono::DateTime<Utc>> {
@@ -537,6 +549,82 @@ mod tests {
         let digest = std::fs::read_to_string(dir.path().join("digests/learning-digest-2026-09-16.md")).unwrap();
         assert!(!digest.contains("Archive spend"), "{digest}");
         assert!(!digest.contains("## Spend"), "{digest}");
+    }
+
+    #[test]
+    fn nightly_date_without_date_flag_is_the_local_calendar_day() {
+        // JILOG_TZ would outrank the config under test; the process env is
+        // not part of this test.
+        std::env::remove_var(jilog_review::zone::ENV_OVERRIDE);
+        let now = Utc.with_ymd_and_hms(2026, 9, 17, 22, 30, 0).unwrap();
+        let args = nightly_args();
+        let thimphu = JilogConfig::from_toml_str("timezone = \"Asia/Thimphu\"\n").unwrap();
+        let (date, zone) = nightly_date(&thimphu, &args, now).unwrap();
+        assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap());
+        assert_eq!(zone, chrono_tz::Asia::Thimphu);
+        assert_eq!(
+            jilog_review::ArchiveSpend::window(date),
+            (chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(), chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap())
+        );
+        let utc = JilogConfig::from_toml_str("timezone = \"UTC\"\n").unwrap();
+        let (date, _) = nightly_date(&utc, &args, now).unwrap();
+        assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 17).unwrap());
+        // An explicit --date is used as given, whatever the zone says.
+        let mut pinned = nightly_args();
+        pinned.date = Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        let (date, zone) = nightly_date(&thimphu, &pinned, now).unwrap();
+        assert_eq!(date, chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        assert_eq!(zone, chrono_tz::Asia::Thimphu);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nightly_threads_the_zone_and_local_date_into_the_agentsview_call() {
+        // The whole path, no --date: the configured zone dates the digest,
+        // the window is derived from that date, and the same zone reaches
+        // agentsview as --timezone. The stub binary records its argv.
+        use std::os::unix::fs::PermissionsExt;
+        std::env::remove_var(jilog_review::zone::ENV_OVERRIDE);
+        let base = one_shot_daemon(r#"{"machines":[],"machine_labels":{},"machine_aliases":{}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "t").unwrap();
+        let calls = dir.path().join("calls");
+        let stub = dir.path().join("agentsview");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho '{{\"schema_version\":6,\"daily\":[]}}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Tokyo, not the host zone: the argv must come from the config.
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "timezone = \"Asia/Tokyo\"\n[[reader]]\ntype = \"agentsview\"\nurl = \"{base}\"\ntoken_file = \"{}\"\ntimeout_secs = 2\nbin = \"{}\"\n",
+            token.display(),
+            stub.display()
+        ))
+        .unwrap();
+        let mut args = nightly_args();
+        args.dry_run = true;
+        args.digest_dir = Some(dir.path().join("digests"));
+        args.processed_file = Some(dir.path().join("processed.txt"));
+        let before = jilog_review::zone::local_date(Utc::now(), chrono_tz::Asia::Tokyo);
+        run_nightly(&cfg, &args).expect("dry run with an empty archive window");
+        let after = jilog_review::zone::local_date(Utc::now(), chrono_tz::Asia::Tokyo);
+        let argv = std::fs::read_to_string(&calls).expect("agentsview was called");
+        let expected = |d: chrono::NaiveDate| {
+            let (from, to) = jilog_review::ArchiveSpend::window(d);
+            format!("usage daily --json --breakdown --since {from} --until {to} --timezone Asia/Tokyo --no-sync")
+        };
+        // Tokyo midnight may pass mid-test; either day is right.
+        assert!(
+            argv.trim() == expected(before) || argv.trim() == expected(after),
+            "argv {argv:?} vs {:?}",
+            expected(before)
+        );
     }
 
     #[test]
