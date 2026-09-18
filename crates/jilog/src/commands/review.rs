@@ -82,7 +82,18 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| expand_tilde("~/.jilog/digests"));
 
-    let date = args.date.unwrap_or_else(|| Utc::now().date_naive());
+    // The digest is dated in the configured zone, never UTC: the 22:50
+    // nightly must call the day it ran "today" and the morning brief's
+    // "yesterday" must be the same calendar day this block calls yesterday
+    // (jilog#0qpq, amplifier-bundle-joi#rvbm).
+    let (zone, zone_source) = jilog_review::zone::resolve_zone(cfg.timezone.as_deref())
+        .with_context(|| "resolve the digest time zone")?;
+    if zone_source == jilog_review::zone::ZoneSource::Fallback {
+        tracing::warn!("no time zone from JILOG_TZ, jilog.toml, TZ or the system: dating the digest in UTC");
+    }
+    let date = args
+        .date
+        .unwrap_or_else(|| jilog_review::zone::local_date(Utc::now(), zone));
 
     let processed_file = args.processed_file.clone().or_else(|| {
         Some(expand_tilde("~/.jilog/telemetry/processed-sessions.txt"))
@@ -110,7 +121,7 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
     // and the run continues.
     let archive_spend = cfg
         .agentsview_settings()
-        .and_then(|s| load_archive_spend(&s, date));
+        .and_then(|s| load_archive_spend(&s, date, zone.name()));
 
     let review_args = LibReviewArgs {
         since,
@@ -193,6 +204,7 @@ fn run_nightly(cfg: &JilogConfig, args: &NightlyArgs) -> anyhow::Result<()> {
 pub fn load_archive_spend(
     settings: &crate::config::AgentsviewSettings,
     date: NaiveDate,
+    timezone: &str,
 ) -> Option<jilog_review::ArchiveSpend> {
     let reader = match jilog_review::readers::AgentsviewReader::new(
         &settings.url,
@@ -211,9 +223,9 @@ pub fn load_archive_spend(
         return None;
     }
     let (from, to) = jilog_review::ArchiveSpend::window(date);
-    match jilog_review::archive_spend::fetch_daily_usage(&settings.bin, from, to, settings.timeout) {
+    match jilog_review::archive_spend::fetch_daily_usage(&settings.bin, from, to, timezone, settings.timeout) {
         Ok(rows) => {
-            let spend = jilog_review::ArchiveSpend::summarize(&rows, date);
+            let spend = jilog_review::ArchiveSpend::summarize(&rows, date, timezone);
             if spend.is_none() {
                 tracing::warn!("archive spend hidden: no usage rows between {} and {}", from, to);
             }
@@ -338,6 +350,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
             "week": period(&a.week),
             "week_from": a.week_from.to_string(),
             "week_to": a.week_to.to_string(),
+            "timezone": a.timezone,
         });
     }
     value
@@ -514,7 +527,7 @@ mod tests {
         .unwrap();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
         let settings = cfg.agentsview_settings().unwrap();
-        assert!(load_archive_spend(&settings, date).is_none(), "probe fails → hidden");
+        assert!(load_archive_spend(&settings, date, "UTC").is_none(), "probe fails → hidden");
         let mut args = nightly_args();
         args.dry_run = false;
         args.date = Some(date);
@@ -541,7 +554,7 @@ mod tests {
         ))
         .unwrap();
         let settings = cfg.agentsview_settings().unwrap();
-        assert!(load_archive_spend(&settings, chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap()).is_none());
+        assert!(load_archive_spend(&settings, chrono::NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(), "UTC").is_none());
         // And the JSON document for a report without the block has no key.
         let value = digest_report_json(&digest_report(), false);
         assert!(value.get("archive_spend").is_none());
@@ -561,12 +574,14 @@ mod tests {
             week,
             week_from: chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
             week_to: chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            timezone: "Asia/Thimphu".into(),
         });
         let value = digest_report_json(&report, false);
         assert_eq!(value["archive_spend"]["week"]["total_usd"], "2101.500000");
         assert_eq!(value["archive_spend"]["week"]["days"], 7);
         assert_eq!(value["archive_spend"]["week"]["agents_usd"]["codex"], "1300.250000");
         assert_eq!(value["archive_spend"]["week_from"], "2026-09-09");
+        assert_eq!(value["archive_spend"]["timezone"], "Asia/Thimphu");
         assert!(value["archive_spend"]["yesterday"].is_null());
         assert_eq!(value["schema_version"], 2);
     }

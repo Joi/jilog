@@ -168,6 +168,12 @@ default_seat = "main"         # seat label for the sessions under path/paths
 # through a profile parent. default_seat is off by default so a config
 # without it produces the same digest as before 0.8.1.)
 
+# The zone the nightly digest is dated in: the digest date, the archive
+# spend window and agentsview's `--timezone`. Optional — `JILOG_TZ` wins
+# over it, and without either jilog uses `TZ` when it names an IANA zone,
+# then the system zone, then UTC with a warning (jilog#0qpq).
+# timezone = "Asia/Thimphu"
+
 # The agentsview archive: other machines and agents without a raw reader,
 # plus the digest's "Archive spend" block. Keep it LAST — a session both a
 # raw reader and the archive know is scanned once, by the raw reader.
@@ -294,17 +300,17 @@ Boundary: jilog reports spend it **observed** in session files. It does not fetc
 
 ### Archive spend (agentsview)
 
-With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --breakdown --since <date−7> --until <date−1> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models:
+With an `agentsview` reader configured, the nightly also runs `agentsview usage daily --json --breakdown --since <date−7> --until <date−1> --timezone <zone> --no-sync` and adds an **Archive spend** block to the Spend section: yesterday's total per agent, the trailing seven days per agent, and the five most expensive models. `<date>` is the digest date in the resolved zone (`JILOG_TZ`, then `timezone` in jilog.toml, then `TZ`, then the system zone — never a UTC date on a host that keeps another clock), and the block names that zone so it can be compared with a report bucketed on a different one:
 
 ```markdown
 ### Archive spend (agentsview)
 
 - **Yesterday (2026-09-15)**: $332.138392 — codex $224.554060, claude $104.943456, cowork $2.640876
-- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.500000 across 7 day(s) — codex $1300.250000, claude $800.250000, cowork $1.000000
+- **Trailing 7d (2026-09-09 – 2026-09-15, days in Asia/Thimphu)**: $2101.500000 across 7 day(s) — codex $1300.250000, claude $800.250000, cowork $1.000000
 - **Top models (7d)**: `gpt-6-astra` $900.000000, `claude-opus-5` $700.500000, `gpt-5.6-sol` $400.000000
 ```
 
-Costs come from agentsview's own pricing (integer `microdollars`, summed with `rust_decimal`); jilog still keeps no price tables. The daemon is probed first (`GET /api/v1/machines`) because `usage daily` answers from the local archive even when the daemon is down, and the CLI runs under `timeout_secs` in its own process group (a daemon mid-sync blocks the command for minutes; the nightly never waits on it). The block — and the `archive_spend` key in `--json` (`yesterday`, `week`, `week_from`, `week_to`; costs as decimal strings) — is absent when agentsview is not configured, the daemon is unreachable, the binary is missing, the call exceeds the timeout, the output is unparseable, or the window has no rows. None of those fail the run, and a host without agentsview emits exactly the digest and JSON it emitted before (two golden files under `crates/*/tests/golden/` pin the bytes).
+Costs come from agentsview's own pricing (integer `microdollars`, summed with `rust_decimal`); jilog still keeps no price tables. The daemon is probed first (`GET /api/v1/machines`) because `usage daily` answers from the local archive even when the daemon is down, and the CLI runs under `timeout_secs` in its own process group (a daemon mid-sync blocks the command for minutes; the nightly never waits on it). The block — and the `archive_spend` key in `--json` (`yesterday`, `week`, `week_from`, `week_to`, `timezone`; costs as decimal strings) — is absent when agentsview is not configured, the daemon is unreachable, the binary is missing, the call exceeds the timeout, the output is unparseable, or the window has no rows. None of those fail the run, and a host without agentsview emits exactly the digest and JSON it emitted before (two golden files under `crates/*/tests/golden/` pin the bytes).
 
 ---
 

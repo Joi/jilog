@@ -970,7 +970,8 @@ pub fn render_digest(
 
 /// The "Archive spend (agentsview)" block: yesterday, trailing 7d, top
 /// models (jilog#heyg). Agents by cost descending; the five most expensive
-/// models.
+/// models. The trailing line names the zone the days are bucketed in
+/// (jilog#0qpq) so a reader can tell it from a report on another clock.
 fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
     /// ` — codex $1.00, claude $2.00`, or nothing when the period has no
     /// per-agent rows.
@@ -998,9 +999,10 @@ fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend
         None => buf.push_str(&format!("- **Yesterday ({})**: no archive rows\n", a.week_to)),
     }
     buf.push_str(&format!(
-        "- **Trailing 7d ({} – {})**: {} across {} day(s){}\n",
+        "- **Trailing 7d ({} – {}, days in {})**: {} across {} day(s){}\n",
         a.week_from,
         a.week_to,
+        sanitize_display(&a.timezone),
         format_usd(&a.week.total_usd),
         a.week.days,
         agents(&a.week)
@@ -2527,6 +2529,7 @@ mod tests {
             week,
             week_from: NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
             week_to: NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            timezone: "Asia/Thimphu".into(),
         }
     }
 
@@ -2539,7 +2542,7 @@ mod tests {
         );
         let expected = "## Spend\n\n### Archive spend (agentsview)\n\n\
 - **Yesterday (2026-09-15)**: $332.138392 — codex $224.55406, claude $104.943456, cowork $2.640876\n\
-- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s) — codex $1300.25, claude $800.25, cowork $1.00\n\
+- **Trailing 7d (2026-09-09 – 2026-09-15, days in Asia/Thimphu)**: $2101.50 across 7 day(s) — codex $1300.25, claude $800.25, cowork $1.00\n\
 - **Top models (7d)**: `gpt-6-astra` $900.00, `claude-opus-5` $700.50, `gpt-5.6-sol` $400.00, `claude-haiku-4-5-20251001` $60.00, `m5` $30.00\n\n";
         assert!(body.ends_with(expected), "archive block:\n{body}");
         // With observed stats too: the observed block is unchanged and comes first.
@@ -2562,7 +2565,7 @@ mod tests {
         );
         assert!(body.contains("- **Yesterday (2026-09-15)**: no archive rows\n"), "{body}");
         assert!(
-            body.contains("- **Trailing 7d (2026-09-09 – 2026-09-15)**: $2101.50 across 7 day(s)\n"),
+            body.contains("- **Trailing 7d (2026-09-09 – 2026-09-15, days in Asia/Thimphu)**: $2101.50 across 7 day(s)\n"),
             "{body}"
         );
     }

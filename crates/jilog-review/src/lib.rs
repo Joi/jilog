@@ -25,6 +25,7 @@ pub mod digest;
 pub mod util;
 pub mod readers;
 pub mod trackers;
+pub mod zone;
 
 pub use archive_spend::{ArchiveSpend, DailyUsage, PeriodSpend};
 pub use error::JilogReviewError;

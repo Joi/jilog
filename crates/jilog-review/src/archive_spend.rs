@@ -73,6 +73,9 @@ pub struct ArchiveSpend {
     pub week: PeriodSpend,
     pub week_from: NaiveDate,
     pub week_to: NaiveDate,
+    /// The IANA zone the days are bucketed in — the digest date's zone,
+    /// passed to agentsview as `--timezone` (jilog#0qpq).
+    pub timezone: String,
 }
 
 impl ArchiveSpend {
@@ -85,8 +88,9 @@ impl ArchiveSpend {
     }
 
     /// Bucket the rows into yesterday and the trailing week; `None` when
-    /// no row falls inside the window.
-    pub fn summarize(rows: &[DailyUsage], digest_date: NaiveDate) -> Option<Self> {
+    /// no row falls inside the window. `timezone` is the zone the rows
+    /// were bucketed in (the one the fetch passed to agentsview).
+    pub fn summarize(rows: &[DailyUsage], digest_date: NaiveDate, timezone: &str) -> Option<Self> {
         let (from, to) = Self::window(digest_date);
         let mut week = PeriodSpend::default();
         let mut yesterday: Option<PeriodSpend> = None;
@@ -101,7 +105,7 @@ impl ArchiveSpend {
         if week.days == 0 {
             return None;
         }
-        Some(Self { yesterday, week, week_from: from, week_to: to })
+        Some(Self { yesterday, week, week_from: from, week_to: to, timezone: timezone.to_string() })
     }
 }
 
@@ -182,13 +186,16 @@ pub fn parse_daily_usage(raw: &str) -> Result<Vec<DailyUsage>, JilogReviewError>
 }
 
 /// Run `<bin> usage daily --json --breakdown --since <from> --until <to>
-/// --no-sync` under `timeout` and parse it. `--breakdown` is what fills
-/// `agentBreakdowns` (model rows are always present); `--no-sync` keeps the
-/// CLI from spawning or waiting on a daemon sync of its own.
+/// --timezone <timezone> --no-sync` under `timeout` and parse it.
+/// `--breakdown` is what fills `agentBreakdowns` (model rows are always
+/// present); `--timezone` makes agentsview bucket days in the digest's
+/// zone instead of its own default (jilog#0qpq); `--no-sync` keeps the CLI
+/// from spawning or waiting on a daemon sync of its own.
 pub fn fetch_daily_usage(
     bin: &Path,
     from: NaiveDate,
     to: NaiveDate,
+    timezone: &str,
     timeout: Duration,
 ) -> Result<Vec<DailyUsage>, JilogReviewError> {
     let mut cmd = std::process::Command::new(bin);
@@ -201,6 +208,8 @@ pub fn fetch_daily_usage(
         &from.to_string(),
         "--until",
         &to.to_string(),
+        "--timezone",
+        timezone,
         "--no-sync",
     ]);
     let out = crate::util::run_with_timeout(&mut cmd, timeout).map_err(|e| {
@@ -267,7 +276,8 @@ mod tests {
 
         let digest = day(16);
         assert_eq!(ArchiveSpend::window(digest), (day(9), day(15)));
-        let spend = ArchiveSpend::summarize(&rows, digest).expect("rows in window");
+        let spend = ArchiveSpend::summarize(&rows, digest, "Asia/Thimphu").expect("rows in window");
+        assert_eq!(spend.timezone, "Asia/Thimphu");
         let y = spend.yesterday.as_ref().expect("2026-09-15 present");
         assert_eq!(y.total_usd.to_string(), "332.138392");
         assert_eq!(spend.week.days, 2, "the 16th is today and excluded");
@@ -279,12 +289,12 @@ mod tests {
         assert_eq!(models, ["gpt-6-astra", "claude-opus-5"]);
 
         // Yesterday absent → None for yesterday, week still summarized.
-        let spend = ArchiveSpend::summarize(&rows, day(18)).unwrap();
+        let spend = ArchiveSpend::summarize(&rows, day(18), "UTC").unwrap();
         assert!(spend.yesterday.is_none());
         assert_eq!(spend.week.days, 3);
         // Nothing in window → None; an empty daily array → no rows → None.
-        assert!(ArchiveSpend::summarize(&rows, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()).is_none());
-        assert!(ArchiveSpend::summarize(&[], digest).is_none());
+        assert!(ArchiveSpend::summarize(&rows, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(), "UTC").is_none());
+        assert!(ArchiveSpend::summarize(&[], digest, "UTC").is_none());
         assert_eq!(parse_daily_usage("{\"schema_version\": 6, \"daily\": []}").unwrap().len(), 0);
         // Structurally wrong but syntactically valid output is an error,
         // never a plausible $0.00 block.
@@ -307,14 +317,14 @@ mod tests {
             agents: Default::default(),
             models: Default::default(),
         };
-        let s = ArchiveSpend::summarize(&[edge(8), edge(9)], digest).unwrap();
+        let s = ArchiveSpend::summarize(&[edge(8), edge(9)], digest, "UTC").unwrap();
         assert_eq!(s.week.days, 1, "2026-09-08 is outside the 7-day window ending 2026-09-15");
         // Top-5 truncation, descending.
         let mut many = edge(15);
         for i in 0..8 {
             many.models.insert(format!("m{i}"), Decimal::from(i));
         }
-        let s = ArchiveSpend::summarize(&[many], digest).unwrap();
+        let s = ArchiveSpend::summarize(&[many], digest, "UTC").unwrap();
         let top: Vec<&str> = s.week.top_models(5).iter().map(|(m, _)| m.as_str()).collect();
         assert_eq!(top, ["m7", "m6", "m5", "m4", "m3"]);
         // Garbage → Err, not a panic.
@@ -333,7 +343,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fetch_uses_the_binary_with_window_flags_and_times_out() {
+    fn fetch_uses_the_binary_with_window_and_timezone_flags_and_times_out() {
         let dir = tempfile::tempdir().unwrap();
         let calls = dir.path().join("calls");
         let stub = script(
@@ -346,24 +356,24 @@ mod tests {
             ),
         );
         let (from, to) = (day(9), day(15));
-        let rows = fetch_daily_usage(&stub, from, to, Duration::from_secs(10)).unwrap();
+        let rows = fetch_daily_usage(&stub, from, to, "Asia/Thimphu", Duration::from_secs(10)).unwrap();
         assert_eq!(rows.len(), 3);
         let argv = std::fs::read_to_string(&calls).unwrap();
         assert_eq!(
             argv.trim(),
-            "usage daily --json --breakdown --since 2026-09-09 --until 2026-09-15 --no-sync"
+            "usage daily --json --breakdown --since 2026-09-09 --until 2026-09-15 --timezone Asia/Thimphu --no-sync"
         );
 
         // A hung binary is killed at the deadline.
         let slow = script(dir.path(), "slow", "#!/bin/sh\nsleep 30\n");
         let started = std::time::Instant::now();
-        let err = fetch_daily_usage(&slow, from, to, Duration::from_millis(300))
+        let err = fetch_daily_usage(&slow, from, to, "Asia/Thimphu", Duration::from_millis(300))
             .unwrap_err()
             .to_string();
         assert!(started.elapsed() < Duration::from_secs(5), "must not wait for the child");
         assert!(err.contains("timed out"), "{err}");
         // Missing binary → Err.
-        assert!(fetch_daily_usage(&dir.path().join("missing"), from, to, Duration::from_secs(1)).is_err());
+        assert!(fetch_daily_usage(&dir.path().join("missing"), from, to, "Asia/Thimphu", Duration::from_secs(1)).is_err());
         // Non-zero exit → Err naming the status and the CLI's `error:`
         // line (any case), else the last non-empty line — never a progress
         // line, and not a trailing hint when an error line exists.
@@ -372,11 +382,11 @@ mod tests {
             "bad",
             "#!/bin/sh\necho 'Reading archived sessions (1s)' >&2\necho 'errors: 0' >&2\necho 'Error: usage summary: internal error' >&2\necho 'hint: run agentsview sync' >&2\necho '' >&2\nexit 3\n",
         );
-        let err = fetch_daily_usage(&bad, from, to, Duration::from_secs(5)).unwrap_err().to_string();
+        let err = fetch_daily_usage(&bad, from, to, "Asia/Thimphu", Duration::from_secs(5)).unwrap_err().to_string();
         assert!(err.contains("exit 3") && err.contains("internal error"), "{err}");
         assert!(!err.contains("Reading archived") && !err.contains("errors: 0") && !err.contains("hint:"), "{err}");
         let noerr = script(dir.path(), "noerr", "#!/bin/sh\necho 'step one' >&2\necho 'gave up' >&2\nexit 2\n");
-        let err = fetch_daily_usage(&noerr, from, to, Duration::from_secs(5)).unwrap_err().to_string();
+        let err = fetch_daily_usage(&noerr, from, to, "Asia/Thimphu", Duration::from_secs(5)).unwrap_err().to_string();
         assert!(err.contains("exit 2") && err.contains("gave up"), "last line when no error line: {err}");
     }
 }

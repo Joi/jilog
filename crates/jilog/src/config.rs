@@ -25,6 +25,12 @@ pub struct JilogConfig {
     pub tracker: TrackerConfig,
     #[serde(default, rename = "zone")]
     pub zones: Vec<ZoneConfig>,
+    /// IANA zone the nightly digest is dated in — the digest date, the
+    /// archive-spend window and agentsview's `--timezone` (jilog#0qpq).
+    /// Optional: `JILOG_TZ` overrides it, and without either the process
+    /// `TZ` then the system zone apply (see `jilog_review::zone`).
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 /// A configured reader.
@@ -289,6 +295,9 @@ impl JilogConfig {
     /// Parse and validate config from a TOML string.
     pub fn from_toml_str(raw: &str) -> anyhow::Result<Self> {
         let cfg: Self = toml::from_str(raw).with_context(|| "parse jilog.toml")?;
+        if let Some(tz) = &cfg.timezone {
+            jilog_review::zone::parse_zone(tz, "timezone")?;
+        }
         if matches!(cfg.tracker, TrackerConfig::Beads { .. }) {
             anyhow::bail!(
                 "tracker type \"beads\" was removed in jilog 0.2.0 (beads is deprecated); \
@@ -607,6 +616,15 @@ mod tests {
         assert_eq!(s.since_days, 3);
         // No agentsview reader → no settings.
         assert!(JilogConfig::from_toml_str("[[reader]]\ntype = \"pi\"\n").unwrap().agentsview_settings().is_none());
+    }
+
+    #[test]
+    fn timezone_is_optional_and_validated_at_load() {
+        assert_eq!(JilogConfig::from_toml_str("").unwrap().timezone, None);
+        let cfg = JilogConfig::from_toml_str("timezone = \"Asia/Thimphu\"\n[[reader]]\ntype = \"pi\"\n").unwrap();
+        assert_eq!(cfg.timezone.as_deref(), Some("Asia/Thimphu"));
+        let err = JilogConfig::from_toml_str("timezone = \"Bhutan/Thimphu\"\n").unwrap_err().to_string();
+        assert!(err.contains("timezone") && err.contains("Bhutan/Thimphu"), "{err}");
         // https, hostnames and out-of-range numbers are refused at config load, loudly.
         let err = JilogConfig::from_toml_str("[[reader]]\ntype = \"agentsview\"\nurl = \"https://x\"\n")
             .expect_err("https must be rejected")
