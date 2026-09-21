@@ -1,3 +1,5 @@
+CLAUDE.md is a symlink to this file: the claude-glm lane cannot read AGENTS.md directly (jibot-code#1ea1); edit only AGENTS.md.
+
 <!-- BEGIN KATA (managed by `kata init --with-agents`) -->
 ## kata issue tracker
 
