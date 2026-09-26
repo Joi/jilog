@@ -526,37 +526,38 @@ impl Drop for TmuxServer {
     }
 }
 
-/// Processes still running a tmux server on `socket`, from `ps`. A server
-/// keeps the argv of the client that started it: `tmux -L <socket> new-session …`.
-fn tmux_server_processes(socket: &str) -> usize {
-    let ps = std::process::Command::new("ps")
-        .args(["-axww", "-o", "command="])
+/// Whether process `pid` is still running. The census goes by the server's
+/// own pid, from `#{pid}`: tmux retitles its server process on Linux, so its
+/// command line cannot be matched.
+fn running(pid: &str) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", pid])
         .output()
-        .expect("ps");
-    let needle = format!("tmux -L {socket} ");
-    String::from_utf8_lossy(&ps.stdout)
-        .lines()
-        .filter(|line| line.trim_start().starts_with(&needle))
-        .count()
+        .expect("ps")
+        .status
+        .success()
 }
 
 #[test]
 fn a_panicking_test_still_reaps_its_tmux_server() {
     let socket = format!("jilog-test-{}-reap", std::process::id());
     let dir = test_dir("tmux-reap");
-    assert_eq!(tmux_server_processes(&socket), 0, "census before");
 
+    let mut pid = String::new();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _server = TmuxServer::start(socket.clone(), &dir);
-        assert_eq!(tmux_server_processes(&socket), 1, "census while running");
+        let server = TmuxServer::start(socket.clone(), &dir);
+        let shown = server.run(&["display-message", "-p", "#{pid}"]);
+        pid = String::from_utf8_lossy(&shown.stdout).trim().to_owned();
+        assert!(running(&pid), "census while running: server pid {pid:?}");
         panic!("an assertion failing mid-test");
     }));
     assert!(outcome.is_err());
+    assert!(pid.parse::<u32>().is_ok(), "server pid: {pid:?}");
 
     // kill-server returns before the server has exited; give it a moment.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tmux_server_processes(&socket) > 0 && std::time::Instant::now() < deadline {
+    while running(&pid) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(tmux_server_processes(&socket), 0, "census after");
+    assert!(!running(&pid), "census after: tmux server {pid} survived the panic");
 }
