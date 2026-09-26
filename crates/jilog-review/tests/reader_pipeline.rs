@@ -408,17 +408,11 @@ esac
 
     // A real tmux pane sitting in the worktree, on its own server, so the
     // reader's own liveness probe runs instead of a stub.
-    let socket = format!("jilog-test-{}", std::process::id());
-    let tmux = |args: &[&str]| {
-        let mut command = std::process::Command::new("tmux");
-        command.args(["-L", &socket]).args(args).output()
-    };
-    let started = tmux(&["new-session", "-d", "-c", &worktree.to_string_lossy(), "sh"])
-        .expect("tmux must be installed: this test covers the reader's live pane probe");
-    assert!(started.status.success(), "tmux new-session: {started:?}");
+    let server = TmuxServer::start(format!("jilog-test-{}", std::process::id()), &worktree);
+    let socket = server.socket.clone();
     let pane = String::from_utf8(
-        tmux(&["display-message", "-p", "-t", "0", "#{pane_id}"])
-            .unwrap()
+        server
+            .run(&["display-message", "-p", "-t", "0", "#{pane_id}"])
             .stdout,
     )
     .unwrap()
@@ -486,7 +480,7 @@ esac
 
     // …and so does a pane that is gone, with the file removed again.
     fs::remove_file(state_dir.join(&hook_file)).unwrap();
-    let _ = tmux(&["kill-server"]);
+    drop(server);
     let dead = run_review(&readers, &NoneTracker, &args("processed-3"))
         .unwrap()
         .errors
@@ -496,4 +490,73 @@ esac
         "an existing hook state file must retire the finding"
     );
     assert!(dead, "a pane that is gone leaves no identity to confirm");
+}
+
+/// A tmux server on its own socket, killed when the guard drops: on a failed
+/// assertion too, so a red run leaves no `tmux -L jilog-test-*` server behind
+/// holding a cwd in the worktree (jilog#kqs6).
+struct TmuxServer {
+    socket: String,
+}
+
+impl TmuxServer {
+    fn start(socket: String, cwd: &Path) -> Self {
+        // The guard exists before the server does, so a failure below still
+        // reaps whatever new-session left running.
+        let server = Self { socket };
+        let started = server.run(&["new-session", "-d", "-c", &cwd.to_string_lossy(), "sh"]);
+        assert!(started.status.success(), "tmux new-session: {started:?}");
+        server
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("tmux")
+            .args(["-L", &self.socket])
+            .args(args)
+            .output()
+            .expect("tmux must be installed: this test covers the reader's live pane probe")
+    }
+}
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .output();
+    }
+}
+
+/// Processes still running a tmux server on `socket`, from `ps`. A server
+/// keeps the argv of the client that started it: `tmux -L <socket> new-session …`.
+fn tmux_server_processes(socket: &str) -> usize {
+    let ps = std::process::Command::new("ps")
+        .args(["-axww", "-o", "command="])
+        .output()
+        .expect("ps");
+    let needle = format!("tmux -L {socket} ");
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.trim_start().starts_with(&needle))
+        .count()
+}
+
+#[test]
+fn a_panicking_test_still_reaps_its_tmux_server() {
+    let socket = format!("jilog-test-{}-reap", std::process::id());
+    let dir = test_dir("tmux-reap");
+    assert_eq!(tmux_server_processes(&socket), 0, "census before");
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _server = TmuxServer::start(socket.clone(), &dir);
+        assert_eq!(tmux_server_processes(&socket), 1, "census while running");
+        panic!("an assertion failing mid-test");
+    }));
+    assert!(outcome.is_err());
+
+    // kill-server returns before the server has exited; give it a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tmux_server_processes(&socket) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(tmux_server_processes(&socket), 0, "census after");
 }
