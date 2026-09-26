@@ -110,6 +110,20 @@ pub(crate) fn reopen_allowed(closed_reason: Option<&str>) -> bool {
     matches!(closed_reason, Some("done"))
 }
 
+/// Unit tests never run the `kata` on PATH. With `KATA_SERVER` unset (a gate
+/// host, a launchd job) the CLI auto-starts `kata daemon start --foreground`
+/// detached from the test, so no guard on the child can reap it: orphans on
+/// macazbd held worktrees open for days (jilog#kqs6). With it set, the test
+/// talks to the live daemon. Point `kata_bin` at a stub or a missing path.
+#[cfg(test)]
+pub(crate) fn refuse_real_kata(bin: &std::path::Path) {
+    assert!(
+        bin.components().count() > 1,
+        "test ran the real `{}`; use a stub or a missing path (jilog#kqs6)",
+        bin.display()
+    );
+}
+
 impl KataTracker {
     pub fn new(project: impl Into<String>) -> Self {
         Self {
@@ -148,6 +162,8 @@ impl KataTracker {
 
     /// Build a `kata` command pre-configured with `--project <name> --json`.
     fn cmd(&self) -> Command {
+        #[cfg(test)]
+        refuse_real_kata(&self.kata_bin);
         let mut c = Command::new(&self.kata_bin);
         c.args(["--project", &self.project, "--json"]);
         c
@@ -696,35 +712,33 @@ mod tests {
     use super::*;
     use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Workaround};
 
+    /// A tracker whose binary does not exist, for the fail-loud smoke tests.
+    fn missing_kata_tracker() -> KataTracker {
+        KataTracker {
+            kata_bin: "/nonexistent/jilog-kqs6/kata".into(),
+            ..KataTracker::new("nonexistent-jilog-test-project")
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "jilog#kqs6")]
+    fn a_test_that_reaches_the_real_kata_fails() {
+        let _ = KataTracker::new("nonexistent-jilog-test-project").list_open();
+    }
+
     // -----------------------------------------------------------------------
     // Original 7 tests (unchanged behaviour)
     // -----------------------------------------------------------------------
 
     #[test]
     fn kata_tracker_graceful_when_kata_missing_or_unconfigured() {
-        // If kata is not on PATH, we get a Command error.
-        // If kata is on PATH but the project doesn't exist, we get a Tracker error.
-        // Either way, no panic.
-        let tracker = KataTracker::new("nonexistent-jilog-test-project");
-        let signal = Signal::Correction(Correction {
-            session_id: "test".into(),
-            context: "some correction context here".into(),
-            ..Default::default()
-        });
-
+        // A missing binary is a Command error, not a panic. The real kata is
+        // never run here: see refuse_real_kata (jilog#kqs6).
+        let tracker = missing_kata_tracker();
         match tracker.list_open() {
-            Ok(_) => eprintln!("kata list returned successfully (project may exist)"),
-            Err(JilogReviewError::Command(msg)) => {
-                eprintln!("kata not found (expected in CI): {}", msg);
-            }
-            Err(JilogReviewError::Tracker(msg)) => {
-                eprintln!("kata returned error (expected when project missing): {}", msg);
-            }
-            Err(e) => {
-                eprintln!("unexpected error type: {}", e);
-            }
+            Err(JilogReviewError::Command(_)) => {}
+            other => panic!("expected a Command error, got {other:?}"),
         }
-        let _ = signal;
     }
 
     #[test]
@@ -902,21 +916,12 @@ mod tests {
 
     #[test]
     fn list_closed_graceful_when_kata_missing() {
-        // Mirrors the list_open smoke test. If kata is absent we get a
-        // Command error; if the project is missing we get a Tracker error.
-        // Either way, no panic.
-        let tracker = KataTracker::new("nonexistent-jilog-test-project");
+        // Mirrors the list_open smoke test: a missing binary is a Command
+        // error, not a panic.
+        let tracker = missing_kata_tracker();
         match tracker.list_closed() {
-            Ok(_) => eprintln!("kata list (closed) returned successfully (project may exist)"),
-            Err(JilogReviewError::Command(msg)) => {
-                eprintln!("kata not found (expected in CI): {}", msg);
-            }
-            Err(JilogReviewError::Tracker(msg)) => {
-                eprintln!("kata returned error (expected when project missing): {}", msg);
-            }
-            Err(e) => {
-                eprintln!("unexpected error type: {}", e);
-            }
+            Err(JilogReviewError::Command(_)) => {}
+            other => panic!("expected a Command error, got {other:?}"),
         }
     }
 
@@ -1073,27 +1078,15 @@ mod tests {
 
     #[test]
     fn reopen_fails_loud_when_kata_missing() {
-        let tracker = KataTracker::new("nonexistent-jilog-test-project");
+        let tracker = missing_kata_tracker();
         let result = tracker.reopen(
             "999",
             "Recurred on 2026-05-11 — closure may have been premature.",
         );
         match result {
-            Ok(()) => {
-                eprintln!("kata reopen returned Ok (kata must be installed with matching project)");
-            }
-            Err(JilogReviewError::Command(msg)) => {
-                eprintln!("kata not found — correct fail-loud behaviour: {}", msg);
-            }
-            Err(JilogReviewError::Tracker(msg)) => {
-                eprintln!("kata returned structured error — correct fail-loud behaviour: {}", msg);
-            }
-            Err(e) => {
-                eprintln!("other error variant (still not a panic): {}", e);
-            }
+            Err(JilogReviewError::Command(_)) => {}
+            other => panic!("expected a Command error, got {other:?}"),
         }
-        // Test passes regardless — verifies no panic and errors surface rather
-        // than being swallowed.
     }
 
     // -----------------------------------------------------------------------

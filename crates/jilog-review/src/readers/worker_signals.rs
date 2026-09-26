@@ -63,6 +63,8 @@ fn local_host() -> Option<String> {
 }
 
 fn kata(bin: &std::path::Path, args: &[&str]) -> Result<Value, JilogReviewError> {
+    #[cfg(test)]
+    crate::trackers::kata::refuse_real_kata(bin);
     let output = Command::new(bin).args(args).output()?;
     if !output.status.success() {
         return Err(JilogReviewError::Reader(format!(
