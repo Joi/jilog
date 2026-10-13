@@ -13,6 +13,7 @@ use crate::detectors::{
     detect_p0_alerts, detect_workarounds,
 };
 use crate::error::JilogReviewError;
+use crate::signal_ledger::{assign_ids, ledger_path, render_path, KindCounts, SignalLedger};
 use crate::health::detect_health_patterns;
 use crate::reader::{ProcessedSessions, Reader, RetrySessions, TranscriptHandle, RETRY_LOOKBACK_CAP_DAYS};
 use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Signal, Workaround};
@@ -70,6 +71,11 @@ pub struct DigestReport {
     /// those signals came from are NOT persisted as processed, so the next
     /// run rescans and retries them (jilog#1dvk).
     pub tracker_failures: usize,
+    /// Signals detected among the sessions this run scanned, new and
+    /// already counted alike (jilog#1xmf). `None` when the run keeps no
+    /// signal ledger (no processed file); then the lists above are
+    /// everything detected.
+    pub detected: Option<KindCounts>,
 }
 
 /// Sessions and signal counts for one persona@channel key.
@@ -252,7 +258,27 @@ pub fn run_review(
         Some(path) => RetrySessions::load(path)?,
         None => RetrySessions::empty(),
     };
-    let effective_since = match pending_retries.min_modified() {
+    // Signal ledger and render sidecar (jilog#1xmf), both beside the
+    // processed file; without one there is no ledger and nothing changes.
+    let ledger_file = args.processed_file.as_ref().map(|p| ledger_path(p));
+    let render_file = args.processed_file.as_ref().map(|p| render_path(p));
+    let mut ledger: Option<SignalLedger> = match &ledger_file {
+        Some(p) => Some(SignalLedger::load(p)?),
+        None => None,
+    };
+    let pending_render = match &render_file {
+        Some(p) => RetrySessions::load(p)?,
+        None => RetrySessions::empty(),
+    };
+    // One pending set: `.retry` entries (failed creates) and `.render`
+    // entries (signals no written digest has rendered) widen discovery,
+    // pass the in-window filter and count as pending for the same-date
+    // preservation test alike.
+    let oldest_pending = match (pending_retries.min_modified(), pending_render.min_modified()) {
+        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+        (a, b) => a.or(b),
+    };
+    let effective_since = match oldest_pending {
         Some(oldest) => {
             let widened = std::cmp::min(args.since, oldest - chrono::Duration::seconds(1));
             let floor = args.since - chrono::Duration::days(RETRY_LOOKBACK_CAP_DAYS);
@@ -270,8 +296,12 @@ pub fn run_review(
     // session_id → transcript modified time for sessions scanned this run,
     // recorded so failed sessions can be written to the retry sidecar.
     let mut scanned_modified: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
-    let pending_ids: HashSet<String> =
-        pending_retries.entries().keys().cloned().collect();
+    let pending_ids: HashSet<String> = pending_retries
+        .entries()
+        .keys()
+        .chain(pending_render.entries().keys())
+        .cloned()
+        .collect();
     // Dedupe keys scanned this run, and session id → key for the sessions
     // whose key differs from their id (jilog#heyg): one session seen through
     // two readers (raw transcript + archive) is scanned once, and an unmark
@@ -502,7 +532,54 @@ pub fn run_review(
         }
     }
 
+    // P0 alerts and the persona rollup cover everything detected this run,
+    // seen or new: P0 is a standing alarm (jilog#1xmf).
     let p0_alerts = detect_p0_alerts(&all_errors);
+
+    // Ledger split (jilog#1xmf): a signal without the counted flag is NEW
+    // and is rendered; a signal without the filed flag is offered to the
+    // tracker. The `all_*` lists hold only new signals from here on.
+    let mut detected: Option<KindCounts> = None;
+    let mut new_ids: Vec<String> = Vec::new();
+    let mut new_sessions: HashSet<String> = HashSet::new();
+    let mut to_offer: Option<Vec<(Signal, String)>> = None;
+    if let Some(ref led) = ledger {
+        detected = Some(KindCounts {
+            corrections: all_corrections.len(),
+            errors: all_errors.len(),
+            workarounds: all_workarounds.len(),
+            deferrals: all_deferrals.len(),
+            patterns: all_patterns.len(),
+        });
+        let signals: Vec<Signal> = all_corrections
+            .drain(..)
+            .map(Signal::Correction)
+            .chain(all_errors.drain(..).map(Signal::Error))
+            .chain(all_workarounds.drain(..).map(Signal::Workaround))
+            .chain(all_deferrals.drain(..).map(Signal::Deferral))
+            .chain(all_patterns.drain(..).map(Signal::Pattern))
+            .collect();
+        let ids = assign_ids(&signals);
+        let mut offer = Vec::new();
+        for (signal, id) in signals.into_iter().zip(ids) {
+            if !led.is_filed(&id) {
+                offer.push((signal.clone(), id.clone()));
+            }
+            if led.is_counted(&id) {
+                continue;
+            }
+            new_sessions.insert(signal.session_id().to_string());
+            new_ids.push(id);
+            match signal {
+                Signal::Correction(c) => all_corrections.push(c),
+                Signal::Error(e) => all_errors.push(e),
+                Signal::Workaround(w) => all_workarounds.push(w),
+                Signal::Deferral(d) => all_deferrals.push(d),
+                Signal::Pattern(p) => all_patterns.push(p),
+            }
+        }
+        to_offer = Some(offer);
+    }
     let spend = if spend.sessions_with_stats > 0 { Some(spend) } else { None };
     let personas = display_keyed_personas(personas);
 
@@ -538,17 +615,28 @@ pub fn run_review(
     let mut issue_index: HashMap<String, IssueRef> = HashMap::new();
     let mut failed_sessions: HashSet<String> = HashSet::new();
     let mut tracker_failures: usize = 0;
+    let mut filed_ids: Vec<String> = Vec::new();
     if args.create_issues && !args.dry_run {
-        let signals = all_corrections
-            .iter()
-            .map(|c| Signal::Correction(c.clone()))
-            .chain(all_errors.iter().map(|e| Signal::Error(e.clone())))
-            .chain(all_workarounds.iter().map(|w| Signal::Workaround(w.clone())))
-            .chain(all_deferrals.iter().map(|d| Signal::Deferral(d.clone())))
-            .chain(all_patterns.iter().map(|p| Signal::Pattern(p.clone())));
-        for signal in signals {
+        // With a ledger, every signal not yet filed — new or already
+        // counted — is offered; without one, everything detected, as before.
+        let signals: Vec<(Signal, Option<String>)> = match to_offer.take() {
+            Some(offer) => offer.into_iter().map(|(s, id)| (s, Some(id))).collect(),
+            None => all_corrections
+                .iter()
+                .map(|c| Signal::Correction(c.clone()))
+                .chain(all_errors.iter().map(|e| Signal::Error(e.clone())))
+                .chain(all_workarounds.iter().map(|w| Signal::Workaround(w.clone())))
+                .chain(all_deferrals.iter().map(|d| Signal::Deferral(d.clone())))
+                .chain(all_patterns.iter().map(|p| Signal::Pattern(p.clone())))
+                .map(|s| (s, None))
+                .collect(),
+        };
+        for (signal, id) in signals {
             match tracker.create(&signal) {
                 Ok(issue_ref) => {
+                    if let Some(id) = id {
+                        filed_ids.push(id);
+                    }
                     // Deferrals are deliberately excluded from digest
                     // annotations (no issue_index entry), matching the
                     // pre-refactor per-kind loops.
@@ -583,12 +671,33 @@ pub fn run_review(
     // overwrite the populated digest with an empty one. The signal lists
     // only contain THIS run's findings, not the prior run's, so we have
     // no way to "merge" — skipping the write is the conservative choice.
+    //
+    // A retry-only run (every scanned session was pending in `.retry` or
+    // `.render`) must also not overwrite an existing same-date digest: the
+    // first run's digest already recorded everything else, and rewriting it
+    // with just the retried subset would delete the rest (fresheyes
+    // 2026-08-26 round 3; `.render` joins the set under jilog#1xmf). Computed
+    // before any write, because the sidecars below depend on it.
+    let retry_only_run = sessions_scanned > 0
+        && scanned_modified.keys().all(|sid| pending_ids.contains(sid));
+    let should_write = !args.dry_run
+        && !(digest_path.exists() && (sessions_scanned == 0 || retry_only_run));
+
+    // Write order (jilog#1xmf, spec "Write order and failure"):
+    //   1. `.retry`, then `.render` with every session holding a new signal
+    //      — the durable intent, so a later failure cannot strand them;
+    //   2. ledger: `filed` marks, before anything else can fail;
+    //   3. digest;
+    //   4. only if the digest was written: ledger `counted` marks, then
+    //      `.render` without the sessions that digest rendered;
+    //   5. processed file, unmarking every session still in `.render`.
     // Persist the retry sidecar BEFORE the fallible digest and
     // processed-file writes: if either of those errors out, the pending
     // failures are already durably recorded and the run's early return
     // cannot lose them (fresheyes 2026-08-26 round 4).
     let creates_attempted = args.create_issues;
     let mut unresolved_pending: Vec<String> = Vec::new();
+    let mut render_entries: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
     if !args.dry_run {
         let mut new_retry_entries: HashMap<String, chrono::DateTime<chrono::Utc>> =
             HashMap::new();
@@ -622,21 +731,41 @@ pub fn run_review(
         if let Some(rf) = &retry_file {
             RetrySessions::save_entries(rf, &new_retry_entries)?;
         }
-    }
 
-    // A retry-only run (every scanned session was a pending retry) must
-    // also not overwrite an existing same-date digest: the first run's
-    // digest already recorded these sessions' signals alongside everything
-    // else, and rewriting it with just the retried subset would delete the
-    // rest (fresheyes 2026-08-26 round 3). Like the sessions_scanned == 0
-    // guard, skipping the write is the conservative choice — there is no
-    // merge source for the prior run's signal lists.
-    let retry_only_run = sessions_scanned > 0
-        && scanned_modified.keys().all(|sid| pending_ids.contains(sid));
-    // An existing same-date digest is preserved when this run scanned
-    // nothing new (sessions_scanned == 0) or only retried sessions.
-    let should_write = !args.dry_run
-        && !(digest_path.exists() && (sessions_scanned == 0 || retry_only_run));
+        if let Some(rf) = &render_file {
+            // An older `.render` entry resolves once a run scans its
+            // session: either nothing in it is new any more, or it is in
+            // `new_sessions` below and leaves at step 4 when the digest is
+            // written.
+            for (sid, ts) in pending_render.entries() {
+                if *ts < gc_floor {
+                    tracing::warn!(
+                        "render entry {} aged past the {}-day lookback cap — dropping; its unrendered signals are lost",
+                        sid, RETRY_LOOKBACK_CAP_DAYS
+                    );
+                    continue;
+                }
+                if !scanned_modified.contains_key(sid) {
+                    render_entries.insert(sid.clone(), *ts);
+                }
+            }
+            for sid in &new_sessions {
+                if let Some(m) = scanned_modified.get(sid) {
+                    render_entries.insert(sid.clone(), *m);
+                }
+            }
+            RetrySessions::save_entries(rf, &render_entries)?;
+        }
+
+        // Step 2: filing is recorded before anything else can fail, so a
+        // later failure never leads to a second create.
+        if let (Some(led), Some(lf)) = (ledger.as_mut(), ledger_file.as_ref()) {
+            for id in &filed_ids {
+                led.mark_filed(id, args.date);
+            }
+            led.save(lf, args.date)?;
+        }
+    }
 
     if should_write {
         write_digest(
@@ -653,7 +782,20 @@ pub fn run_review(
             &args.digest_dir,
             &issue_index,
             &personas,
+            detected.as_ref(),
         )?;
+
+        // Step 4: the digest rendering the new signals is on disk.
+        if let (Some(led), Some(lf)) = (ledger.as_mut(), ledger_file.as_ref()) {
+            for id in &new_ids {
+                led.mark_counted(id, args.date);
+            }
+            led.save(lf, args.date)?;
+        }
+        if let Some(rf) = &render_file {
+            render_entries.retain(|sid, _| !new_sessions.contains(sid));
+            RetrySessions::save_entries(rf, &render_entries)?;
+        }
     }
 
     // Persist processed-sessions (jilog#1dvk): the retry sidecar above
@@ -661,12 +803,18 @@ pub fn run_review(
     // still-pending scanned sessions are unmarked so the next
     // create-enabled run rescans them. A pending retry counted as RESOLVED
     // only when this run actually attempted its tracker operations and none
-    // failed (fresheyes rounds 2+4).
+    // failed (fresheyes rounds 2+4). Sessions still in `.render` are
+    // unmarked too: their new signals are not in any written digest yet
+    // (jilog#1xmf).
     if !args.dry_run {
         if let (Some(ps), Some(pf)) = (processed.as_mut(), args.processed_file.as_ref()) {
             // Unmark the alias too: with the id-or-key skip above, a stale
             // key line would silently drop the retry (jilog#heyg).
-            for sid in failed_sessions.iter().chain(unresolved_pending.iter()) {
+            for sid in failed_sessions
+                .iter()
+                .chain(unresolved_pending.iter())
+                .chain(render_entries.keys())
+            {
                 ps.unmark(sid);
                 if let Some(alias) = aliases.get(sid) {
                     ps.unmark(alias);
@@ -698,6 +846,7 @@ pub fn run_review(
         created_issues,
         sessions_scanned,
         tracker_failures,
+        detected,
     })
 }
 
@@ -730,6 +879,33 @@ pub fn render_digest(
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
 ) -> String {
+    render_digest_full(
+        date, corrections, errors, workarounds, deferrals, patterns, p0_alerts, spend,
+        archive_spend, recurrence_costs, issue_index, personas, None,
+    )
+}
+
+/// [`render_digest`] with the signal-ledger counts (jilog#1xmf). With
+/// `detected`, the per-kind header lines count NEW signals and
+/// `signals_detected`/`*_detected` lines count everything detected among
+/// the sessions this run scanned; the persona heading says "(detected)".
+/// With `None` the output is byte-identical to [`render_digest`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_digest_full(
+    date: &str,
+    corrections: &[Correction],
+    errors: &[ErrorSignal],
+    workarounds: &[Workaround],
+    deferrals: &[DeferralSignal],
+    patterns: &[PatternSignal],
+    p0_alerts: &HashMap<String, BTreeSet<String>>,
+    spend: Option<&SpendSummary>,
+    archive_spend: Option<&crate::archive_spend::ArchiveSpend>,
+    recurrence_costs: &HashMap<String, String>,
+    issue_index: &HashMap<String, IssueRef>,
+    personas: &BTreeMap<String, PersonaCounts>,
+    detected: Option<&KindCounts>,
+) -> String {
     let signals =
         corrections.len() + errors.len() + workarounds.len() + deferrals.len() + patterns.len();
     let mut buf = String::new();
@@ -742,6 +918,14 @@ pub fn render_digest(
     buf.push_str(&format!("workarounds: {}\n", workarounds.len()));
     buf.push_str(&format!("deferrals: {}\n", deferrals.len()));
     buf.push_str(&format!("patterns: {}\n", patterns.len()));
+    if let Some(d) = detected {
+        buf.push_str(&format!("signals_detected: {}\n", d.total()));
+        buf.push_str(&format!("corrections_detected: {}\n", d.corrections));
+        buf.push_str(&format!("errors_detected: {}\n", d.errors));
+        buf.push_str(&format!("workarounds_detected: {}\n", d.workarounds));
+        buf.push_str(&format!("deferrals_detected: {}\n", d.deferrals));
+        buf.push_str(&format!("patterns_detected: {}\n", d.patterns));
+    }
     buf.push_str("---\n\n");
 
     buf.push_str(&format!("# Learning Digest — {}\n\n", date));
@@ -877,7 +1061,10 @@ pub fn render_digest(
     // Personas — rendered only when fleet sessions (persona-carrying
     // handles) were scanned. Coding-only digests are unchanged.
     if !personas.is_empty() {
-        buf.push_str("## Personas\n\n");
+        // The rollup counts every signal detected in the persona's
+        // sessions, seen or new (jilog#1xmf); say so when that differs from
+        // the lists above.
+        buf.push_str(if detected.is_some() { "## Personas (detected)\n\n" } else { "## Personas\n\n" });
         for (key, counts) in personas {
             // Usage suffix (jilog#2hwm): tokens whenever the sessions carried
             // usage data, dollars only when transcripts carried cost — jilog
@@ -1039,14 +1226,17 @@ pub fn write_digest(
     digest_dir: &Path,
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
+    detected: Option<&KindCounts>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = crate::util::digest_file_path(digest_dir, date);
-    let body = render_digest(
+    let body = render_digest_full(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
-        spend, archive_spend, recurrence_costs, issue_index, personas,
+        spend, archive_spend, recurrence_costs, issue_index, personas, detected,
     );
-    std::fs::write(&path, body)?;
+    // Atomic (jilog#1xmf): a failed write must never leave a truncated
+    // digest, which a later same-date run would preserve.
+    crate::reader::write_atomic(&path, &body)?;
     Ok(path)
 }
 
@@ -1373,7 +1563,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new()).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new(), None).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -2786,5 +2976,399 @@ mod tests {
         let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "retry rescans the session");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // jilog#1xmf — signal ledger: one count and one filing per signal
+    // -----------------------------------------------------------------------
+
+    /// Tracker that records every create and fails those whose correction
+    /// context is in `fail_contexts`.
+    struct CountingTracker {
+        fail_contexts: Vec<String>,
+        created: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingTracker {
+        fn new(fail: &[&str]) -> Self {
+            Self {
+                fail_contexts: fail.iter().map(|s| s.to_string()).collect(),
+                created: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn creates(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+
+    impl Tracker for CountingTracker {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn create(&self, signal: &Signal) -> Result<IssueRef, JilogReviewError> {
+            let context = match signal {
+                Signal::Correction(c) => c.context.clone(),
+                other => signal_title(other),
+            };
+            if self.fail_contexts.contains(&context) {
+                return Err(JilogReviewError::Tracker("simulated failure".into()));
+            }
+            self.created.lock().unwrap().push(context);
+            Ok(IssueRef {
+                id: "#c1".into(),
+                backend: "counting".into(),
+                url: None,
+                title: signal_title(signal),
+            })
+        }
+        fn list_open(&self) -> Result<Vec<IssueRef>, JilogReviewError> {
+            Ok(vec![])
+        }
+        fn is_resolved(&self, _issue: &IssueRef) -> Result<bool, JilogReviewError> {
+            Ok(false)
+        }
+    }
+
+    fn multi_correction_messages(contexts: &[&str]) -> Vec<Message> {
+        let msg = |role: &str, text: &str| Message {
+            role: Some(role.to_string()),
+            content: Some(serde_json::Value::String(text.to_string())),
+            name: None,
+        };
+        let mut out = vec![msg("assistant", "start")];
+        for c in contexts {
+            out.push(msg("user", c));
+            out.push(msg("assistant", "reply"));
+        }
+        out
+    }
+
+    fn fixture(session: &str, contexts: &[&str]) -> Vec<Box<dyn Reader>> {
+        vec![Box::new(FixtureReader {
+            agent: None,
+            machine: None,
+            dedupe_key: None,
+            session_id: session.into(),
+            messages: multi_correction_messages(contexts),
+            stats: None,
+            persona: None,
+            channel: None,
+        })]
+    }
+
+    fn ledger_args(dir: &Path, date: &str, create_issues: bool) -> ReviewArgs {
+        ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.to_path_buf(),
+            processed_file: Some(dir.join("processed-sessions.txt")),
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            dry_run: false,
+            create_issues,
+            archive_spend: None,
+        }
+    }
+
+    fn clear_processed(dir: &Path) {
+        let _ = fs::remove_file(dir.join("processed-sessions.txt"));
+    }
+
+    fn digest_for(dir: &Path, date: &str) -> String {
+        fs::read_to_string(crate::util::digest_file_path(dir, date)).unwrap()
+    }
+
+    const C1: &str = "no, use the staging database";
+    const C2: &str = "revert the change to the parser";
+
+    #[test]
+    fn rescan_next_night_counts_and_files_once() {
+        let dir = test_dir("ledger-rescan");
+        let readers = fixture("sess-1", &[C1, C2]);
+        let tracker = CountingTracker::new(&[]);
+
+        let r1 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        assert_eq!(r1.corrections.len(), 2);
+        assert_eq!(tracker.creates().len(), 2);
+
+        // Force a rescan the next night (the retry/render paths do this).
+        clear_processed(&dir);
+        let r2 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        assert_eq!(r2.sessions_scanned, 1);
+        assert_eq!(r2.corrections.len(), 0, "nothing new on the rescan");
+        assert_eq!(r2.detected.as_ref().unwrap().corrections, 2);
+        assert_eq!(tracker.creates().len(), 2, "no second create");
+        let body = digest_for(&dir, "2026-10-13");
+        assert!(body.contains("\ncorrections: 0\n"), "{body}");
+        assert!(body.contains("\ncorrections_detected: 2\n"), "{body}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_create_is_retried_without_recount() {
+        let dir = test_dir("ledger-failed-create");
+        let readers = fixture("sess-1", &[C1, C2]);
+        let failing = CountingTracker::new(&[C2]);
+        let r1 = run_review(&readers, &failing, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        assert_eq!(r1.corrections.len(), 2, "both rendered on the first night");
+        assert_eq!(failing.creates(), vec![C1.to_string()]);
+
+        // Next night the session is rescanned through `.retry`.
+        let healthy = CountingTracker::new(&[]);
+        let r2 = run_review(&readers, &healthy, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        assert_eq!(r2.sessions_scanned, 1);
+        assert_eq!(r2.corrections.len(), 0, "the failed signal is not recounted");
+        assert_eq!(healthy.creates(), vec![C2.to_string()], "only the unfiled signal is offered");
+        assert!(digest_for(&dir, "2026-10-13").contains("\ncorrections: 0\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_disabled_run_does_not_mark_filed() {
+        let dir = test_dir("ledger-creates-off");
+        let readers = fixture("sess-1", &[C1]);
+        let tracker = CountingTracker::new(&[]);
+        run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-12", false)).unwrap();
+        assert!(tracker.creates().is_empty());
+        let ledger = fs::read_to_string(dir.join("processed-sessions.txt.signals")).unwrap();
+        assert!(ledger.contains("\tc\t"), "counted only: {ledger}");
+
+        clear_processed(&dir);
+        let r2 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        assert_eq!(r2.corrections.len(), 0, "already counted");
+        assert_eq!(tracker.creates(), vec![C1.to_string()], "offered and filed now");
+        let ledger = fs::read_to_string(dir.join("processed-sessions.txt.signals")).unwrap();
+        assert!(ledger.contains("\tcf\t"), "{ledger}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn aging_reader(modified: DateTime<Utc>, contexts: &[&str]) -> Vec<Box<dyn Reader>> {
+        vec![Box::new(SinceAwareReader {
+            session_id: "sess-aging".into(),
+            modified,
+            messages: multi_correction_messages(contexts),
+        })]
+    }
+
+    #[test]
+    fn digest_write_failure_keeps_filed_and_rerenders() {
+        let dir = test_dir("ledger-digest-fail");
+        let digest_dir = dir.join("digests");
+        fs::write(&digest_dir, "occupied").unwrap();
+        let modified = Utc::now() - chrono::Duration::hours(30);
+        let readers = aging_reader(modified, &[C1]);
+        let tracker = CountingTracker::new(&[]);
+        let mut args = ledger_args(&dir, "2026-10-12", true);
+        args.digest_dir = digest_dir.clone();
+        args.since = modified - chrono::Duration::hours(1);
+        assert!(run_review(&readers, &tracker, &args).is_err(), "digest write must fail");
+        assert_eq!(tracker.creates().len(), 1);
+        let ledger = fs::read_to_string(dir.join("processed-sessions.txt.signals")).unwrap();
+        assert!(ledger.contains("\tf\t"), "filed, not counted: {ledger}");
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt.render")).unwrap().contains("sess-aging"));
+
+        // Next night: the window starts after the session's last change.
+        fs::remove_file(&digest_dir).unwrap();
+        let mut args2 = ledger_args(&dir, "2026-10-13", true);
+        args2.digest_dir = digest_dir.clone();
+        args2.since = Utc::now() - chrono::Duration::hours(2);
+        // Without `.render` the window alone finds nothing.
+        let bare = test_dir("ledger-digest-fail-bare");
+        let mut bare_args = ledger_args(&bare, "2026-10-13", true);
+        bare_args.since = args2.since;
+        let rb = run_review(&readers, &CountingTracker::new(&[]), &bare_args).unwrap();
+        assert_eq!(rb.sessions_scanned, 0);
+
+        let r2 = run_review(&readers, &tracker, &args2).unwrap();
+        assert_eq!(r2.sessions_scanned, 1, "rediscovered through .render");
+        assert_eq!(r2.corrections.len(), 1, "rendered now");
+        assert_eq!(tracker.creates().len(), 1, "not refiled");
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt.render")).unwrap().trim().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn render_entry_resolves_without_creates() {
+        let dir = test_dir("ledger-render-creates-off");
+        let digest_dir = dir.join("digests");
+        fs::write(&digest_dir, "occupied").unwrap();
+        let modified = Utc::now() - chrono::Duration::hours(30);
+        let readers = aging_reader(modified, &[C1]);
+        let tracker = CountingTracker::new(&[]);
+        let mut args = ledger_args(&dir, "2026-10-12", false);
+        args.digest_dir = digest_dir.clone();
+        args.since = modified - chrono::Duration::hours(1);
+        assert!(run_review(&readers, &tracker, &args).is_err());
+
+        fs::remove_file(&digest_dir).unwrap();
+        let mut args2 = ledger_args(&dir, "2026-10-13", false);
+        args2.digest_dir = digest_dir.clone();
+        args2.since = Utc::now() - chrono::Duration::hours(2);
+        let r2 = run_review(&readers, &tracker, &args2).unwrap();
+        assert_eq!(r2.corrections.len(), 1);
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt.render")).unwrap().trim().is_empty());
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt")).unwrap().contains("sess-aging"));
+        // A third run finds nothing pending.
+        let r3 = run_review(&readers, &tracker, &args2).unwrap();
+        assert_eq!(r3.sessions_scanned, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_date_retry_only_run_with_new_signal_is_not_lost() {
+        let dir = test_dir("ledger-same-date");
+        let tracker1 = CountingTracker::new(&[C2]);
+        // Run 1: two sessions; sess-b's create fails, so it goes to .retry.
+        let mut readers: Vec<Box<dyn Reader>> = fixture("sess-a", &[C1]);
+        readers.extend(fixture("sess-b", &[C2]));
+        run_review(&readers, &tracker1, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        let first = digest_for(&dir, "2026-10-12");
+        assert!(first.contains(C1) && first.contains(C2));
+
+        // Run 2, same date: sess-b gained a new correction; retry-only run.
+        const C3: &str = "you missed the second call site";
+        let readers2: Vec<Box<dyn Reader>> = fixture("sess-b", &[C2, C3]);
+        let tracker2 = CountingTracker::new(&[]);
+        let r2 = run_review(&readers2, &tracker2, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        assert_eq!(r2.sessions_scanned, 1);
+        assert_eq!(digest_for(&dir, "2026-10-12"), first, "digest preserved");
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt.render")).unwrap().contains("sess-b"));
+        assert!(!fs::read_to_string(dir.join("processed-sessions.txt")).unwrap().contains("sess-b"));
+
+        // Run 3, same date: sess-b pending only through .render → preserved.
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt.retry")).unwrap().trim().is_empty());
+        run_review(&readers2, &tracker2, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        assert_eq!(digest_for(&dir, "2026-10-12"), first, "still preserved");
+
+        // Run 4, next date: the new signal is rendered once, nothing refiled.
+        let before = tracker2.creates().len();
+        let r4 = run_review(&readers2, &tracker2, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        let ctx: Vec<&str> = r4.corrections.iter().map(|c| c.context.as_str()).collect();
+        assert_eq!(ctx, vec![C3]);
+        assert_eq!(tracker2.creates().len(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_entry_with_nothing_new_resolves() {
+        // A `.render` entry whose signals are already counted (say a step-4
+        // `.render` save failed after the ledger save) must clear on the
+        // next scan instead of re-queuing the session every run.
+        let dir = test_dir("ledger-render-stale");
+        let readers = fixture("sess-1", &[C1]);
+        let tracker = CountingTracker::new(&[]);
+        run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-12", true)).unwrap();
+        let ledger = fs::read_to_string(dir.join("processed-sessions.txt.signals")).unwrap();
+        assert!(ledger.contains("\tcf\t"), "{ledger}");
+        // Simulate the stale state: session listed in `.render`, not processed.
+        RetrySessions::save_entries(
+            &dir.join("processed-sessions.txt.render"),
+            &HashMap::from([("sess-1".to_string(), Utc::now())]),
+        )
+        .unwrap();
+        clear_processed(&dir);
+
+        let r2 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        assert_eq!(r2.sessions_scanned, 1);
+        assert_eq!(r2.corrections.len(), 0);
+        assert!(
+            fs::read_to_string(dir.join("processed-sessions.txt.render")).unwrap().trim().is_empty(),
+            "stale render entry must resolve"
+        );
+        assert!(fs::read_to_string(dir.join("processed-sessions.txt")).unwrap().contains("sess-1"));
+        let r3 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        assert_eq!(r3.sessions_scanned, 0, "nothing re-queued");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dry_run_does_not_write_ledger() {
+        let dir = test_dir("ledger-dry-run");
+        let mut args = ledger_args(&dir, "2026-10-12", true);
+        args.dry_run = true;
+        let r = run_review(&fixture("sess-1", &[C1]), &CountingTracker::new(&[]), &args).unwrap();
+        assert_eq!(r.corrections.len(), 1);
+        assert!(!dir.join("processed-sessions.txt.signals").exists());
+        assert!(!dir.join("processed-sessions.txt.render").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_processed_file_means_no_ledger() {
+        let dir = test_dir("ledger-none");
+        let mut args = ledger_args(&dir, "2026-10-12", false);
+        args.processed_file = None;
+        let readers = fixture("sess-1", &[C1]);
+        let r1 = run_review(&readers, &CountingTracker::new(&[]), &args).unwrap();
+        assert!(r1.detected.is_none());
+        let body = digest_for(&dir, "2026-10-12");
+        assert!(!body.contains("_detected:"), "{body}");
+        args.date = NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let r2 = run_review(&readers, &CountingTracker::new(&[]), &args).unwrap();
+        assert_eq!(r2.corrections.len(), 1, "without a ledger every scan counts, as before");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p0_counts_seen_errors() {
+        let dir = test_dir("ledger-p0");
+        let failing = |s: &str| -> Box<dyn Reader> {
+            Box::new(FixtureReader {
+                agent: None,
+                machine: None,
+                dedupe_key: None,
+                session_id: s.into(),
+                messages: vec![Message {
+                    role: Some("tool".into()),
+                    content: Some(serde_json::Value::String(
+                        r#"{"success": false, "error": "boom"}"#.into(),
+                    )),
+                    name: Some("web_fetch".into()),
+                }],
+                stats: None,
+                persona: None,
+                channel: None,
+            })
+        };
+        let tracker = CountingTracker::new(&[]);
+        let readers1: Vec<Box<dyn Reader>> = vec![failing("s1"), failing("s2")];
+        let r1 = run_review(&readers1, &tracker, &ledger_args(&dir, "2026-10-12", false)).unwrap();
+        assert!(r1.p0_alerts.is_empty());
+        // Next night s1 and s2 are rescanned (seen errors) and s3 is new.
+        clear_processed(&dir);
+        let readers2: Vec<Box<dyn Reader>> = vec![failing("s1"), failing("s2"), failing("s3")];
+        let r2 = run_review(&readers2, &tracker, &ledger_args(&dir, "2026-10-13", false)).unwrap();
+        assert_eq!(r2.errors.len(), 1, "only s3's error is new");
+        assert!(r2.p0_alerts.contains_key("web_fetch"), "P0 counts seen errors");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_digest_detected_header() {
+        let detected = KindCounts { corrections: 5, errors: 4, workarounds: 3, deferrals: 2, patterns: 1 };
+        let personas = BTreeMap::from([(
+            "jibot@ops".to_string(),
+            PersonaCounts { persona: "jibot".into(), channel: Some("ops".into()), sessions: 1, ..Default::default() },
+        )]);
+        let with = render_digest_full(
+            "2026-10-13", &[], &[], &[], &[], &[], &HashMap::new(), None, None,
+            &HashMap::new(), &no_issues(), &personas, Some(&detected),
+        );
+        for line in [
+            "\nsignals_detected: 15\n",
+            "\ncorrections_detected: 5\n",
+            "\nerrors_detected: 4\n",
+            "\nworkarounds_detected: 3\n",
+            "\ndeferrals_detected: 2\n",
+            "\npatterns_detected: 1\n",
+            "\n## Personas (detected)\n",
+        ] {
+            assert!(with.contains(line), "missing {line:?} in:\n{with}");
+        }
+        let without = render_digest(
+            "2026-10-13", &[], &[], &[], &[], &[], &HashMap::new(), None, None,
+            &HashMap::new(), &no_issues(), &personas,
+        );
+        assert!(!without.contains("_detected:"));
+        assert!(without.contains("\n## Personas\n"));
     }
 }

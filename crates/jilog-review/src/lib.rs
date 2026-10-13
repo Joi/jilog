@@ -22,6 +22,7 @@ pub mod tracker;
 pub mod detectors;
 pub mod health;
 pub mod digest;
+pub mod signal_ledger;
 pub mod util;
 pub mod readers;
 pub mod trackers;

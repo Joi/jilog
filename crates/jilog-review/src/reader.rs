@@ -277,7 +277,7 @@ impl ProcessedSessions {
 /// counter and is opened with `create_new`, so it never truncates an
 /// unrelated file, follows a planted symlink, or collides with the
 /// destination or a concurrent writer.
-fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<(), JilogReviewError> {
     use std::io::Write as _;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

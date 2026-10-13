@@ -9,6 +9,7 @@
     }
   ],
   "deferrals": 0,
+  "detected": null,
   "digest_path": "/tmp/learning-digest-2026-05-10.md",
   "errors": 0,
   "p0_alerts": {

@@ -146,16 +146,7 @@ fn run_nightly_at(
                 .with_context(|| "failed to serialize review JSON")?
         );
     } else {
-        println!(
-            "{} corrections, {} errors, {} workarounds, {} deferrals, {} patterns, {} P0 alert(s), {} session(s) scanned",
-            report.corrections.len(),
-            report.errors.len(),
-            report.workarounds.len(),
-            report.deferrals.len(),
-            report.patterns.len(),
-            report.p0_alerts.len(),
-            report.sessions_scanned,
-        );
+        println!("{}", summary_line(&report));
 
         if let Some(sp) = &report.spend {
             if let Some(total) = &sp.total_cost_usd {
@@ -273,6 +264,25 @@ fn nightly_since(args: &NightlyArgs) -> anyhow::Result<chrono::DateTime<Utc>> {
     }
 }
 
+/// The one-line human summary. With a signal ledger the per-kind counts are
+/// new signals and the suffix gives everything detected (jilog#1xmf).
+fn summary_line(report: &DigestReport) -> String {
+    let mut line = format!(
+        "{} corrections, {} errors, {} workarounds, {} deferrals, {} patterns, {} P0 alert(s), {} session(s) scanned",
+        report.corrections.len(),
+        report.errors.len(),
+        report.workarounds.len(),
+        report.deferrals.len(),
+        report.patterns.len(),
+        report.p0_alerts.len(),
+        report.sessions_scanned,
+    );
+    if let Some(d) = &report.detected {
+        line.push_str(&format!(" ({} detected)", d.total()));
+    }
+    line
+}
+
 fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value {
     let mut p0_alerts = serde_json::Map::new();
     for (tool, sessions) in &report.p0_alerts {
@@ -353,6 +363,14 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         "spend": spend,
         "digest_path": digest_path,
         "created_issues": serde_json::Value::Array(created_issues),
+        // Signals detected among the sessions scanned, new and already
+        // counted alike; the per-kind counts above are new signals only
+        // (jilog#1xmf). Null when the run keeps no signal ledger.
+        "detected": report
+            .detected
+            .as_ref()
+            .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null),
     });
 
     // Archive spend (agentsview): present only when the block rendered, so
@@ -457,7 +475,37 @@ mod tests {
             }],
             sessions_scanned: 3,
             tracker_failures: 0,
+            detected: None,
         }
+    }
+
+    #[test]
+    fn json_detected_object_populated() {
+        let mut report = digest_report();
+        report.detected = Some(jilog_review::signal_ledger::KindCounts {
+            corrections: 5,
+            errors: 4,
+            workarounds: 3,
+            deferrals: 2,
+            patterns: 1,
+        });
+        let value = digest_report_json(&report, false);
+        assert_eq!(
+            value["detected"],
+            serde_json::json!({"corrections": 5, "errors": 4, "workarounds": 3, "deferrals": 2, "patterns": 1})
+        );
+        assert_eq!(digest_report_json(&digest_report(), false)["detected"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn summary_line_appends_detected() {
+        let mut report = digest_report();
+        assert!(!summary_line(&report).contains("detected"));
+        report.detected = Some(jilog_review::signal_ledger::KindCounts {
+            corrections: 2,
+            ..Default::default()
+        });
+        assert!(summary_line(&report).ends_with("3 session(s) scanned (2 detected)"), "{}", summary_line(&report));
     }
 
     #[test]
@@ -732,6 +780,7 @@ mod tests {
                 "spend",
                 "digest_path",
                 "created_issues",
+                "detected",
             ])
         );
         // Populated personas entry: the exact serialized shape is a

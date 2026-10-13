@@ -1,6 +1,6 @@
 # Run: 1xmf-correction-precision-signal-ledger
 Instruction: Run `kata show jilog#1xmf` and work the issue in this worktree, following the dispatch rules (/do-it, starting rung floored at medium; not repoman-managed — no .repoman-managed marker; close with evidence; decide-and-notify).
-Stage: code-review:B
+Stage: code-review:C
 Rung: heavy (start-floor heavy: hard-trigger — live prod config (joimba ~/.jilog.toml) + digest header meaning read by consumers outside the repo; BR2 REV1 NOV1 INT2 FC1 = 7; Lens: none). Floored-at-heavy-by-hard-trigger: yes
 Spec: docs/superpowers/specs/2026-10-13-1xmf-correction-precision-signal-ledger-design.md   Plan: docs/superpowers/plans/2026-10-13-1xmf-correction-precision-signal-ledger.md
 Agency project: — (no mcp__agency__* tools in this session; executed directly, see Notes)
@@ -8,7 +8,8 @@ Kata: jilog#1xmf
 Fresheyes launches: 8/8 (budget spent: every further in-run independent pass goes to roborev --agent codex, then a fresh subagent)
 Last reviewed: spec c39811d02051ad0d58d33d82a02151e899bf1c26 (pass 5, final; pass 4 0db6b546, pass 3 f4e127f3, pass 2 45449226, pass 1 67023b7b)
 Last reviewed: plan ebb51cb8fba51720f481aa26a0e070d8e6d92f54 (pass 3, final; pass 2 e48e2a8d, pass 1 15fff915)
-Last reviewed: code:A f87e9a1341fe27201bee569d0936f01ff050e8e6 (pass 3; pass 2 e18a52e, pass 1 5434509)
+Last reviewed: code:A f87e9a1341fe27201bee569d0936f01ff050e8e6 (pass 3, final; committed as 7bf3643)
+Last reviewed: code:B 71686193ca868ad473f19b6161f7a1aa422fe3c6 (pass 4 delta; pass 3 whole chunk 6e0650e, pass 2 af7f4a6, pass 1 e9b740f)
 Pre-handoff review: — (not repoman-managed)
 
 ## Scorecards
@@ -26,10 +27,15 @@ Pass 1 [code:A]: 0B/4S/6C/0R · fixed -/- · velocity = (—→10, escalation no
 Pass 2 [code:A]: 0B/1S/3C/0R · fixed 10/10 prior · velocity ↓ (10→4, escalation no) · judge: CONTINUE (floor)   (Stage 1 PASS, mutation-verified; fresheyes run 20261013-110713-caeeda: README chat wording = chunk C, DEFERRED, fixed in tree; test labels fixed)
 Pass 3 [code:A]: 0B/0S/1C/0R · fixed 4/4 prior · velocity ↓ (4→1, escalation no) · judge: STOP-CLASS   (subagent, workspace tests green on snapshot; cosmetic "don't" after an unpunctuated newline NOT fixed inline — behaviour change after the last pass, so filed as a follow-up per the review-cycle rule)
 code:A: passes: 3 · elapsed: ~45 min · STOP-CLASS · committed tree = snapshot f87e9a1 + run artifacts
+Pass 1 [code:B]: 0B/2S/1C/0R · fixed -/- · velocity = (—→3, escalation no) · judge: pre-floor   (Stage 1 subagent: untested .render resolve guard → test added, mutation-verified; issue_index wording aligned. Stage 2 roborev job 1536 by codex: detected ≠ window total → REBUTTED (spec §2), job commented + closed)
+Pass 2 [code:B]: 0B/0S/0C/0R · fixed 1/1 prior (1 rebutted) · velocity ↓ (3→0, escalation no) · judge: CONTINUE (floor)   (Stage 1 PASS, mutation-verified; roborev job 1537 by codex: Pass)
+Pass 3 [code:B]: 0B/1S/1C/0R · fixed -/- · velocity ↑ (0→2, escalation yes) · judge: CONTINUE   (subagent, failure-modes lens: pattern identity hashed growing counts → fixed: kind + stuck-loop tool; load() doc corrected)
+Pass 4 [code:B]: 0B/0S/1C/0R · fixed 2/2 prior · velocity ↓ (2→1, escalation no) · judge: STOP-VELOCITY   (Stage 1 PASS; roborev job 1538 by codex: Pass; cosmetic — stuck-loop tool parsed from description prose — rebutted: health.rs is the only producer, structured field is follow-up material)
+code:B: passes: 4 · elapsed: ~60 min · STOP-VELOCITY · committed tree = 7168619 + run artifacts
 
 ## Chunks
 - [x] A — detector precision (item 1) — 3 code passes, STOP-CLASS; committed (item 4's diagnosis is documented in chunk C)
-- [ ] B — signal ledger: one filing per signal, new/total header counts (item 2) — code + tests written (292 jilog-review tests green); awaiting chunk review
+- [x] B — signal ledger (item 2) — 4 code passes (Stage 2 via roborev codex: budget spent), STOP-VELOCITY; committed
 - [ ] C — `jilog config check`, README + architecture doc (item 3, docs for 1/2/4) — code, CLI test, README, architecture.html written; joimba step pending; awaiting chunk review
 
 ## Notes
@@ -40,4 +46,6 @@ code:A: passes: 3 · elapsed: ~45 min · STOP-CLASS · committed tree = snapshot
 - The plan's chunk B/C rewrite (after spec pass 1) was applied with a python block replace rather than the Edit tool; checked afterwards with grep that no stale `in_window` text remained.
 - A9 corpus measurement with the COMMITTED detector (`corpus_measure_from_env`, ignored test): 2026-10-12 corpus 254 → 7. Kept: 4 constraint corrections ("don't make the debrief available", "Don't post the audio… just link", "do not trust that reading", "don't write out the konomi"), 1 report of a repeated failure ("did it again… still saying not logged in"), 2 false positives (a question whose "?" is mid-line, "shouldn't there be more…?"; a request matching "not what" in "if not what is missing").
 - C4 done 2026-10-13: joimba `hostname -s` = joimba; backup ~/.jilog.toml.bak-1xmf-20261013 (did not exist before; `cp -p`); `[tracker]` changed kata → none with the 41e2 comment; diff touches only that block. Not changed: azbd2's ~/.jilog.toml still says kata, but azbd2 has no nightly jilog LaunchAgent, so nothing files from it; noted for the close-out.
+- Follow-ups to file at close-out: (1) clause-initial "don't" misses a line-initial "don't" after an unpunctuated line, and `^no[,.! ]` fires on "no problem, …" — detector recall/precision polish (chunk A pass 3, Stage 1 pass 1); (2) kata tracker treats kata's fuzzy-title create conflict as a failure → 14-day retry loop; (3) errors detector for Claude Code is_error tool_result blocks, filtered.
+- roborev `review <sha>` installed its own pre-push hook in the shared ~/repos/jilog/.git/hooks/pre-push (roborev v0.71.0, flushes post-commit batches); left in place.
 - Measurement corpus: macazbd ~/.amplifier/health/learning-digest-2026-10-12.md, Corrections section (254 lines), copied to the session scratchpad. It holds private message text, so it is NOT committed; the committed fixture is synthetic, modelled on the categories the issue lists.
