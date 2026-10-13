@@ -1,6 +1,6 @@
 # Run: 1xmf-correction-precision-signal-ledger
 Instruction: Run `kata show jilog#1xmf` and work the issue in this worktree, following the dispatch rules (/do-it, starting rung floored at medium; not repoman-managed — no .repoman-managed marker; close with evidence; decide-and-notify).
-Stage: code-review:C
+Stage: whole-branch review
 Rung: heavy (start-floor heavy: hard-trigger — live prod config (joimba ~/.jilog.toml) + digest header meaning read by consumers outside the repo; BR2 REV1 NOV1 INT2 FC1 = 7; Lens: none). Floored-at-heavy-by-hard-trigger: yes
 Spec: docs/superpowers/specs/2026-10-13-1xmf-correction-precision-signal-ledger-design.md   Plan: docs/superpowers/plans/2026-10-13-1xmf-correction-precision-signal-ledger.md
 Agency project: — (no mcp__agency__* tools in this session; executed directly, see Notes)
@@ -32,11 +32,13 @@ Pass 2 [code:B]: 0B/0S/0C/0R · fixed 1/1 prior (1 rebutted) · velocity ↓ (3�
 Pass 3 [code:B]: 0B/1S/1C/0R · fixed -/- · velocity ↑ (0→2, escalation yes) · judge: CONTINUE   (subagent, failure-modes lens: pattern identity hashed growing counts → fixed: kind + stuck-loop tool; load() doc corrected)
 Pass 4 [code:B]: 0B/0S/1C/0R · fixed 2/2 prior · velocity ↓ (2→1, escalation no) · judge: STOP-VELOCITY   (Stage 1 PASS; roborev job 1538 by codex: Pass; cosmetic — stuck-loop tool parsed from description prose — rebutted: health.rs is the only producer, structured field is follow-up material)
 code:B: passes: 4 · elapsed: ~60 min · STOP-VELOCITY · committed tree = 7168619 + run artifacts
+Pass 1 [code:C]: 0B/1S/6C/0R · fixed -/- · velocity = (—→7)   (Stage 1 subagent PASS, 6 cosmetic → 4 fixed (fed-by wording, claude-code comment, README "unchanged"/"and so on"), 2 left (Quick Start --create-issues example still valid usage; architecture excerpt partial by design); roborev job 1539 by codex: window total missing — second time codex raised it (also job 1536) → REVERSED the rebuttal and implemented *_in_window from the ledger's first-seen dates, commit "Add window totals")
+code:C: one pass under the new One Review rule; the whole-branch independent review follows
 
 ## Chunks
 - [x] A — detector precision (item 1) — 3 code passes, STOP-CLASS; committed (item 4's diagnosis is documented in chunk C)
 - [x] B — signal ledger (item 2) — 4 code passes (Stage 2 via roborev codex: budget spent), STOP-VELOCITY; committed
-- [ ] C — `jilog config check`, README + architecture doc (item 3, docs for 1/2/4) — code, CLI test, README, architecture.html written; joimba step pending; awaiting chunk review
+- [x] C — `jilog config check`, README + architecture doc, v0.9.0 (item 3, docs for 1/2/4); joimba tracker none done; committed
 
 ## Notes
 - Agency MCP tools are not loaded in this session (no `mcp__agency__*` in the tool list). Execution is direct, chunk by chunk, with the plan's verification commands as the per-task check.
@@ -48,4 +50,5 @@ code:B: passes: 4 · elapsed: ~60 min · STOP-VELOCITY · committed tree = 71686
 - C4 done 2026-10-13: joimba `hostname -s` = joimba; backup ~/.jilog.toml.bak-1xmf-20261013 (did not exist before; `cp -p`); `[tracker]` changed kata → none with the 41e2 comment; diff touches only that block. Not changed: azbd2's ~/.jilog.toml still says kata, but azbd2 has no nightly jilog LaunchAgent, so nothing files from it; noted for the close-out.
 - Follow-ups to file at close-out: (1) clause-initial "don't" misses a line-initial "don't" after an unpunctuated line, and `^no[,.! ]` fires on "no problem, …" — detector recall/precision polish (chunk A pass 3, Stage 1 pass 1); (2) kata tracker treats kata's fuzzy-title create conflict as a failure → 14-day retry loop; (3) errors detector for Claude Code is_error tool_result blocks, filtered.
 - roborev `review <sha>` installed its own pre-push hook in the shared ~/repos/jilog/.git/hooks/pre-push (roborev v0.71.0, flushes post-commit batches); left in place.
+- RULE CHANGE MID-RUN (2026-10-13, jibot-code#41e2 decision 4, rendered into the global instructions as "Review Cycle — Scoped Gate, One Review, One Delta"): one independent-model review of the whole branch before handoff, fix every BLOCKER, fix-or-rebut every SUBSTANTIVE, one delta pass only when a BLOCKER fix changed behaviour; the 8-launch budget and the per-artifact heavy loop are gone, and that section is canonical over do-it's loop. Applied from chunk C on: chunk C keeps its one Stage 1 ∥ roborev pass (no floor-driven passes 2–3), then one whole-branch independent review before landing.
 - Measurement corpus: macazbd ~/.amplifier/health/learning-digest-2026-10-12.md, Corrections section (254 lines), copied to the session scratchpad. It holds private message text, so it is NOT committed; the committed fixture is synthetic, modelled on the categories the issue lists.

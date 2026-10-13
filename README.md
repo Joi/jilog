@@ -95,10 +95,11 @@ type = "nanoclaw"
 path = "~/nanoclaw/data"
 exclude = ["bifbot"]
 
-# A tracker turns recurring signals into issues (kata, github, none)
+# Raw signals are filed nowhere: the digest and the signal ledger keep the
+# record, and a weekly synthesis over the digests is what files issues.
+# (`kata` and `github` file every raw signal; `jilog config check` warns.)
 [tracker]
-type = "github"
-repo = "your-org/your-repo"
+type = "none"
 
 # Zones for the event ledger (jilog query; supervise is planned)
 [[zone]]
@@ -132,7 +133,7 @@ jilog can scan transcripts from different agent systems. Configure one or more r
 | `worker-signals` | Kata dispatch/kickoff/review records, kata-dispatch hook state, and the local Codex pool allocation log | — (emits P3 errors) | ✅ built-in |
 | `copilot` | `~/.copilot/session-state/<uuid>/events.jsonl` (GitHub Copilot CLI; `user.message` + `assistant.message` events) | — | ✅ built-in |
 | `pi` | `~/.pi/agent/sessions/<project-slug>/<timestamp>_<uuid>.jsonl` ([pi.dev](https://pi.dev) coding agent, session format v3; user + assistant + toolResult messages, per-call usage/cost → spend section) | ✅ | ✅ built-in |
-| `generic` | Any JSONL of `{"role","content","name"}` lines at a configured glob (`path`, `~` ok) with `session_id_from = "parent_dir" \| "file_stem"`; an optional first line `{"_jilog": {"persona": …, "channel": …}}` stamps the fleet dimensions (Personas rollup + chat-tuned corrections) — how Hermes profiles on jibotmac reach jilog (cell-fleet `scripts/hermes-jilog-export.py`) | — | ✅ built-in |
+| `generic` | Any JSONL of `{"role","content","name"}` lines at a configured glob (`path`, `~` ok) with `session_id_from = "parent_dir" \| "file_stem"`; an optional first line `{"_jilog": {"persona": …, "channel": …}}` stamps the fleet dimensions (persona/channel stamps + Personas rollup) — how Hermes profiles on jibotmac reach jilog (cell-fleet `scripts/hermes-jilog-export.py`) | — | ✅ built-in |
 | `nanoclaw` | `<data>/v2-sessions/<agent-id>/.claude-shared/projects/**/*.jsonl` (NanoClaw cell agent sessions — Claude Code format plus queue-operation entries; persona + channel mapped from the cell's `v2.db`, trust-tier `include`/`exclude` allowlist; run on-cell or against a read-only mirror) | ✅ | ✅ built-in |
 
 Configure pooled Codex scanning and dispatch evidence together:
@@ -213,11 +214,27 @@ Each reader emits normalized `Signal` types: corrections, errors, workarounds, d
 
 **Health signals** require a richer event stream than chat messages (compactions, resumes, tool calls with arguments). Readers with ✅ implement `Reader::load_events`; the others degrade gracefully — the same pipeline runs, they just never produce `Pattern` signals.
 
+### Why errors and patterns can read zero
+
+The errors detector reads `role: tool` results; the patterns detector reads the event stream. A digest whose readers carry neither reports `errors: 0` and `patterns: 0` every night, and that is the reader set, not a bug:
+
+| Reader | Tool-role results (errors) | Event stream (patterns) |
+|---|---|---|
+| amplifier, context-intelligence | yes | yes |
+| pi, nanoclaw | yes | yes |
+| worker-signals | yes (dispatch diagnostics) | no |
+| generic | only if its files hold tool-role lines | no |
+| claude-code | no — tool results are user-role `tool_result` blocks | no |
+| codex | no — tool calls are dropped | no |
+| copilot, agentsview | no | no |
+
+Claude Code marks every non-zero Bash exit `is_error: true`, so counting its `tool_result` errors unfiltered would replace a zero with a flood; that reader stays out of the errors detector until a filtered design exists. `jilog config check` prints which configured readers feed each detector.
+
 ---
 
 ## Trackers — pluggable issue backends
 
-Learnings from the nightly loop can be filed as issues in any supported tracker:
+Learnings from the nightly loop can be filed as issues in any supported tracker. The recommended fleet setting is `none`: the nightly scan records raw signals in the digest and the signal ledger, and a weekly synthesis over the digests decides what becomes an issue. Filing every raw signal nightly produced thousands of near-duplicate records (jilog#1xmf); `jilog config check` exits 1 with a warning when `kata` or `github` is configured.
 
 | Tracker | Notes | Status |
 |---|---|---|
@@ -256,7 +273,7 @@ Six signal types are detected today.
 
 | Signal        | What triggers it                                                    | Detector heuristic                                                                                       |
 |---------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| `Correction`  | User pushes back on an assistant turn in 15–200 chars               | `assistant → user → assistant` window with a short user message in the middle                            |
+| `Correction`  | User pushes back on an assistant turn in 15–200 chars               | `assistant → user → assistant` window with a short user message that carries corrective language (`no,` / an imperative `don't` / `wrong` / `revert` / `I meant` / `you missed` / …) in every session kind; questions ending in `?`, bare confirmations and harness injections (`<system-reminder>`, `[structured-output-enforce]`, …) never count |
 | `Error`       | A tool call returned a structured failure                           | A `role: tool` message whose JSON content has `success: false` — minus the ruled-expected `mode` denials and content-free `bash` failures (see the expected-noise filter below) |
 | `Workaround`  | Assistant text admits a temporary or hacky path                     | First-match across `for now`, `temporary`, `workaround`, `hardcoded`, `TODO`, `FIXME`, `quick fix`, `hack` |
 | `Deferral`    | Assistant text postpones work to a later session                    | First-match across `come back to`, `defer`, `punt on`, `leave for later`, `skipping for now`, `park for now`, `next session`, `circle back` |
@@ -265,11 +282,24 @@ Six signal types are detected today.
 
 Each emitted signal carries the `session_id` it came from, so digest and tracker entries always link back to the conversation that produced them.
 
+### One count and one filing per signal (signal ledger)
+
+The processed-sessions file keeps a clean session from being scanned twice, but a session can still come back: a failed tracker create puts it in the `.retry` sidecar, and a session whose signals no digest has shown yet goes into `.render` (below). Before 0.9, every signal in such a session was counted again in the next digest and offered to the tracker again — the same corrections five nights running.
+
+`review nightly` keeps a signal ledger beside the processed file, `<processed-file>.signals`, one line per signal: `<first-seen date>\t<c|f|cf>\t<kind>:<session id>:<hash>`. The hash is FNV-1a over the signal's own fields (a correction's text, an error's tool and message, …), so a signal keeps its identity when its session grows; the session id is part of it. Two flags, independent:
+
+- `c` (counted): a written digest has rendered it. A signal without `c` is **new**: it is listed and counted in the next digest written, then gains `c`.
+- `f` (filed): the tracker accepted it. Whenever creates are attempted, every signal without `f` is offered — new or not — so a failed create retries the next night without being counted again.
+
+A session whose new signals no written digest has rendered yet (a same-date rerun that preserved the earlier digest, or a failed digest write) goes into a second sidecar, `<processed-file>.render`, which widens discovery like `.retry`; the next digest written renders those signals once. Entries older than 90 days leave the ledger. A dry run reads the ledger but writes nothing; a run without a processed file keeps no ledger and behaves as before.
+
+The digest header keeps its keys: `corrections:` … `patterns:` and `signals_captured:` now count **new** signals. Added lines count everything detected among the sessions this run scanned, new or already counted: `signals_detected:`, `corrections_detected:` … `patterns_detected:`. Those cover only sessions this run scanned, since sessions an earlier run already processed are skipped, so a third block gives the window total from the ledger: `signals_in_window:`, `corrections_in_window:` … `patterns_in_window:` count every signal first counted by a run dated on or after the window start (`--days`/`--since`), plus this run's new ones. P0 alerts and the persona rollup (headed `## Personas (detected)`) cover everything detected, since a P0 is a standing alarm. The CLI summary adds `(<n> detected, <m> in window)` and `--json` the `detected` and `in_window` objects.
+
 ### Persona and channel dimensions (fleet sessions)
 
-Readers for chat-bot fleets (nanoclaw) stamp each handle with a **persona** (which bot: `jibot`, `bifbot`, …) and a **channel** (which group/surface). Every signal from those sessions carries both, digest bullets are prefixed `` `persona@channel` ``, and a **Personas** section rolls up per-bot counts — including bots that produced *no* signals, so the digest can say one bot needed four corrections this week and another needed none. The rollup also carries usage: summed `input_tokens` / `output_tokens` per persona, and a `cost_usd` sum (string-decimal, or null) only for sessions whose transcripts carried a cost field — cell transcripts have tokens but no cost, and jilog keeps no price tables, so fleet rows stay tokens-only. Digest persona lines append the usage as `— <in> in / <out> out tokens[, $<cost>]`. `review nightly --json` exposes the same rollup (counts + `input_tokens`, `output_tokens`, `cost_usd`) under a `personas` key. Coding-session output is unchanged.
+Readers for chat-bot fleets (nanoclaw) stamp each handle with a **persona** (which bot: `jibot`, `bifbot`, …) and a **channel** (which group/surface). Every signal from those sessions carries both, digest bullets are prefixed `` `persona@channel` ``, and a **Personas** section rolls up per-bot counts — including bots that produced *no* signals, so the digest can say one bot needed four corrections this week and another needed none. The rollup also carries usage: summed `input_tokens` / `output_tokens` per persona, and a `cost_usd` sum (string-decimal, or null) only for sessions whose transcripts carried a cost field — cell transcripts have tokens but no cost, and jilog keeps no price tables, so fleet rows stay tokens-only. Digest persona lines append the usage as `— <in> in / <out> out tokens[, $<cost>]`. `review nightly --json` exposes the same rollup (counts + `input_tokens`, `output_tokens`, `cost_usd`) under a `personas` key. Coding sessions carry no persona or channel stamps.
 
-Chat sessions also swap the correction heuristic: in a group chat, a short user message after an assistant turn is usually just conversation, so the chat-tuned detector additionally requires corrective language (`no, …`, `don't`, `stop`, `wrong`, `should never`, …).
+Chat and coding sessions share one correction detector (jilog#1xmf): in either, a short user message after an assistant turn is usually a new request, an approval or plain conversation, so a correction needs corrective language (`no, …`, an imperative `don't`, `stop …`, `wrong`, `should never`, `revert`, `I meant`, …). Before 0.9 that requirement applied to chat sessions only, and coding sessions counted every 15–200 character reply.
 
 ### Health-pattern detectors
 
@@ -402,7 +432,7 @@ Add `--json` for the machine-readable version — same counts plus per-tool P0 s
 
 ## Example: issues filed from a digest
 
-When the tracker isn't `none` and `--dry-run` is off, each new signal becomes an issue. `Tracker::create` checks `list_open()` first and returns the existing handle if a matching open issue is already filed, so re-running the same window doesn't churn duplicates.
+When the tracker isn't `none` and `--dry-run` is off, each signal not yet filed becomes an issue. `Tracker::create` checks `list_open()` first and returns the existing handle if a matching open issue is already filed, so re-running the same window doesn't churn duplicates.
 
 The issue title is built by `signal_title()` (see `crates/jilog-review/src/tracker.rs`):
 
@@ -459,6 +489,7 @@ The point of the nightly review is not that any single one of these is interesti
 
 ```bash
 jilog review nightly [--json]       # Nightly learning digest + issue filing
+jilog config check                  # Which readers feed errors/patterns; exit 1 if raw signals are filed
 jilog query [--since N] [--json]    # Filter ledger events
 jilog spool emit                    # Producer: this host's new segments -> spool
 jilog spool ingest                  # Authority: spool -> deduped fleet store

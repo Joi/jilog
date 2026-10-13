@@ -5,6 +5,7 @@ mod commands {
     pub mod review;
     pub mod query;
     pub mod spool;
+    pub mod config;
 }
 
 use clap::{Parser, Subcommand};
@@ -35,6 +36,9 @@ enum Cmd {
     Query(QueryArgs),
     /// Replicate ledger segments across the fleet (emit/ingest/status).
     Spool(commands::spool::SpoolArgs),
+    /// Inspect the config: which readers feed which detectors, and whether
+    /// the tracker files raw signals.
+    Config(commands::config::ConfigArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -64,5 +68,6 @@ fn main() -> anyhow::Result<()> {
             commands::spool::SpoolCmd::Ingest(a) => commands::spool::run_ingest(&cfg, a),
             commands::spool::SpoolCmd::Status(a) => commands::spool::run_status(&cfg, a),
         },
+        Cmd::Config(args) => commands::config::run(&cfg, args),
     }
 }

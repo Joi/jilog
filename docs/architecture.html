@@ -193,7 +193,7 @@
   <li>
     <span class="name cor">Correction</span>
     <div class="what">User pushes back on a turn</div>
-    <div class="how">An <code>assistant → user → assistant</code> window where the user message is 15&ndash;200 chars. Short pushback, not a new question.</div>
+    <div class="how">An <code>assistant → user → assistant</code> window where the user message is 15&ndash;200 chars <em>and</em> carries corrective language (<code>no,</code>, an imperative <code>don't</code>, <code>wrong</code>, <code>revert</code>, <code>I meant</code>, <code>you missed</code>, &hellip;) in every session kind. Questions ending in <code>?</code>, bare confirmations and harness injections (<code>&lt;system-reminder&gt;</code>, <code>[structured-output-enforce]</code>) never count.</div>
   </li>
   <li>
     <span class="name err">Error</span>
@@ -219,7 +219,8 @@
 <p class="caption">Each signal carries the <code>session_id</code> it came from, so digests and issues link back to the originating conversation.</p>
 
 <h2><span class="num">02</span> What jilog produces</h2>
-<p class="sub">A nightly run writes a markdown digest and (optionally) files issues to your tracker. The digest layout is byte-stable so downstream tooling can grep it.</p>
+<p class="sub">A nightly run writes a markdown digest and (optionally) files issues to your tracker. The digest layout is byte-stable so downstream tooling can grep it. The recommended tracker is <code>none</code>: the digest and the signal ledger keep the record, and a weekly synthesis over the digests decides what becomes an issue.</p>
+<p class="sub">Each signal is counted once and filed once across runs. A signal ledger beside the processed-sessions file (<code>&lt;processed-file&gt;.signals</code>) keeps two flags per signal: <code>c</code> once a written digest has rendered it, <code>f</code> once the tracker has accepted it. The flow per run: <strong>detect &rarr; classify against the ledger &rarr; offer every unfiled signal to the tracker &rarr; record filings &rarr; write the digest with the new signals &rarr; record them counted</strong>. Sessions whose new signals no written digest has rendered wait in <code>&lt;processed-file&gt;.render</code> until one does. The header's per-kind counts are new signals; <code>*_detected</code> lines count everything detected in the sessions scanned; <code>*_in_window</code> lines give the window total from the ledger, including sessions an earlier run already processed.</p>
 
 <div class="grid-2">
 
@@ -232,6 +233,9 @@
 <span class="k">corrections:</span> <span class="v">3</span>
 <span class="k">errors:</span> <span class="v">2</span>
 <span class="k">workarounds:</span> <span class="v">2</span>
+<span class="k">signals_detected:</span> <span class="v">9</span>
+<span class="k">corrections_detected:</span> <span class="v">4</span>
+<span class="k">signals_in_window:</span> <span class="v">21</span>
 <span class="c">---</span>
 
 <span class="a"># Learning Digest — 2026-05-09</span>
@@ -414,7 +418,7 @@
   <tr><th>Tracker</th><th>Backend</th></tr>
   <tr><td><code>kata</code></td><td>Local SQLite daemon (kenn-io/kata)</td></tr>
   <tr><td><code>github</code></td><td><code>gh issue</code> CLI wrapper</td></tr>
-  <tr><td><code>none</code></td><td>Markdown digest only, no issues filed</td></tr>
+  <tr><td><code>none</code></td><td>Markdown digest only, no issues filed &mdash; recommended; <code>jilog config check</code> warns on the others</td></tr>
 </table>
 </div>
 </div>
@@ -461,6 +465,7 @@
 <div><span class="cmd">jilog supervise</span> <span class="desc"># wrap tasks with ledger events + retry</span></div>
 <div><span class="cmd">jilog query</span> <span class="desc">[--since N] [--json]   # filter ledger events</span></div>
 <div><span class="cmd">jilog review nightly</span> <span class="desc">[--json]    # digest + issue filing</span></div>
+<div><span class="cmd">jilog config check</span>              <span class="desc"># readers feeding errors/patterns; exit 1 if raw signals are filed</span></div>
 <div><span class="cmd">jilog review sessions</span>           <span class="desc"># session-level summary by reader</span></div>
 <div><span class="cmd">jilog issues list</span>               <span class="desc"># open jilog-learning issues</span></div>
 <div><span class="cmd">jilog issues pending</span>            <span class="desc"># learnings not yet filed</span></div>
