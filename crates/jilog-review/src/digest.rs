@@ -547,7 +547,8 @@ pub fn run_review(
     let mut new_ids: Vec<String> = Vec::new();
     let mut new_sessions: HashSet<String> = HashSet::new();
     let mut to_offer: Option<Vec<(Signal, String)>> = None;
-    if let Some(ref led) = ledger {
+    let mut new_modified: Vec<Option<DateTime<Utc>>> = Vec::new();
+    if let Some(ref mut led) = ledger {
         let detected = KindCounts {
             corrections: all_corrections.len(),
             errors: all_errors.len(),
@@ -565,7 +566,14 @@ pub fn run_review(
             .collect();
         let ids = assign_ids(&signals);
         let mut offer = Vec::new();
+        // New signals from sessions in the review window (modified at or
+        // after the caller's `since`, not the widened discovery start).
+        let mut new_in_window = KindCounts::default();
         for (signal, id) in signals.into_iter().zip(ids) {
+            let modified = scanned_modified.get(signal.session_id()).copied();
+            if let Some(m) = modified {
+                led.note_session(&id, m);
+            }
             if !led.is_filed(&id) {
                 offer.push((signal.clone(), id.clone()));
             }
@@ -573,7 +581,11 @@ pub fn run_review(
                 continue;
             }
             new_sessions.insert(signal.session_id().to_string());
+            if modified.is_some_and(|m| m >= args.since) {
+                new_in_window.add(signal.kind());
+            }
             new_ids.push(id);
+            new_modified.push(modified);
             match signal {
                 Signal::Correction(c) => all_corrections.push(c),
                 Signal::Error(e) => all_errors.push(e),
@@ -583,16 +595,9 @@ pub fn run_review(
             }
         }
         to_offer = Some(offer);
-        let new = KindCounts {
-            corrections: all_corrections.len(),
-            errors: all_errors.len(),
-            workarounds: all_workarounds.len(),
-            deferrals: all_deferrals.len(),
-            patterns: all_patterns.len(),
-        };
-        // The window starts at the caller's `since` (not the widened
-        // discovery start): counted signals the ledger first saw on a run dated in it.
-        ledger_counts = Some(LedgerCounts::new(led, args.since.date_naive(), detected, &new));
+        // The window is the review's own: sessions modified at or after the
+        // caller's `since`, including ones the processed file skipped.
+        ledger_counts = Some(LedgerCounts::new(led, args.since, detected, &new_in_window));
     }
     let spend = if spend.sessions_with_stats > 0 { Some(spend) } else { None };
     let personas = display_keyed_personas(personas);
@@ -629,7 +634,7 @@ pub fn run_review(
     let mut issue_index: HashMap<String, IssueRef> = HashMap::new();
     let mut failed_sessions: HashSet<String> = HashSet::new();
     let mut tracker_failures: usize = 0;
-    let mut filed_ids: Vec<String> = Vec::new();
+    let mut filed_ids: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     if args.create_issues && !args.dry_run {
         // With a ledger, every signal not yet filed — new or already
         // counted — is offered; without one, everything detected, as before.
@@ -649,7 +654,7 @@ pub fn run_review(
             match tracker.create(&signal) {
                 Ok(issue_ref) => {
                     if let Some(id) = id {
-                        filed_ids.push(id);
+                        filed_ids.push((id, scanned_modified.get(signal.session_id()).copied()));
                     }
                     // Deferrals are deliberately excluded from digest
                     // annotations (no issue_index entry), matching the
@@ -774,8 +779,8 @@ pub fn run_review(
         // Step 2: filing is recorded before anything else can fail, so a
         // later failure never leads to a second create.
         if let (Some(led), Some(lf)) = (ledger.as_mut(), ledger_file.as_ref()) {
-            for id in &filed_ids {
-                led.mark_filed(id, args.date);
+            for (id, modified) in &filed_ids {
+                led.mark_filed(id, args.date, *modified);
             }
             led.save(lf, args.date)?;
         }
@@ -801,8 +806,8 @@ pub fn run_review(
 
         // Step 4: the digest rendering the new signals is on disk.
         if let (Some(led), Some(lf)) = (ledger.as_mut(), ledger_file.as_ref()) {
-            for id in &new_ids {
-                led.mark_counted(id, args.date);
+            for (id, modified) in new_ids.iter().zip(&new_modified) {
+                led.mark_counted(id, args.date, *modified);
             }
             led.save(lf, args.date)?;
         }
@@ -3320,6 +3325,44 @@ mod tests {
         assert!(fs::read_to_string(dir.join("processed-sessions.txt")).unwrap().contains("sess-1"));
         let r3 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
         assert_eq!(r3.sessions_scanned, 0, "nothing re-queued");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_total_follows_session_modified_time() {
+        // roborev 1541: a 24-hour nightly window must not count the
+        // previous night's signals from sessions last modified before it.
+        let dir = test_dir("ledger-window-nightly");
+        let now = Utc::now();
+        let readers: Vec<Box<dyn Reader>> = vec![
+            Box::new(SinceAwareReader {
+                session_id: "sess-old".into(),
+                modified: now - chrono::Duration::hours(30),
+                messages: multi_correction_messages(&[C1]),
+            }),
+            Box::new(SinceAwareReader {
+                session_id: "sess-recent".into(),
+                modified: now - chrono::Duration::hours(2),
+                messages: multi_correction_messages(&[C2]),
+            }),
+        ];
+        let tracker = CountingTracker::new(&[]);
+        let mut a1 = ledger_args(&dir, "2026-10-12", true);
+        a1.since = now - chrono::Duration::hours(48);
+        let r1 = run_review(&readers, &tracker, &a1).unwrap();
+        assert_eq!(r1.corrections.len(), 2);
+        assert_eq!(r1.in_window.as_ref().unwrap().corrections, 2);
+
+        // The next night, a 24-hour window, both sessions already processed.
+        let mut a2 = ledger_args(&dir, "2026-10-13", true);
+        a2.since = now - chrono::Duration::hours(24);
+        let r2 = run_review(&readers, &tracker, &a2).unwrap();
+        assert_eq!(r2.sessions_scanned, 0);
+        assert_eq!(
+            r2.in_window.as_ref().unwrap().corrections,
+            1,
+            "only the session modified inside the window counts"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

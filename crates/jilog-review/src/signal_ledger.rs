@@ -14,13 +14,15 @@
 //! - `f` (filed): the tracker accepted it. A signal without `f` is offered
 //!   to the tracker whenever creates are attempted.
 //!
-//! File format: one line per signal, `<first-seen date>\t<c|f|cf>\t<id>`,
-//! next to the processed file as `<processed-file>.signals`.
+//! File format: one line per signal,
+//! `<first-seen date>\t<c|f|cf>\t<session modified|->\t<id>`, next to the
+//! processed file as `<processed-file>.signals`. The session's latest seen
+//! modified time decides whether the signal falls in a review window.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 
 use crate::error::JilogReviewError;
@@ -161,9 +163,19 @@ impl Flags {
 }
 
 /// The per-job signal ledger.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    /// The run date the ledger first saw the signal (filed or counted).
+    date: NaiveDate,
+    flags: Flags,
+    /// The latest modified time seen for the signal's session; `None` for
+    /// an entry written before the field existed.
+    session_modified: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Default)]
 pub struct SignalLedger {
-    entries: HashMap<String, (NaiveDate, Flags)>,
+    entries: HashMap<String, Entry>,
 }
 
 impl SignalLedger {
@@ -185,19 +197,27 @@ impl SignalLedger {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut parts = line.splitn(3, '\t');
-            let parsed = match (parts.next(), parts.next(), parts.next()) {
-                (Some(d), Some(f), Some(id)) if !id.is_empty() => {
-                    match (NaiveDate::parse_from_str(d, "%Y-%m-%d"), Flags::parse(f)) {
-                        (Ok(date), Some(flags)) => Some((id.to_string(), date, flags)),
-                        _ => None,
-                    }
+            let fields: Vec<&str> = line.splitn(4, '\t').collect();
+            // Four fields today; three (no session time) from the first
+            // 0.9.0 builds.
+            let (d, f, m, id) = match fields.as_slice() {
+                [d, f, m, id] => (*d, *f, Some(*m), *id),
+                [d, f, id] => (*d, *f, None, *id),
+                _ => ("", "", None, ""),
+            };
+            let modified = match m {
+                None | Some("-") => Ok(None),
+                Some(t) => DateTime::parse_from_rfc3339(t).map(|t| Some(t.with_timezone(&Utc))),
+            };
+            let parsed = match (NaiveDate::parse_from_str(d, "%Y-%m-%d"), Flags::parse(f), modified) {
+                (Ok(date), Some(flags), Ok(session_modified)) if !id.is_empty() => {
+                    Some((id.to_string(), Entry { date, flags, session_modified }))
                 }
                 _ => None,
             };
             match parsed {
-                Some((id, date, flags)) => {
-                    ledger.entries.insert(id, (date, flags));
+                Some((id, entry)) => {
+                    ledger.entries.insert(id, entry);
                 }
                 None => tracing::warn!(
                     "signal ledger {}: skipping malformed line {:?}",
@@ -210,43 +230,61 @@ impl SignalLedger {
     }
 
     pub fn is_counted(&self, id: &str) -> bool {
-        self.entries.get(id).is_some_and(|(_, f)| f.counted)
+        self.entries.get(id).is_some_and(|e| e.flags.counted)
     }
 
     pub fn is_filed(&self, id: &str) -> bool {
-        self.entries.get(id).is_some_and(|(_, f)| f.filed)
+        self.entries.get(id).is_some_and(|e| e.flags.filed)
     }
 
-    /// Per-kind counts of counted signals the ledger first saw (filed or
-    /// counted, whichever came first) on a run dated `from` or later — the window total, together with this run's new signals
-    /// (jilog#1xmf). The kind is the identity's prefix.
-    pub fn counted_since(&self, from: NaiveDate) -> KindCounts {
+    /// Record that an existing entry's session was seen with `modified`
+    /// (the latest time wins). A no-op for an id the ledger does not hold.
+    pub fn note_session(&mut self, id: &str, modified: DateTime<Utc>) {
+        if let Some(e) = self.entries.get_mut(id) {
+            if e.session_modified.is_none_or(|m| modified > m) {
+                e.session_modified = Some(modified);
+            }
+        }
+    }
+
+    /// Per-kind counts of counted signals whose session was last seen
+    /// modified at or after `since` — the window's earlier signals; this
+    /// run's new ones are added by [`LedgerCounts::new`] (jilog#1xmf). The
+    /// window is the review's own: sessions modified since `since`. An
+    /// entry with no recorded session time is outside every window.
+    pub fn counted_in_window(&self, since: DateTime<Utc>) -> KindCounts {
         let mut out = KindCounts::default();
-        for (id, (date, flags)) in &self.entries {
-            if flags.counted && *date >= from {
+        for (id, e) in &self.entries {
+            if e.flags.counted && e.session_modified.is_some_and(|m| m >= since) {
                 out.add(id.split(':').next().unwrap_or(""));
             }
         }
         out
     }
 
-    pub fn mark_counted(&mut self, id: &str, date: NaiveDate) {
-        self.entry(id, date).counted = true;
+    pub fn mark_counted(&mut self, id: &str, date: NaiveDate, session_modified: Option<DateTime<Utc>>) {
+        self.entry(id, date, session_modified).counted = true;
     }
 
-    pub fn mark_filed(&mut self, id: &str, date: NaiveDate) {
-        self.entry(id, date).filed = true;
+    pub fn mark_filed(&mut self, id: &str, date: NaiveDate, session_modified: Option<DateTime<Utc>>) {
+        self.entry(id, date, session_modified).filed = true;
     }
 
-    fn entry(&mut self, id: &str, date: NaiveDate) -> &mut Flags {
-        let slot = self
-            .entries
-            .entry(id.to_string())
-            .or_insert((date, Flags::default()));
-        if date < slot.0 {
-            slot.0 = date;
+    fn entry(&mut self, id: &str, date: NaiveDate, session_modified: Option<DateTime<Utc>>) -> &mut Flags {
+        let slot = self.entries.entry(id.to_string()).or_insert(Entry {
+            date,
+            flags: Flags::default(),
+            session_modified: None,
+        });
+        if date < slot.date {
+            slot.date = date;
         }
-        &mut slot.1
+        if let Some(m) = session_modified {
+            if slot.session_modified.is_none_or(|old| m > old) {
+                slot.session_modified = Some(m);
+            }
+        }
+        &mut slot.flags
     }
 
     /// Write atomically, dropping entries first seen more than
@@ -256,8 +294,14 @@ impl SignalLedger {
         let mut lines: Vec<String> = self
             .entries
             .iter()
-            .filter(|(_, (date, flags))| *date >= floor && (flags.counted || flags.filed))
-            .map(|(id, (date, flags))| format!("{}\t{}\t{}", date.format("%Y-%m-%d"), flags.as_str(), id))
+            .filter(|(_, e)| e.date >= floor && (e.flags.counted || e.flags.filed))
+            .map(|(id, e)| {
+                let m = e
+                    .session_modified
+                    .map(|m| m.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| "-".to_string());
+                format!("{}\t{}\t{}\t{}", e.date.format("%Y-%m-%d"), e.flags.as_str(), m, id)
+            })
             .collect();
         lines.sort();
         let mut body = lines.join("\n");
@@ -318,17 +362,19 @@ pub struct LedgerCounts {
     /// Everything detected among the sessions this run scanned, new or
     /// already counted.
     pub detected: KindCounts,
-    /// Every counted signal the ledger first saw on a run dated within the window, plus
-    /// this run's new signals: the window total, including sessions an
-    /// earlier run already processed and this run skipped.
+    /// Every counted signal whose session was modified within the window,
+    /// plus this run's new signals from sessions in the window: the window
+    /// total, including sessions an earlier run already processed and this
+    /// run skipped.
     pub in_window: KindCounts,
 }
 
 impl LedgerCounts {
-    /// `in_window` = the ledger's counted entries dated `from` or later,
-    /// plus `new` (this run's signals, not yet in the ledger as counted).
-    pub fn new(ledger: &SignalLedger, from: NaiveDate, detected: KindCounts, new: &KindCounts) -> Self {
-        Self { detected, in_window: ledger.counted_since(from).plus(new) }
+    /// `in_window` = the ledger's counted entries whose session was seen
+    /// modified at or after `since`, plus `new_in_window` (this run's new
+    /// signals from sessions modified at or after `since`, not yet counted).
+    pub fn new(ledger: &SignalLedger, since: DateTime<Utc>, detected: KindCounts, new_in_window: &KindCounts) -> Self {
+        Self { detected, in_window: ledger.counted_in_window(since).plus(new_in_window) }
     }
 }
 
@@ -430,13 +476,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.txt.signals");
         let mut l = SignalLedger::empty();
-        l.mark_counted("a", d("2026-10-10"));
-        l.mark_filed("b", d("2026-10-11"));
-        l.mark_counted("c", d("2026-10-12"));
-        l.mark_filed("c", d("2026-10-12"));
+        l.mark_counted("a", d("2026-10-10"), None);
+        l.mark_filed("b", d("2026-10-11"), None);
+        l.mark_counted("c", d("2026-10-12"), None);
+        l.mark_filed("c", d("2026-10-12"), None);
         l.save(&path, d("2026-10-13")).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body, "2026-10-10\tc\ta\n2026-10-11\tf\tb\n2026-10-12\tcf\tc\n");
+        assert_eq!(body, "2026-10-10\tc\t-\ta\n2026-10-11\tf\t-\tb\n2026-10-12\tcf\t-\tc\n");
         let back = SignalLedger::load(&path).unwrap();
         assert!(back.is_counted("a") && !back.is_filed("a"));
         assert!(!back.is_counted("b") && back.is_filed("b"));
@@ -447,10 +493,10 @@ mod tests {
     #[test]
     fn first_seen_date_keeps_earliest() {
         let mut l = SignalLedger::empty();
-        l.mark_filed("a", d("2026-10-12"));
-        l.mark_counted("a", d("2026-10-10"));
-        l.mark_filed("a", d("2026-10-13"));
-        assert_eq!(l.entries["a"].0, d("2026-10-10"));
+        l.mark_filed("a", d("2026-10-12"), None);
+        l.mark_counted("a", d("2026-10-10"), None);
+        l.mark_filed("a", d("2026-10-13"), None);
+        assert_eq!(l.entries["a"].date, d("2026-10-10"));
     }
 
     #[test]
@@ -459,8 +505,8 @@ mod tests {
         let path = dir.path().join("p.signals");
         let run = d("2026-10-13");
         let mut l = SignalLedger::empty();
-        l.mark_counted("keep", run - chrono::Duration::days(90));
-        l.mark_counted("drop", run - chrono::Duration::days(91));
+        l.mark_counted("keep", run - chrono::Duration::days(90), None);
+        l.mark_counted("drop", run - chrono::Duration::days(91), None);
         l.save(&path, run).unwrap();
         let back = SignalLedger::load(&path).unwrap();
         assert!(back.is_counted("keep"));
@@ -489,19 +535,46 @@ mod tests {
         assert_eq!(l.len(), 0);
     }
 
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
     #[test]
-    fn counted_since_counts_window_by_kind() {
+    fn window_counts_by_session_modified_time() {
         let mut l = SignalLedger::empty();
-        l.mark_counted("correction:s1:aaaa", d("2026-10-10"));
-        l.mark_counted("correction:s2:bbbb", d("2026-10-12"));
-        l.mark_counted("error:s2:cccc", d("2026-10-12"));
-        l.mark_filed("correction:s3:dddd", d("2026-10-12")); // filed, never counted
-        let w = l.counted_since(d("2026-10-11"));
-        assert_eq!(w, KindCounts { corrections: 1, errors: 1, ..Default::default() });
+        l.mark_counted("correction:s1:aaaa", d("2026-10-12"), Some(t("2026-10-11T10:00:00Z")));
+        l.mark_counted("correction:s2:bbbb", d("2026-10-12"), Some(t("2026-10-12T10:00:00Z")));
+        l.mark_counted("error:s2:cccc", d("2026-10-12"), Some(t("2026-10-12T10:00:00Z")));
+        l.mark_filed("correction:s3:dddd", d("2026-10-12"), Some(t("2026-10-12T10:00:00Z"))); // never counted
+        l.mark_counted("correction:s4:eeee", d("2026-10-12"), None); // no session time
+        let since = t("2026-10-12T00:00:00Z");
+        assert_eq!(l.counted_in_window(since), KindCounts { corrections: 1, errors: 1, ..Default::default() });
+        // A rescan that sees s1 modified later brings it into the window.
+        l.note_session("correction:s1:aaaa", t("2026-10-12T20:00:00Z"));
+        l.note_session("correction:zzz:none", t("2026-10-12T20:00:00Z")); // absent: no-op
+        assert_eq!(l.counted_in_window(since).corrections, 2);
         let new = KindCounts { corrections: 2, ..Default::default() };
-        let lc = LedgerCounts::new(&l, d("2026-10-11"), KindCounts::default(), &new);
-        assert_eq!(lc.in_window.corrections, 3);
-        assert_eq!(lc.in_window.total(), 4);
+        let lc = LedgerCounts::new(&l, since, KindCounts::default(), &new);
+        assert_eq!(lc.in_window.corrections, 4);
+        assert_eq!(lc.in_window.total(), 5);
+    }
+
+    #[test]
+    fn session_time_round_trips_and_old_lines_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.signals");
+        let mut l = SignalLedger::empty();
+        l.mark_counted("a", d("2026-10-12"), Some(t("2026-10-12T10:00:00Z")));
+        l.save(&path, d("2026-10-13")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "2026-10-12\tc\t2026-10-12T10:00:00Z\ta\n");
+        let back = SignalLedger::load(&path).unwrap();
+        assert_eq!(back.counted_in_window(t("2026-10-12T09:00:00Z")).total(), 0, "unknown kind 'a' counts nowhere");
+        assert_eq!(back.entries["a"].session_modified, Some(t("2026-10-12T10:00:00Z")));
+        // A three-field line from the first 0.9.0 builds still loads.
+        std::fs::write(&path, "2026-10-12\tcf\tcorrection:s1:aaaa\n").unwrap();
+        let old = SignalLedger::load(&path).unwrap();
+        assert!(old.is_counted("correction:s1:aaaa") && old.is_filed("correction:s1:aaaa"));
+        assert_eq!(old.entries["correction:s1:aaaa"].session_modified, None);
     }
 
     #[test]
