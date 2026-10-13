@@ -13,7 +13,7 @@ use crate::detectors::{
     detect_p0_alerts, detect_workarounds,
 };
 use crate::error::JilogReviewError;
-use crate::signal_ledger::{assign_ids, ledger_path, render_path, KindCounts, SignalLedger};
+use crate::signal_ledger::{assign_ids, ledger_path, render_path, KindCounts, LedgerCounts, SignalLedger};
 use crate::health::detect_health_patterns;
 use crate::reader::{ProcessedSessions, Reader, RetrySessions, TranscriptHandle, RETRY_LOOKBACK_CAP_DAYS};
 use crate::signal::{Correction, DeferralSignal, ErrorSignal, PatternSignal, Signal, Workaround};
@@ -76,6 +76,10 @@ pub struct DigestReport {
     /// signal ledger (no processed file); then the lists above are
     /// everything detected.
     pub detected: Option<KindCounts>,
+    /// The window total: signals first counted by a run dated on or after
+    /// the window start, plus this run's new ones (jilog#1xmf). `None`
+    /// without a ledger.
+    pub in_window: Option<KindCounts>,
 }
 
 /// Sessions and signal counts for one persona@channel key.
@@ -539,18 +543,18 @@ pub fn run_review(
     // Ledger split (jilog#1xmf): a signal without the counted flag is NEW
     // and is rendered; a signal without the filed flag is offered to the
     // tracker. The `all_*` lists hold only new signals from here on.
-    let mut detected: Option<KindCounts> = None;
+    let mut ledger_counts: Option<LedgerCounts> = None;
     let mut new_ids: Vec<String> = Vec::new();
     let mut new_sessions: HashSet<String> = HashSet::new();
     let mut to_offer: Option<Vec<(Signal, String)>> = None;
     if let Some(ref led) = ledger {
-        detected = Some(KindCounts {
+        let detected = KindCounts {
             corrections: all_corrections.len(),
             errors: all_errors.len(),
             workarounds: all_workarounds.len(),
             deferrals: all_deferrals.len(),
             patterns: all_patterns.len(),
-        });
+        };
         let signals: Vec<Signal> = all_corrections
             .drain(..)
             .map(Signal::Correction)
@@ -579,6 +583,16 @@ pub fn run_review(
             }
         }
         to_offer = Some(offer);
+        let new = KindCounts {
+            corrections: all_corrections.len(),
+            errors: all_errors.len(),
+            workarounds: all_workarounds.len(),
+            deferrals: all_deferrals.len(),
+            patterns: all_patterns.len(),
+        };
+        // The window starts at the caller's `since` (not the widened
+        // discovery start): signals first counted by a run dated in it.
+        ledger_counts = Some(LedgerCounts::new(led, args.since.date_naive(), detected, &new));
     }
     let spend = if spend.sessions_with_stats > 0 { Some(spend) } else { None };
     let personas = display_keyed_personas(personas);
@@ -782,7 +796,7 @@ pub fn run_review(
             &args.digest_dir,
             &issue_index,
             &personas,
-            detected.as_ref(),
+            ledger_counts.as_ref(),
         )?;
 
         // Step 4: the digest rendering the new signals is on disk.
@@ -846,7 +860,8 @@ pub fn run_review(
         created_issues,
         sessions_scanned,
         tracker_failures,
-        detected,
+        detected: ledger_counts.as_ref().map(|lc| lc.detected.clone()),
+        in_window: ledger_counts.map(|lc| lc.in_window),
     })
 }
 
@@ -904,8 +919,9 @@ pub fn render_digest_full(
     recurrence_costs: &HashMap<String, String>,
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
-    detected: Option<&KindCounts>,
+    ledger_counts: Option<&LedgerCounts>,
 ) -> String {
+    let detected = ledger_counts.map(|lc| &lc.detected);
     let signals =
         corrections.len() + errors.len() + workarounds.len() + deferrals.len() + patterns.len();
     let mut buf = String::new();
@@ -925,6 +941,14 @@ pub fn render_digest_full(
         buf.push_str(&format!("workarounds_detected: {}\n", d.workarounds));
         buf.push_str(&format!("deferrals_detected: {}\n", d.deferrals));
         buf.push_str(&format!("patterns_detected: {}\n", d.patterns));
+    }
+    if let Some(w) = ledger_counts.map(|lc| &lc.in_window) {
+        buf.push_str(&format!("signals_in_window: {}\n", w.total()));
+        buf.push_str(&format!("corrections_in_window: {}\n", w.corrections));
+        buf.push_str(&format!("errors_in_window: {}\n", w.errors));
+        buf.push_str(&format!("workarounds_in_window: {}\n", w.workarounds));
+        buf.push_str(&format!("deferrals_in_window: {}\n", w.deferrals));
+        buf.push_str(&format!("patterns_in_window: {}\n", w.patterns));
     }
     buf.push_str("---\n\n");
 
@@ -1226,13 +1250,13 @@ pub fn write_digest(
     digest_dir: &Path,
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
-    detected: Option<&KindCounts>,
+    ledger_counts: Option<&LedgerCounts>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = crate::util::digest_file_path(digest_dir, date);
     let body = render_digest_full(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
-        spend, archive_spend, recurrence_costs, issue_index, personas, detected,
+        spend, archive_spend, recurrence_costs, issue_index, personas, ledger_counts,
     );
     // Atomic (jilog#1xmf): a failed write must never leave a truncated
     // digest, which a later same-date run would preserve.
@@ -3089,16 +3113,35 @@ mod tests {
         assert_eq!(r1.corrections.len(), 2);
         assert_eq!(tracker.creates().len(), 2);
 
+        // Next night, with a window that covers the first run's date.
+        let window_start = |a: &mut ReviewArgs| {
+            a.since = chrono::DateTime::parse_from_rfc3339("2026-10-12T00:00:00Z").unwrap().with_timezone(&Utc);
+        };
+        // First, without a rescan: the processed file skips the session,
+        // yet the window total still holds its two signals.
+        let mut quiet = ledger_args(&dir, "2026-10-13", true);
+        window_start(&mut quiet);
+        let rq = run_review(&readers, &tracker, &quiet).unwrap();
+        assert_eq!(rq.sessions_scanned, 0);
+        assert_eq!(rq.detected.as_ref().unwrap().corrections, 0);
+        assert_eq!(rq.in_window.as_ref().unwrap().corrections, 2);
+        let body = digest_for(&dir, "2026-10-13");
+        assert!(body.contains("\ncorrections_in_window: 2\n"), "{body}");
+
         // Force a rescan the next night (the retry/render paths do this).
         clear_processed(&dir);
-        let r2 = run_review(&readers, &tracker, &ledger_args(&dir, "2026-10-13", true)).unwrap();
+        let mut args2 = ledger_args(&dir, "2026-10-14", true);
+        window_start(&mut args2);
+        let r2 = run_review(&readers, &tracker, &args2).unwrap();
         assert_eq!(r2.sessions_scanned, 1);
         assert_eq!(r2.corrections.len(), 0, "nothing new on the rescan");
         assert_eq!(r2.detected.as_ref().unwrap().corrections, 2);
         assert_eq!(tracker.creates().len(), 2, "no second create");
-        let body = digest_for(&dir, "2026-10-13");
+        assert_eq!(r2.in_window.as_ref().unwrap().corrections, 2, "not double counted");
+        let body = digest_for(&dir, "2026-10-14");
         assert!(body.contains("\ncorrections: 0\n"), "{body}");
         assert!(body.contains("\ncorrections_detected: 2\n"), "{body}");
+        assert!(body.contains("\ncorrections_in_window: 2\n"), "{body}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3344,7 +3387,10 @@ mod tests {
 
     #[test]
     fn render_digest_detected_header() {
-        let detected = KindCounts { corrections: 5, errors: 4, workarounds: 3, deferrals: 2, patterns: 1 };
+        let detected = LedgerCounts {
+            detected: KindCounts { corrections: 5, errors: 4, workarounds: 3, deferrals: 2, patterns: 1 },
+            in_window: KindCounts { corrections: 9, errors: 8, workarounds: 7, deferrals: 6, patterns: 0 },
+        };
         let personas = BTreeMap::from([(
             "jibot@ops".to_string(),
             PersonaCounts { persona: "jibot".into(), channel: Some("ops".into()), sessions: 1, ..Default::default() },
@@ -3360,6 +3406,12 @@ mod tests {
             "\nworkarounds_detected: 3\n",
             "\ndeferrals_detected: 2\n",
             "\npatterns_detected: 1\n",
+            "\nsignals_in_window: 30\n",
+            "\ncorrections_in_window: 9\n",
+            "\nerrors_in_window: 8\n",
+            "\nworkarounds_in_window: 7\n",
+            "\ndeferrals_in_window: 6\n",
+            "\npatterns_in_window: 0\n",
             "\n## Personas (detected)\n",
         ] {
             assert!(with.contains(line), "missing {line:?} in:\n{with}");
@@ -3369,6 +3421,7 @@ mod tests {
             &HashMap::new(), &no_issues(), &personas,
         );
         assert!(!without.contains("_detected:"));
+        assert!(!without.contains("_in_window:"));
         assert!(without.contains("\n## Personas\n"));
     }
 }

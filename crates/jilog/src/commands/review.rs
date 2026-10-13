@@ -277,8 +277,10 @@ fn summary_line(report: &DigestReport) -> String {
         report.p0_alerts.len(),
         report.sessions_scanned,
     );
-    if let Some(d) = &report.detected {
-        line.push_str(&format!(" ({} detected)", d.total()));
+    match (&report.detected, &report.in_window) {
+        (Some(d), Some(w)) => line.push_str(&format!(" ({} detected, {} in window)", d.total(), w.total())),
+        (Some(d), None) => line.push_str(&format!(" ({} detected)", d.total())),
+        _ => {}
     }
     line
 }
@@ -368,6 +370,13 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
         // (jilog#1xmf). Null when the run keeps no signal ledger.
         "detected": report
             .detected
+            .as_ref()
+            .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null),
+        // Window total: signals first counted by a run dated on or after
+        // the window start, plus this run's new ones (jilog#1xmf).
+        "in_window": report
+            .in_window
             .as_ref()
             .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
             .unwrap_or(serde_json::Value::Null),
@@ -476,6 +485,7 @@ mod tests {
             sessions_scanned: 3,
             tracker_failures: 0,
             detected: None,
+            in_window: None,
         }
     }
 
@@ -506,6 +516,11 @@ mod tests {
             ..Default::default()
         });
         assert!(summary_line(&report).ends_with("3 session(s) scanned (2 detected)"), "{}", summary_line(&report));
+        report.in_window = Some(jilog_review::signal_ledger::KindCounts {
+            corrections: 7,
+            ..Default::default()
+        });
+        assert!(summary_line(&report).ends_with("(2 detected, 7 in window)"), "{}", summary_line(&report));
     }
 
     #[test]
@@ -781,6 +796,7 @@ mod tests {
                 "digest_path",
                 "created_issues",
                 "detected",
+                "in_window",
             ])
         );
         // Populated personas entry: the exact serialized shape is a

@@ -217,6 +217,19 @@ impl SignalLedger {
         self.entries.get(id).is_some_and(|(_, f)| f.filed)
     }
 
+    /// Per-kind counts of signals first counted on a run dated `from` or
+    /// later — the window total, together with this run's new signals
+    /// (jilog#1xmf). The kind is the identity's prefix.
+    pub fn counted_since(&self, from: NaiveDate) -> KindCounts {
+        let mut out = KindCounts::default();
+        for (id, (date, flags)) in &self.entries {
+            if flags.counted && *date >= from {
+                out.add(id.split(':').next().unwrap_or(""));
+            }
+        }
+        out
+    }
+
     pub fn mark_counted(&mut self, id: &str, date: NaiveDate) {
         self.entry(id, date).counted = true;
     }
@@ -274,6 +287,48 @@ pub struct KindCounts {
 impl KindCounts {
     pub fn total(&self) -> usize {
         self.corrections + self.errors + self.workarounds + self.deferrals + self.patterns
+    }
+
+    /// Count one signal of `kind` (a [`Signal::kind`] string).
+    pub fn add(&mut self, kind: &str) {
+        match kind {
+            "correction" => self.corrections += 1,
+            "error" => self.errors += 1,
+            "workaround" => self.workarounds += 1,
+            "deferral" => self.deferrals += 1,
+            "pattern" => self.patterns += 1,
+            _ => {}
+        }
+    }
+
+    fn plus(&self, other: &KindCounts) -> KindCounts {
+        KindCounts {
+            corrections: self.corrections + other.corrections,
+            errors: self.errors + other.errors,
+            workarounds: self.workarounds + other.workarounds,
+            deferrals: self.deferrals + other.deferrals,
+            patterns: self.patterns + other.patterns,
+        }
+    }
+}
+
+/// The two ledger-derived header blocks (jilog#1xmf).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LedgerCounts {
+    /// Everything detected among the sessions this run scanned, new or
+    /// already counted.
+    pub detected: KindCounts,
+    /// Every signal first counted on a run dated within the window, plus
+    /// this run's new signals: the window total, including sessions an
+    /// earlier run already processed and this run skipped.
+    pub in_window: KindCounts,
+}
+
+impl LedgerCounts {
+    /// `in_window` = the ledger's counted entries dated `from` or later,
+    /// plus `new` (this run's signals, not yet in the ledger as counted).
+    pub fn new(ledger: &SignalLedger, from: NaiveDate, detected: KindCounts, new: &KindCounts) -> Self {
+        Self { detected, in_window: ledger.counted_since(from).plus(new) }
     }
 }
 
@@ -432,6 +487,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l = SignalLedger::load(&dir.path().join("none")).unwrap();
         assert_eq!(l.len(), 0);
+    }
+
+    #[test]
+    fn counted_since_counts_window_by_kind() {
+        let mut l = SignalLedger::empty();
+        l.mark_counted("correction:s1:aaaa", d("2026-10-10"));
+        l.mark_counted("correction:s2:bbbb", d("2026-10-12"));
+        l.mark_counted("error:s2:cccc", d("2026-10-12"));
+        l.mark_filed("correction:s3:dddd", d("2026-10-12")); // filed, never counted
+        let w = l.counted_since(d("2026-10-11"));
+        assert_eq!(w, KindCounts { corrections: 1, errors: 1, ..Default::default() });
+        let new = KindCounts { corrections: 2, ..Default::default() };
+        let lc = LedgerCounts::new(&l, d("2026-10-11"), KindCounts::default(), &new);
+        assert_eq!(lc.in_window.corrections, 3);
+        assert_eq!(lc.in_window.total(), 4);
     }
 
     #[test]
