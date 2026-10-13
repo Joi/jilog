@@ -2,7 +2,7 @@
 //!
 //! Optional per-file header: if the FIRST line of a transcript is
 //! `{"_jilog": {"persona": "...", "channel": "..."}}`, the handle carries
-//! those dimensions (chat-tuned correction detector + Personas rollup),
+//! those dimensions (persona/channel stamps + Personas rollup),
 //! exactly like the nanoclaw reader stamps them from a cell's routing db.
 //! The header has no `role`, so `load()` skips it and older jilog versions
 //! ignore it. Exporters that write this format: cell-fleet

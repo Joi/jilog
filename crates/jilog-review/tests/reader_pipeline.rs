@@ -228,7 +228,7 @@ fn nanoclaw_cell_fixture_produces_dims_and_pattern_section() {
 }
 
 #[test]
-fn pooled_codex_seat_reaches_signals_without_chat_heuristics() {
+fn pooled_codex_seat_reaches_signals_through_the_pipeline() {
     use jilog_review::readers::CodexReader;
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("profiles/codex-17/sessions");

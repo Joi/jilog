@@ -80,44 +80,85 @@ const DEFERRAL_LABELS: &[&str] = &[
 /// Threshold for the P0 alert: distinct root sessions per tool.
 const P0_DISTINCT_SESSION_THRESHOLD: usize = 3;
 
-/// Corrective-marker regexes for the chat-tuned correction detector.
+/// Corrective-marker regexes. A correction candidate must match at least one
+/// in every session kind (jilog#1xmf): in coding sessions as in group chat,
+/// a short user turn between two assistant turns is usually a new request,
+/// an approval or a question, not a correction. Measured 2026-10-12: the
+/// length window alone flagged 254 turns, almost none of them corrections.
 ///
-/// In a group chat, a short user message after an assistant turn is usually
-/// just conversation (often not even addressed to the bot), so the coding
-/// heuristic's length window alone would flag most of the channel. Chat
-/// sessions additionally require explicit corrective language.
-const CHAT_CORRECTION_PATTERNS: &[&str] = &[
+/// Three markers are narrower than the bare word, each measured on that
+/// corpus: `don't`/`do not` only clause-initially (an imperative, not "I
+/// don't think it completed"); `again` only beside a failure word ("still
+/// failing again", not "check in again" or "thanks again"); `actually` only
+/// leading and followed by a redirect ("actually, use the other file", not
+/// "actually, that sounds great"). Those two use `(?s)`, so the pairing
+/// holds across a line break within one message.
+const CORRECTION_PATTERNS: &[&str] = &[
     r"(?i)^no[,.! ]",
-    r"(?i)\bdon'?t\b",
-    r"(?i)\bdo not\b",
+    r"(?i)(^|[.;:!,-]\s*|\band\s+)(just\s+|please\s+)?(don['’]?t|do not)\b",
     r"(?i)\bplease stop\b",
     r"(?i)\bstop (doing|replying|posting|answering|sending|using|adding)\b",
     r"(?i)\bwrong\b",
     r"(?i)\bincorrect\b",
     r"(?i)\bnot (that|what|like that|right|the right)\b",
-    r"(?i)\bshould(n'?t| not| never)\b",
-    r"(?i)\bthat'?s not\b",
+    r"(?i)\bshould(n['’]?t| not| never)\b",
+    r"(?i)\bthat['’]?s not\b",
+    r"(?i)\bI meant\b",
+    r"(?i)\bnot what I\b",
+    r"(?i)\bundo\b",
+    r"(?i)\brevert\b",
+    r"(?i)\byou missed\b",
+    r"(?is)\b(still|wrong|same|broken|fail\w*|not)\b.*\bagain\b|\bagain\b.*\b(still|wrong|same|broken|fail\w*|not)\b",
+    r"(?is)^actually\b.*\b(no|not|don['’]?t|instead|should|meant|wrong|use|change)\b",
 ];
+
+/// Harness injections that arrive as user turns (or are quoted back in
+/// assistant turns). A message carrying one is never a correction,
+/// workaround or deferral (jilog#1xmf).
+const SYSTEM_MARKERS: &[&str] = &[
+    "[structured-output-enforce]",
+    "<system-reminder>",
+    "<command-name>",
+    "<local-command-stdout>",
+    "<task-notification>",
+];
+
+/// Bare confirmations, compared after trimming, lower-casing and stripping
+/// trailing `.`/`!`. Most sit below [`MIN_CORRECTION_LENGTH`] already; the
+/// list keeps them out if that floor ever moves.
+const BARE_CONFIRMATIONS: &[&str] = &[
+    "ok", "okay", "looks good", "yes", "yep", "do it", "go ahead", "sounds good", "thanks", "lgtm",
+];
+
+fn has_system_marker(text: &str) -> bool {
+    SYSTEM_MARKERS.iter().any(|m| text.contains(m))
+}
+
+fn is_bare_confirmation(text: &str) -> bool {
+    let norm = text.trim().trim_end_matches(['.', '!']).to_lowercase();
+    BARE_CONFIRMATIONS.contains(&norm.as_str())
+}
 
 // ---------------------------------------------------------------------------
 // Heuristic 1: Correction detection
 // ---------------------------------------------------------------------------
 
-/// Detect "correction" patterns: an assistant→user→assistant triple
-/// where the user message is short (15..=200 chars).
+/// Detect "correction" patterns: an assistant→user→assistant triple where
+/// the user message is short (15..=200 chars), carries corrective language
+/// ([`CORRECTION_PATTERNS`]), and is not a question, a bare confirmation or
+/// a harness injection.
 pub fn detect_corrections(messages: &[Message], session_id: &str) -> Vec<Correction> {
-    detect_corrections_impl(messages, session_id, false)
+    detect_corrections_impl(messages, session_id)
 }
 
-/// Chat-tuned variant of [`detect_corrections`] for fleet/chat sessions
-/// (transcript handles with a persona): same triple + length window, but the
-/// user message must also match a corrective-language pattern
-/// ([`CHAT_CORRECTION_PATTERNS`]).
+/// Alias of [`detect_corrections`], kept for callers written when chat
+/// sessions had their own tuned detector. Every session kind now uses the
+/// one detector (jilog#1xmf).
 pub fn detect_corrections_chat(messages: &[Message], session_id: &str) -> Vec<Correction> {
-    detect_corrections_impl(messages, session_id, true)
+    detect_corrections_impl(messages, session_id)
 }
 
-fn detect_corrections_impl(messages: &[Message], session_id: &str, chat: bool) -> Vec<Correction> {
+fn detect_corrections_impl(messages: &[Message], session_id: &str) -> Vec<Correction> {
     if messages.len() < 3 {
         return Vec::new();
     }
@@ -153,8 +194,15 @@ fn detect_corrections_impl(messages: &[Message], session_id: &str, chat: bool) -
         if content_str.trim().len() < MIN_CORRECTION_LENGTH {
             continue;
         }
+        if has_system_marker(&content_str) {
+            continue;
+        }
         // Trimmed so the `^`-anchored markers see the real first word.
-        if chat && !chat_correction_regex().is_match(content_str.trim()) {
+        let trimmed = content_str.trim();
+        if trimmed.ends_with('?') || is_bare_confirmation(trimmed) {
+            continue;
+        }
+        if !correction_regex().is_match(trimmed) {
             continue;
         }
 
@@ -167,11 +215,11 @@ fn detect_corrections_impl(messages: &[Message], session_id: &str, chat: bool) -
     out
 }
 
-/// Compile the chat corrective-marker regex set once.
-fn chat_correction_regex() -> &'static RegexSet {
+/// Compile the corrective-marker regex set once.
+fn correction_regex() -> &'static RegexSet {
     static SET: OnceLock<RegexSet> = OnceLock::new();
     SET.get_or_init(|| {
-        RegexSet::new(CHAT_CORRECTION_PATTERNS).expect("chat correction patterns must compile")
+        RegexSet::new(CORRECTION_PATTERNS).expect("correction patterns must compile")
     })
 }
 
@@ -512,6 +560,10 @@ pub fn detect_workarounds(messages: &[Message], session_id: &str) -> Vec<Workaro
         if text.is_empty() {
             continue;
         }
+        // An assistant turn quoting harness text is echoing it (jilog#1xmf).
+        if has_system_marker(&text) {
+            continue;
+        }
         let matches = regex.matches(&text);
         if !matches.matched_any() {
             continue;
@@ -581,6 +633,10 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
         }
         let text = extract_assistant_text(&msg.content);
         if text.is_empty() {
+            continue;
+        }
+        // An assistant turn quoting harness text is echoing it (jilog#1xmf).
+        if has_system_marker(&text) {
             continue;
         }
         let matches = regex.matches(&text);
@@ -682,10 +738,12 @@ mod tests {
 
     #[test]
     fn corrections_too_short_skipped() {
-        // 12 chars trimmed -- below MIN
+        // 13 chars trimmed -- below MIN, and corrective, so only the
+        // length floor can drop it.
+        assert_eq!("no, wrong one".len(), 13);
         let msgs = vec![
             assistant("first"),
-            user("just a short"),
+            user("  no, wrong one  "),
             assistant("second"),
         ];
         assert!(detect_corrections(&msgs, "s1").is_empty());
@@ -693,16 +751,22 @@ mod tests {
 
     #[test]
     fn corrections_too_long_skipped() {
-        let long = "x".repeat(201);
+        // Corrective text, so only the 200-character ceiling can drop it.
+        let long = format!("no, {}", "x".repeat(197));
+        assert_eq!(long.len(), 201);
         let msgs = vec![assistant("a"), user(&long), assistant("b")];
         assert!(detect_corrections(&msgs, "s1").is_empty());
+        let at_limit = format!("no, {}", "x".repeat(196));
+        let msgs = vec![assistant("a"), user(&at_limit), assistant("b")];
+        assert_eq!(detect_corrections(&msgs, "s1").len(), 1);
     }
 
     #[test]
     fn corrections_wrong_role_pattern_skipped() {
         let msgs = vec![
             user("first message in transcript"),
-            user("another short user message"),
+            // Corrective, so only the role pattern can drop it.
+            user("no, that is the wrong file"),
             assistant("reply"),
         ];
         assert!(detect_corrections(&msgs, "s1").is_empty());
@@ -712,9 +776,9 @@ mod tests {
     fn corrections_multiple_in_one_transcript() {
         let msgs = vec![
             assistant("a1"),
-            user("first correction please"),
+            user("no, that is the wrong file"),
             assistant("a2"),
-            user("second correction please"),
+            user("revert that last change please"),
             assistant("a3"),
         ];
         let out = detect_corrections(&msgs, "s1");
@@ -751,7 +815,8 @@ mod tests {
         // NOT be classified as corrections.
         let msgs = vec![
             assistant("ran it"),
-            tool_result_user("(Bash completed with no output)", false),
+            // Corrective text, so only the tool_result exclusion can drop it.
+            tool_result_user("no, that is the wrong file", false),
             assistant("next"),
         ];
         assert!(
@@ -767,7 +832,7 @@ mod tests {
         let msgs = vec![
             assistant("a"),
             tool_result_user(
-                "<tool_use_error>File has not been read yet. Read it first.</tool_use_error>",
+                "no, wrong file: File has not been read yet. Read it first.",
                 true,
             ),
             assistant("b"),
@@ -792,8 +857,10 @@ mod tests {
     #[test]
     fn corrections_digest_2026_06_24_fixture() {
         // Fixture drawn from the 2026-06-24 learning digest (jilog#21yg): a
-        // run of tool_result echoes interleaved with two genuine user turns.
-        // Only the two real user messages must classify as corrections.
+        // run of tool_result echoes interleaved with genuine user turns. The
+        // tool echoes never classify; since jilog#1xmf the two real user
+        // turns from that digest (a request and an approval) do not either,
+        // and the corrective one added here does.
         let msgs = vec![
             assistant("a0"),
             tool_result_user("--- icon def block ---\n39:  const I = {};", false),
@@ -809,29 +876,215 @@ mod tests {
             assistant("a4"),
             tool_result_user("=== reverted ===\n## main...origin/main", false),
             assistant("a5"),
-            tool_result_user("(Bash completed with no output)", false),
+            user("no, the edits went to the wrong slide"),
             assistant("a6"),
+            tool_result_user("(Bash completed with no output)", false),
+            assistant("a7"),
         ];
         let out = detect_corrections(&msgs, "agent-a446ccbb9e59d3bc4");
-        assert_eq!(out.len(), 2, "only the two real user turns are corrections");
-        assert_eq!(out[0].context, "read the deck and make sure the edits land");
-        assert_eq!(out[1].context, "yes - clean it up please");
+        assert_eq!(out.len(), 1, "only the corrective user turn is a correction");
+        assert_eq!(out[0].context, "no, the edits went to the wrong slide");
     }
 
-    // ---------- chat-tuned corrections ----------
+    #[test]
+    fn corrections_require_corrective_language_in_coding_sessions() {
+        // The issue's own examples (jilog#1xmf): requests, approvals and
+        // questions are not corrections in any session kind.
+        for text in [
+            "fix that cashflow thing",
+            "the mockups look good",
+            "anything else in this session?",
+            "update with new sources",
+            "give me an updated PDF to send over",
+        ] {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            assert!(detect_corrections(&msgs, "s1").is_empty(), "not a correction: {text}");
+        }
+    }
+
+    #[test]
+    fn corrections_drop_questions_confirmations_and_markers() {
+        for text in [
+            "no, did you mean the other repo?",
+            // Each marker case carries corrective language, so only the
+            // marker drop can exclude it.
+            "[structured-output-enforce] don't stop, wrong tool",
+            "<system-reminder>don't stop, the wrong file was read</system-reminder>",
+            "<task-notification>revert the wrong change</task-notification>",
+            "<command-name>/undo</command-name> that was wrong",
+            "<local-command-stdout>no, wrong branch</local-command-stdout>",
+        ] {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            assert!(detect_corrections(&msgs, "s1").is_empty(), "dropped: {text}");
+        }
+    }
+
+    #[test]
+    fn system_marker_helper() {
+        for m in SYSTEM_MARKERS {
+            assert!(has_system_marker(&format!("before {m} after")), "{m}");
+        }
+        assert!(!has_system_marker("<system> is not a harness marker"));
+    }
+
+    #[test]
+    fn bare_confirmation_helper() {
+        // Every entry is shorter than MIN_CORRECTION_LENGTH today, so the
+        // detector never reaches this drop; this helper test is its gate.
+        for c in BARE_CONFIRMATIONS {
+            assert!(is_bare_confirmation(c), "{c}");
+            assert!(is_bare_confirmation(&c.to_uppercase()), "{c} upper");
+            assert!(is_bare_confirmation(&format!("{c}.")), "{c}.");
+            assert!(is_bare_confirmation(&format!("{c}!!")), "{c}!!");
+        }
+        assert!(is_bare_confirmation("  looks good.  "));
+        assert!(!is_bare_confirmation("ok then do it differently"));
+    }
+
+    /// Measures the committed detector on a private corpus (jilog#1xmf):
+    /// `JILOG_CORRECTION_CORPUS=<file> cargo test -p jilog-review
+    /// corpus_measure_from_env -- --ignored --nocapture`, one user message
+    /// per line. The corpus is real message text and never committed.
+    #[test]
+    #[ignore]
+    fn corpus_measure_from_env() {
+        let Ok(path) = std::env::var("JILOG_CORRECTION_CORPUS") else {
+            eprintln!("JILOG_CORRECTION_CORPUS unset; nothing to measure");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("read corpus");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut kept = Vec::new();
+        for line in &lines {
+            let msgs = vec![assistant("a"), user(line), assistant("b")];
+            if !detect_corrections(&msgs, "corpus").is_empty() {
+                kept.push(*line);
+            }
+        }
+        println!("corpus: {} -> {}", lines.len(), kept.len());
+        for k in kept {
+            println!("  kept: {k}");
+        }
+    }
+
+    #[test]
+    fn corrections_new_markers_fire() {
+        for text in [
+            "I meant the staging config, not prod",
+            "that is not what I asked for here",
+            "undo the rename in the parser",
+            "revert the last commit please",
+            "you missed the second call site",
+            "it is still failing again on CI",
+            "still failing\nagain after the retry",
+            "actually,\nuse the other file instead",
+            "actually, use the other file instead",
+            "don't post the audio, just the link",
+            "fix the issue - don't make it public",
+            "rename it and don't touch the tests",
+            "don’t post the audio, just the link",
+            "that’s not the file I asked for",
+            "please don't touch the lockfile",
+            "ok. just don't push it yet",
+        ] {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            assert_eq!(detect_corrections(&msgs, "s1").len(), 1, "expected a correction: {text}");
+        }
+    }
+
+    #[test]
+    fn corrections_narrowed_markers_ignore_lookalikes() {
+        for text in [
+            "I don't think it completed yet",
+            "I just don't think it completed",
+            "check in again and suggest the next thing",
+            "thanks again for all your help",
+            "actually, that sounds great to me",
+            "send the auth link again to chrome",
+        ] {
+            let msgs = vec![assistant("a"), user(text), assistant("b")];
+            assert!(detect_corrections(&msgs, "s1").is_empty(), "not a correction: {text}");
+        }
+    }
+
+    #[test]
+    fn corrections_sample_fixture_exact_set() {
+        // Synthetic stand-in for the issue's sample of 30 open
+        // "[jilog/correction]" records (jilog#1xmf): requests, approvals,
+        // questions, addresses and harness fragments, none a correction, plus
+        // six genuine corrections, one per marker family. The detector must
+        // return exactly the six (recall) and nothing from the sample
+        // (precision; the issue allows two, this fixture allows none).
+        let sample = [
+            "fix that cashflow thing",
+            "the mockups look good",
+            "anything else in this session?",
+            "jane.doe@example.com",
+            "send it to finance@example.com",
+            "[structured-output-enforce] You MUST call the StructuredOutput tool to complete",
+            "<system-reminder>Context: the session is in plan mode</system-reminder>",
+            "update with new sources",
+            "dispatch the kata for the watcher",
+            "check in and tell me where we are",
+            "give me an updated PDF for the board",
+            "do a sweep of the news and tell me",
+            "make an English sheet with the key terms",
+            "I replied to the message already",
+            "we have a prep meeting this week",
+            "can you summarize the thread for me?",
+            "ok do the next round of stuff",
+            "retire it - is there a hole in the workflow?",
+            "great. do you have root on that box?",
+            "can you ask codex for its input?",
+            "I'm going to be afk for a while",
+            "look at my calendar for Sunday",
+            "post the draft to the channel",
+            "add the new speaker to the list",
+            "run the tests and push it",
+            "put it in the shared folder",
+            "keep going with the migration",
+            "write up the meeting notes",
+            "open a PR for the docs change",
+            "what is the status of the deploy?",
+        ];
+        let positives = [
+            "no, use the staging database",
+            "don't merge it until the review lands",
+            "that's not the file I asked for",
+            "revert the change to the parser",
+            "I meant the second paragraph",
+            "the build is still broken again",
+        ];
+        assert_eq!(sample.len(), 30);
+        let mut msgs = vec![assistant("start")];
+        for text in sample.iter().chain(positives.iter()) {
+            msgs.push(user(text));
+            msgs.push(assistant("reply"));
+        }
+        let got: Vec<String> = detect_corrections(&msgs, "s1")
+            .into_iter()
+            .map(|c| c.context)
+            .collect();
+        let want: Vec<String> = positives.iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
+        assert!(!got.iter().any(|c| c.contains("structured-output-enforce")));
+        assert!(!got.iter().any(|c| c.contains("<system-reminder>")));
+    }
+
+    // ---------- corrections through the detect_corrections_chat alias ----------
 
     #[test]
     fn chat_corrections_require_corrective_language() {
-        // Ordinary short group-chat replies must NOT count as corrections in
-        // chat sessions, even though they'd pass the coding length window.
+        // Ordinary short group-chat replies are not corrections; since
+        // jilog#1xmf the same holds for coding sessions, so the alias and
+        // the detector agree.
         let msgs = vec![
             assistant("Here is the summary you asked for."),
             user("thanks, that looks really great"),
             assistant("Happy to help."),
         ];
         assert!(detect_corrections_chat(&msgs, "s1").is_empty());
-        // The same window IS a correction under the coding heuristic.
-        assert_eq!(detect_corrections(&msgs, "s1").len(), 1);
+        assert!(detect_corrections(&msgs, "s1").is_empty());
     }
 
     #[test]
@@ -1207,6 +1460,15 @@ mod tests {
     }
 
     // ---------- workarounds ----------
+
+    #[test]
+    fn workarounds_and_deferrals_skip_system_markers() {
+        let msgs = vec![assistant(
+            "<system-reminder>a temporary workaround; I'll come back to this</system-reminder>",
+        )];
+        assert!(detect_workarounds(&msgs, "s1").is_empty());
+        assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
 
     #[test]
     fn workarounds_basic_for_now() {

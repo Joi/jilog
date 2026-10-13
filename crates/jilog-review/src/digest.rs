@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 
 use crate::detectors::MAX_ERROR_MESSAGE_LENGTH;
 use crate::detectors::{
-    detect_corrections, detect_corrections_chat, detect_deferrals, detect_errors,
+    detect_corrections, detect_deferrals, detect_errors,
     detect_p0_alerts, detect_workarounds,
 };
 use crate::error::JilogReviewError;
@@ -370,13 +370,9 @@ pub fn run_review(
                 continue;
             }
 
-            // Chat sessions (persona present) use the chat-tuned correction
-            // detector; coding sessions keep the original heuristic.
-            let mut corrections = if handle.persona.is_some() {
-                detect_corrections_chat(&messages, &handle.session_id)
-            } else {
-                detect_corrections(&messages, &handle.session_id)
-            };
+            // One correction detector for chat and coding sessions alike:
+            // corrective language is required everywhere (jilog#1xmf).
+            let mut corrections = detect_corrections(&messages, &handle.session_id);
             let mut errors = detect_errors(&messages, &handle.session_id);
             let mut workarounds = detect_workarounds(&messages, &handle.session_id);
             let mut deferrals = detect_deferrals(&messages, &handle.session_id);
@@ -1756,18 +1752,34 @@ mod tests {
     }
 
     #[test]
-    fn run_review_chat_sessions_use_chat_correction_detector() {
+    fn run_review_chat_and_coding_sessions_share_one_detector() {
+        // jilog#1xmf: a persona no longer selects a different detector. The
+        // same two turns — one polite, one corrective — classify the same
+        // in a chat session and a coding session.
         let dir = test_dir("chat-detector");
-        // Short polite reply: correction under the coding heuristic, NOT
-        // under the chat-tuned one.
-        let readers: Vec<Box<dyn Reader>> = vec![Box::new(FixtureReader {
+        let turns = |session: &str, persona: Option<&str>| -> Box<dyn Reader> {
+            let msg = |role: &str, text: &str| Message {
+                role: Some(role.to_string()),
+                content: Some(serde_json::Value::String(text.to_string())),
+                name: None,
+            };
+            Box::new(FixtureReader {
                 agent: None, machine: None, dedupe_key: None,
-            session_id: "sess-chat".into(),
-            messages: correction_messages("thanks, that looks really great"),
-            stats: None,
-            persona: Some("jibot".into()),
-            channel: Some("vibez".into()),
-        })];
+                session_id: session.into(),
+                messages: vec![
+                    msg("assistant", "a"),
+                    msg("user", "thanks, that looks really great"),
+                    msg("assistant", "b"),
+                    msg("user", "no, that went to the wrong group"),
+                    msg("assistant", "c"),
+                ],
+                stats: None,
+                persona: persona.map(String::from),
+                channel: persona.map(|_| "vibez".to_string()),
+            })
+        };
+        let readers: Vec<Box<dyn Reader>> =
+            vec![turns("sess-chat", Some("jibot")), turns("sess-code", None)];
         let args = ReviewArgs {
             since: Utc::now() - chrono::Duration::days(1),
             digest_dir: dir.clone(),
@@ -1778,9 +1790,18 @@ mod tests {
             archive_spend: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
-        assert!(
-            report.corrections.is_empty(),
-            "chat sessions must use the chat-tuned correction detector"
+        let mut got: Vec<(&str, &str)> = report
+            .corrections
+            .iter()
+            .map(|c| (c.session_id.as_str(), c.context.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("sess-chat", "no, that went to the wrong group"),
+                ("sess-code", "no, that went to the wrong group"),
+            ]
         );
         assert_eq!(report.personas["jibot@vibez"].sessions, 1);
         let _ = fs::remove_dir_all(&dir);
