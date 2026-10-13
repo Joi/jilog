@@ -373,7 +373,7 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
             .as_ref()
             .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
             .unwrap_or(serde_json::Value::Null),
-        // Window total: signals first counted by a run dated on or after
+        // Window total: counted signals the ledger first saw on a run dated on or after
         // the window start, plus this run's new ones (jilog#1xmf).
         "in_window": report
             .in_window
@@ -505,6 +505,15 @@ mod tests {
             serde_json::json!({"corrections": 5, "errors": 4, "workarounds": 3, "deferrals": 2, "patterns": 1})
         );
         assert_eq!(digest_report_json(&digest_report(), false)["detected"], serde_json::Value::Null);
+        report.in_window = Some(jilog_review::signal_ledger::KindCounts {
+            corrections: 9,
+            errors: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            digest_report_json(&report, false)["in_window"],
+            serde_json::json!({"corrections": 9, "errors": 1, "workarounds": 0, "deferrals": 0, "patterns": 0})
+        );
     }
 
     #[test]

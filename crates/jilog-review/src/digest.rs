@@ -76,7 +76,7 @@ pub struct DigestReport {
     /// signal ledger (no processed file); then the lists above are
     /// everything detected.
     pub detected: Option<KindCounts>,
-    /// The window total: signals first counted by a run dated on or after
+    /// The window total: counted signals the ledger first saw on a run dated on or after
     /// the window start, plus this run's new ones (jilog#1xmf). `None`
     /// without a ledger.
     pub in_window: Option<KindCounts>,
@@ -591,7 +591,7 @@ pub fn run_review(
             patterns: all_patterns.len(),
         };
         // The window starts at the caller's `since` (not the widened
-        // discovery start): signals first counted by a run dated in it.
+        // discovery start): counted signals the ledger first saw on a run dated in it.
         ledger_counts = Some(LedgerCounts::new(led, args.since.date_naive(), detected, &new));
     }
     let spend = if spend.sessions_with_stats > 0 { Some(spend) } else { None };

@@ -217,8 +217,8 @@ impl SignalLedger {
         self.entries.get(id).is_some_and(|(_, f)| f.filed)
     }
 
-    /// Per-kind counts of signals first counted on a run dated `from` or
-    /// later — the window total, together with this run's new signals
+    /// Per-kind counts of counted signals the ledger first saw (filed or
+    /// counted, whichever came first) on a run dated `from` or later — the window total, together with this run's new signals
     /// (jilog#1xmf). The kind is the identity's prefix.
     pub fn counted_since(&self, from: NaiveDate) -> KindCounts {
         let mut out = KindCounts::default();
@@ -318,7 +318,7 @@ pub struct LedgerCounts {
     /// Everything detected among the sessions this run scanned, new or
     /// already counted.
     pub detected: KindCounts,
-    /// Every signal first counted on a run dated within the window, plus
+    /// Every counted signal the ledger first saw on a run dated within the window, plus
     /// this run's new signals: the window total, including sessions an
     /// earlier run already processed and this run skipped.
     pub in_window: KindCounts,
