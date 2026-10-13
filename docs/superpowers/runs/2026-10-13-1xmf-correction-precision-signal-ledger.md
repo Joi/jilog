@@ -1,6 +1,6 @@
 # Run: 1xmf-correction-precision-signal-ledger
 Instruction: Run `kata show jilog#1xmf` and work the issue in this worktree, following the dispatch rules (/do-it, starting rung floored at medium; not repoman-managed — no .repoman-managed marker; close with evidence; decide-and-notify).
-Stage: committing
+Stage: done
 Rung: heavy (start-floor heavy: hard-trigger — live prod config (joimba ~/.jilog.toml) + digest header meaning read by consumers outside the repo; BR2 REV1 NOV1 INT2 FC1 = 7; Lens: none). Floored-at-heavy-by-hard-trigger: yes
 Spec: docs/superpowers/specs/2026-10-13-1xmf-correction-precision-signal-ledger-design.md   Plan: docs/superpowers/plans/2026-10-13-1xmf-correction-precision-signal-ledger.md
 Agency project: — (no mcp__agency__* tools in this session; executed directly, see Notes)
@@ -35,6 +35,9 @@ code:B: passes: 4 · elapsed: ~60 min · STOP-VELOCITY · committed tree = 71686
 Pass 1 [code:C]: 0B/1S/6C/0R · fixed -/- · velocity = (—→7)   (Stage 1 subagent PASS, 6 cosmetic → 4 fixed (fed-by wording, claude-code comment, README "unchanged"/"and so on"), 2 left (Quick Start --create-issues example still valid usage; architecture excerpt partial by design); roborev job 1539 by codex: window total missing — second time codex raised it (also job 1536) → REVERSED the rebuttal and implemented *_in_window from the ledger's first-seen dates, commit "Add window totals")
 code:C: one pass under the new One Review rule; the whole-branch independent review follows
 Whole-branch review [origin/main...95a4070]: 0B/0S/2 minor/1 nit · fresheyes gpt-5.6-sol/high run 20261013-113609-b5735d · PASSED. Minors ("first counted" wording vs first-seen date; README "once per new signal" vs unfiled) and the nit (no populated in_window JSON assertion) fixed in one doc/comment/test-only commit after the reviewed sha 95a4070 — no behaviour change, so no delta pass is owed.
+Landed: origin/main 8b45b8b → f5b41b8 (fast-forward of 7bf3643, 4d6db7b, a2b54ca, 95a4070, f5b41b8).
+Post-push: explicit roborev codex review job 1544 (8b45b8b..f5b41b8): FAIL — (1) window total compared the UTC date of `since` with local run dates (also patrol job 1541 by claude-code) → FIXED in 27dc2be (session modified time in the ledger; nightly-pair test), pushed; (2) a creates-disabled run marks sessions processed so a later create-enabled run never offers their c-only signals → REBUTTED as pre-existing (same in 0.8.x), README claim narrowed. Bounded codex review of the fix, job 1546: (1) three-field legacy ledger lines excluded from windows → REBUTTED (no 0.9.0 ledger exists on the fleet: macazbd, joimba, azbd2 all run 0.8.1, no .signals files); (2) whole-second serialization drops sub-second boundary → FIXED in the final commit (AutoSi + test). Patrol jobs 1535 and 1542 (Pass, lows) → follow-ups jilog#b4jn and jilog#k3ef.
+Follow-ups filed: jilog#b4jn (detector polish), jilog#bexf (kata fuzzy-title conflict loop), jilog#v9ah (filtered Claude Code errors detector), jilog#k3ef (config check path + exit status).
 
 ## Chunks
 - [x] A — detector precision (item 1) — 3 code passes, STOP-CLASS; committed (item 4's diagnosis is documented in chunk C)

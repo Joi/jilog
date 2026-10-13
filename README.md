@@ -289,7 +289,7 @@ The processed-sessions file keeps a clean session from being scanned twice, but 
 `review nightly` keeps a signal ledger beside the processed file, `<processed-file>.signals`, one line per signal: `<first-seen date>\t<c|f|cf>\t<session modified>\t<kind>:<session id>:<hash>`. The hash is FNV-1a over the signal's own fields (a correction's text, an error's tool and message, …), so a signal keeps its identity when its session grows; the session id is part of it. Two flags, independent:
 
 - `c` (counted): a written digest has rendered it. A signal without `c` is **new**: it is listed and counted in the next digest written, then gains `c`.
-- `f` (filed): the tracker accepted it. Whenever creates are attempted, every signal without `f` is offered — new or not — so a failed create retries the next night without being counted again.
+- `f` (filed): the tracker accepted it. Whenever creates are attempted, every signal without `f` in the sessions that run scans is offered — new or not — so a failed create (whose session stays in `.retry`) retries the next night without being counted again. A run without `--create-issues` still marks its sessions processed, as before 0.9, so turning creates on later does not go back to them.
 
 A session whose new signals no written digest has rendered yet (a same-date rerun that preserved the earlier digest, or a failed digest write) goes into a second sidecar, `<processed-file>.render`, which widens discovery like `.retry`; the next digest written renders those signals once. Entries older than 90 days leave the ledger. A dry run reads the ledger but writes nothing; a run without a processed file keeps no ledger and behaves as before.
 

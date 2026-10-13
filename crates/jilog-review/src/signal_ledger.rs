@@ -298,7 +298,7 @@ impl SignalLedger {
             .map(|(id, e)| {
                 let m = e
                     .session_modified
-                    .map(|m| m.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .map(|m| m.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
                     .unwrap_or_else(|| "-".to_string());
                 format!("{}\t{}\t{}\t{}", e.date.format("%Y-%m-%d"), e.flags.as_str(), m, id)
             })
@@ -557,6 +557,22 @@ mod tests {
         let lc = LedgerCounts::new(&l, since, KindCounts::default(), &new);
         assert_eq!(lc.in_window.corrections, 4);
         assert_eq!(lc.in_window.total(), 5);
+    }
+
+    #[test]
+    fn session_time_keeps_subseconds_across_a_save() {
+        // roborev 1546: a session modified a fraction of a second after the
+        // cutoff must stay in the window after the ledger is saved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.signals");
+        let since = t("2026-10-12T10:00:00Z");
+        let modified = since + chrono::Duration::milliseconds(250);
+        let mut l = SignalLedger::empty();
+        l.mark_counted("correction:s1:aaaa", d("2026-10-12"), Some(modified));
+        l.save(&path, d("2026-10-13")).unwrap();
+        let back = SignalLedger::load(&path).unwrap();
+        assert_eq!(back.counted_in_window(since).corrections, 1);
+        assert_eq!(back.entries["correction:s1:aaaa"].session_modified, Some(modified));
     }
 
     #[test]
