@@ -136,11 +136,10 @@ fn has_system_marker(text: &str) -> bool {
     SYSTEM_MARKERS.iter().any(|m| text.contains(m))
 }
 
-/// The verdict line a fresheyes review ends with (the marker
-/// fresheyes-verdict.py reads): a whole line, flush left, plain, bold or a
-/// heading. An inline quotation of the verdict does not count.
-const REVIEW_VERDICT_PATTERN: &str =
-    r"(?m)^(?:\*\*|#+ )?INDEPENDENT CODE REVIEW (?:PASSED|FAILED)(?:\*\*)?[ \t]*\r?$";
+/// The verdict line a fresheyes review ends with: a whole line, flush left,
+/// plain, emphasised, a heading or both. VERDICT_RE in fresheyes-verdict.py,
+/// less its `\b`, which rejects a trailing `__`. An inline quotation does not count.
+const REVIEW_VERDICT_PATTERN: &str = r"(?im)^(?:#{1,6}[ \t]+)?(?:\*\*|__)?INDEPENDENT CODE REVIEW[ \t]+(?:PASSED|FAILED)[ \t]*(?:\*\*|__)?[ \t]*\r?$";
 
 /// True for an assistant message that is an independent code review: it
 /// opens with the "## Files Examined" manifest the fresheyes prompt asks
@@ -1506,6 +1505,21 @@ mod tests {
         )];
         assert!(detect_workarounds(&msgs, "s1").is_empty());
         assert!(detect_deferrals(&msgs, "s1").is_empty());
+
+        // Every verdict form fresheyes-verdict.py accepts, with no manifest.
+        for verdict in [
+            "INDEPENDENT CODE REVIEW PASSED",
+            "## **INDEPENDENT CODE REVIEW FAILED**",
+            "__INDEPENDENT CODE REVIEW FAILED__",
+            "### Independent Code Review Passed",
+        ] {
+            let text = format!(
+                "Summary first.\n\nThe patch keeps a hardcoded path; defer this to the next session.\n\n{verdict}\n"
+            );
+            let msgs = vec![assistant(&text)];
+            assert!(detect_workarounds(&msgs, "s1").is_empty(), "{verdict}");
+            assert!(detect_deferrals(&msgs, "s1").is_empty(), "{verdict}");
+        }
     }
 
     #[test]
