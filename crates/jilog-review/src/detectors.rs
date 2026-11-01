@@ -137,8 +137,10 @@ fn has_system_marker(text: &str) -> bool {
 }
 
 /// The verdict line a fresheyes review ends with (the marker
-/// fresheyes-verdict.py reads), bold or plain.
-const REVIEW_VERDICT_PATTERN: &str = r"INDEPENDENT CODE REVIEW (PASSED|FAILED)";
+/// fresheyes-verdict.py reads): a whole line, flush left, plain, bold or a
+/// heading. An inline quotation of the verdict does not count.
+const REVIEW_VERDICT_PATTERN: &str =
+    r"(?m)^(?:\*\*|#+ )?INDEPENDENT CODE REVIEW (?:PASSED|FAILED)(?:\*\*)?[ \t]*\r?$";
 
 /// True for an assistant message that is an independent code review: it
 /// opens with the "## Files Examined" manifest the fresheyes prompt asks
@@ -1491,7 +1493,7 @@ mod tests {
 
     /// Context of jibot-code#prq0's evidence signal t7v5, copied as filed,
     /// with the review body that followed it.
-    const FILES_EXAMINED_REVIEW: &str = "## Files Examined\n\nAll repository files were examined at commit `4ac55d3f768bc968dd2e14f7dcb8678cc3af2486`.\n\n- `docs/superpowers/plans/2026-09-23-r0v5-herdr-labeller.md`\n\n## Issues Found\n\nThe plan writes a temporary file and leaves it for now.\n";
+    const FILES_EXAMINED_REVIEW: &str = "## Files Examined\n\nAll repository files were examined at commit `4ac55d3f768bc968dd2e14f7dcb8678cc3af2486`.\n\n- `docs/superpowers/plans/2026-09-23-r0v5-herdr-labeller.md`\n\n## Issues Found\n\nThe plan writes a temporary file, leaving it for now.\n";
 
     #[test]
     fn workarounds_and_deferrals_skip_review_reports() {
@@ -1504,6 +1506,15 @@ mod tests {
         )];
         assert!(detect_workarounds(&msgs, "s1").is_empty());
         assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn signals_still_fire_when_the_verdict_is_quoted_inline() {
+        let msgs = vec![assistant(
+            "The reviewer reported \"INDEPENDENT CODE REVIEW FAILED\". I hardcoded the path for now; defer this to the next session.",
+        )];
+        assert_eq!(detect_workarounds(&msgs, "s1").len(), 1);
+        assert_eq!(detect_deferrals(&msgs, "s1").len(), 1);
     }
 
     #[test]
