@@ -31,6 +31,7 @@ fn json_stdout_parses_with_an_unreadable_register() {
             dir.path().join("processed.txt").to_str().unwrap(),
         ])
         .env("HOME", dir.path())
+        .env("RUST_LOG", "warn")
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
