@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 
 use crate::reader::Message;
 use crate::signal::{Correction, DeferralSignal, ErrorSignal, Workaround};
@@ -28,15 +28,17 @@ const MAX_CORRECTION_LENGTH: usize = 200;
 pub(crate) const MAX_ERROR_MESSAGE_LENGTH: usize = 500;
 
 /// Workaround pattern regexes — at most ONE workaround per message; first-match wins.
+/// Whole words only, so "hackathon" and "TODOs.md" do not match
+/// (jibot-code#prq0).
 const WORKAROUND_PATTERNS: &[&str] = &[
-    r"(?i)for now",
-    r"(?i)temporary",
-    r"(?i)workaround",
-    r"(?i)hardcoded",
-    r"(?i)TODO",
-    r"(?i)FIXME",
-    r"(?i)quick fix",
-    r"(?i)hack",
+    r"(?i)\bfor now\b",
+    r"(?i)\btemporary\b",
+    r"(?i)\bworkarounds?\b",
+    r"(?i)\bhard-?coded\b",
+    r"(?i)\bTODO\b",
+    r"(?i)\bFIXME\b",
+    r"(?i)\bquick fix\b",
+    r"(?i)\bhack(s|y|ed|ing)?\b",
 ];
 
 /// Human-readable labels (parallel to WORKAROUND_PATTERNS by index).
@@ -132,6 +134,21 @@ const BARE_CONFIRMATIONS: &[&str] = &[
 
 fn has_system_marker(text: &str) -> bool {
     SYSTEM_MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// The verdict line a fresheyes review ends with (the marker
+/// fresheyes-verdict.py reads), bold or plain.
+const REVIEW_VERDICT_PATTERN: &str = r"INDEPENDENT CODE REVIEW (PASSED|FAILED)";
+
+/// True for an assistant message that is an independent code review: it
+/// opens with the "## Files Examined" manifest the fresheyes prompt asks
+/// for, or carries the review verdict line. A reviewer describing someone
+/// else's temporary files or TODOs is not the agent taking a shortcut, and
+/// every such signal was closed as noise (jibot-code#prq0).
+fn is_review_report(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(REVIEW_VERDICT_PATTERN).expect("verdict pattern must compile"));
+    text.trim_start().starts_with("## Files Examined") || re.is_match(text)
 }
 
 fn is_bare_confirmation(text: &str) -> bool {
@@ -560,8 +577,9 @@ pub fn detect_workarounds(messages: &[Message], session_id: &str) -> Vec<Workaro
         if text.is_empty() {
             continue;
         }
-        // An assistant turn quoting harness text is echoing it (jilog#1xmf).
-        if has_system_marker(&text) {
+        // An assistant turn quoting harness text is echoing it (jilog#1xmf);
+        // a code review reports on another agent's work (jibot-code#prq0).
+        if has_system_marker(&text) || is_review_report(&text) {
             continue;
         }
         let matches = regex.matches(&text);
@@ -635,8 +653,9 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
         if text.is_empty() {
             continue;
         }
-        // An assistant turn quoting harness text is echoing it (jilog#1xmf).
-        if has_system_marker(&text) {
+        // An assistant turn quoting harness text is echoing it (jilog#1xmf);
+        // a code review reports on another agent's work (jibot-code#prq0).
+        if has_system_marker(&text) || is_review_report(&text) {
             continue;
         }
         let matches = regex.matches(&text);
@@ -1468,6 +1487,53 @@ mod tests {
         )];
         assert!(detect_workarounds(&msgs, "s1").is_empty());
         assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
+
+    /// Context of jibot-code#prq0's evidence signal t7v5, copied as filed,
+    /// with the review body that followed it.
+    const FILES_EXAMINED_REVIEW: &str = "## Files Examined\n\nAll repository files were examined at commit `4ac55d3f768bc968dd2e14f7dcb8678cc3af2486`.\n\n- `docs/superpowers/plans/2026-09-23-r0v5-herdr-labeller.md`\n\n## Issues Found\n\nThe plan writes a temporary file and leaves it for now.\n";
+
+    #[test]
+    fn workarounds_and_deferrals_skip_review_reports() {
+        let msgs = vec![assistant(FILES_EXAMINED_REVIEW)];
+        assert!(detect_workarounds(&msgs, "s1").is_empty());
+        assert!(detect_deferrals(&msgs, "s1").is_empty());
+
+        let msgs = vec![assistant(
+            "The patch keeps a hardcoded path; defer this to the next session.\n\n**INDEPENDENT CODE REVIEW FAILED**\n",
+        )];
+        assert!(detect_workarounds(&msgs, "s1").is_empty());
+        assert!(detect_deferrals(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn workarounds_still_fire_when_files_examined_is_quoted_mid_message() {
+        let msgs = vec![assistant(
+            "I hardcoded the path for now. The reviewer's ## Files Examined section listed it.",
+        )];
+        let out = detect_workarounds(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pattern, "for now");
+    }
+
+    #[test]
+    fn workarounds_match_whole_words_only() {
+        for text in [
+            "Notes from the hackathon.",
+            "Updated TODOs.md with the list.",
+            "The temporaryDir helper exists.",
+        ] {
+            assert!(detect_workarounds(&[assistant(text)], "s1").is_empty(), "{text}");
+        }
+        for (text, label) in [
+            ("A hacky shim.", "hack"),
+            ("Two workarounds remain.", "workaround"),
+            ("A hard-coded port.", "hardcoded"),
+        ] {
+            let out = detect_workarounds(&[assistant(text)], "s1");
+            assert_eq!(out.len(), 1, "{text}");
+            assert_eq!(out[0].pattern, label);
+        }
     }
 
     #[test]
