@@ -47,6 +47,10 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        // Logs go to stderr: stdout carries `--json` documents and command
+        // output, and a warning ahead of the JSON would break its parser
+        // (jibot-code#x9k9 review).
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

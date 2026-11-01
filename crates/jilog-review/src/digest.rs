@@ -826,6 +826,19 @@ pub fn run_review(
         }
     }
 
+    // A preserved same-date digest still gets this run's register check:
+    // its register lines are replaced in place, the session findings kept
+    // (jibot-code#x9k9 review).
+    if !should_write && !args.dry_run && digest_path.exists() {
+        if let Some(w) = &args.workaround_check {
+            let existing = std::fs::read_to_string(&digest_path)?;
+            let refreshed = refresh_workaround_block(&existing, w);
+            if refreshed != existing {
+                crate::reader::write_atomic(&digest_path, &refreshed)?;
+            }
+        }
+    }
+
     // Persist processed-sessions (jilog#1dvk): the retry sidecar above
     // already recorded pending failures durably; here the failed and
     // still-pending scanned sessions are unmarked so the next
@@ -869,11 +882,10 @@ pub fn run_review(
         } else {
             None
         },
-        workaround_check: if should_write || args.dry_run {
-            args.workaround_check.clone()
-        } else {
-            None
-        },
+        // The register check does not depend on which sessions were
+        // scanned: a preserved digest has its register lines refreshed
+        // above, so the check is always echoed.
+        workaround_check: args.workaround_check.clone(),
         personas,
         digest_path,
         created_issues,
@@ -1228,6 +1240,79 @@ fn render_workaround_alerts(buf: &mut String, w: &crate::workaround_register::Wo
             sanitize_display(&p.message),
         ));
     }
+}
+
+const WORKAROUND_FRONTMATTER: [&str; 3] = [
+    "workarounds_standing: ",
+    "workarounds_expired: ",
+    "workaround_register_problems: ",
+];
+const WORKAROUND_CANDIDATE: &str = "- **P0 CANDIDATE**: workaround ";
+const NO_P0: &str = "_No P0 alerts._";
+
+/// Replace the workaround-register lines of an already-written digest with
+/// `w`'s, keeping every other line: the frontmatter counts, the P0
+/// CANDIDATE lines (tool alerts stay first) and `p0_count`, which keeps the
+/// tool alerts it had. A digest without a frontmatter or a P0 Alerts
+/// section is returned unchanged.
+fn refresh_workaround_block(existing: &str, w: &crate::workaround_register::WorkaroundCheck) -> String {
+    let Some(rest) = existing.strip_prefix("---\n") else {
+        return existing.to_string();
+    };
+    let Some(fm_end) = rest.find("\n---\n") else {
+        return existing.to_string();
+    };
+    let (front, body) = (&rest[..fm_end + 1], &rest[fm_end + 1..]);
+    let Some(p0_start) = body.find("## P0 Alerts\n") else {
+        return existing.to_string();
+    };
+    let section_start = p0_start + "## P0 Alerts\n".len();
+    let section_end = body[section_start..]
+        .find("\n## ")
+        .map(|i| section_start + i + 1)
+        .unwrap_or(body.len());
+    let section = &body[section_start..section_end];
+    let tool_lines: Vec<&str> = section
+        .lines()
+        .filter(|l| l.starts_with("- ") && !l.starts_with(WORKAROUND_CANDIDATE))
+        .collect();
+
+    let mut new_front = String::new();
+    for line in front.lines() {
+        if WORKAROUND_FRONTMATTER.iter().any(|k| line.starts_with(k)) {
+            continue;
+        }
+        if line.starts_with("p0_count: ") {
+            new_front.push_str(&format!("p0_count: {}\n", tool_lines.len() + w.alert_count()));
+        } else {
+            new_front.push_str(line);
+            new_front.push('\n');
+        }
+    }
+    new_front.push_str(&format!("{}{}\n", WORKAROUND_FRONTMATTER[0], w.standing));
+    new_front.push_str(&format!("{}{}\n", WORKAROUND_FRONTMATTER[1], w.expired.len()));
+    new_front.push_str(&format!("{}{}\n", WORKAROUND_FRONTMATTER[2], w.problems.len()));
+
+    let mut new_section = String::from("\n");
+    if tool_lines.is_empty() && w.alert_count() == 0 {
+        new_section.push_str(NO_P0);
+        new_section.push_str("\n\n");
+    } else {
+        for l in &tool_lines {
+            new_section.push_str(l);
+            new_section.push('\n');
+        }
+        render_workaround_alerts(&mut new_section, w);
+        new_section.push('\n');
+    }
+
+    format!(
+        "---\n{}{}{}{}",
+        new_front,
+        &body[..section_start],
+        new_section,
+        &body[section_end..]
+    )
 }
 
 fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
@@ -1621,6 +1706,68 @@ mod tests {
         let report = run_review(&[], &crate::trackers::none::NoneTracker, &args).unwrap();
         assert_eq!(report.workaround_check, Some(check));
         let body = fs::read_to_string(&report.digest_path).unwrap();
+        assert!(body.contains("P0 CANDIDATE**: workaround `jibot-code#3x7y`"), "{body}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_matches_a_fresh_render() {
+        // Refreshing a digest rendered with one check (or none) must give
+        // the bytes a fresh render with the new check gives.
+        use crate::workaround_register::WorkaroundCheck;
+        let mut tools = HashMap::new();
+        tools.insert("bash".to_string(), BTreeSet::from(["s1".to_string()]));
+        let corrections = vec![Correction { session_id: "a".into(), context: "fix it".into(), ..Default::default() }];
+        let clean = WorkaroundCheck { registers: 1, standing: 4, ..Default::default() };
+        let render = |p0: &HashMap<String, BTreeSet<String>>, w: Option<&WorkaroundCheck>| {
+            render_digest_full(
+                "2026-11-01", &corrections, &[], &[], &[], &[], p0, None, None, &HashMap::new(),
+                &no_issues(), &BTreeMap::new(), None, w,
+            )
+        };
+        let empty = HashMap::new();
+        for p0 in [&empty, &tools] {
+            for before in [None, Some(&clean), Some(&expired_check())] {
+                for after in [&clean, &expired_check()] {
+                    let old = render(p0, before);
+                    assert_eq!(refresh_workaround_block(&old, after), render(p0, Some(after)), "{old}");
+                }
+            }
+        }
+        assert_eq!(refresh_workaround_block("no frontmatter", &clean), "no frontmatter");
+    }
+
+    #[test]
+    fn preserved_digest_gets_the_new_register_check() {
+        // A same-date rerun with nothing new keeps the digest's findings but
+        // must show this run's register check (jibot-code#x9k9 review).
+        let dir = test_dir("workaround-preserve");
+        let date = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let path = crate::util::digest_file_path(&dir, "2026-11-01");
+        let mut tools = HashMap::new();
+        tools.insert("bash".to_string(), BTreeSet::from(["s1".to_string()]));
+        let earlier = render_digest_full(
+            "2026-11-01", &[], &[], &[], &[], &[], &tools, None, None, &HashMap::new(),
+            &no_issues(), &BTreeMap::new(), None, None,
+        );
+        fs::write(&path, &earlier).unwrap();
+        let check = expired_check();
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date,
+            dry_run: false,
+            create_issues: false,
+            archive_spend: None,
+            workaround_check: Some(check.clone()),
+        };
+        let report = run_review(&[], &crate::trackers::none::NoneTracker, &args).unwrap();
+        assert_eq!(report.sessions_scanned, 0);
+        assert_eq!(report.workaround_check, Some(check));
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("p0_count: 3\n"), "{body}");
+        assert!(body.contains("**P0 ALERT**: `bash`"), "tool alert kept: {body}");
         assert!(body.contains("P0 CANDIDATE**: workaround `jibot-code#3x7y`"), "{body}");
         let _ = fs::remove_dir_all(&dir);
     }
