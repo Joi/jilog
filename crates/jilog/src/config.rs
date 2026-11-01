@@ -31,6 +31,13 @@ pub struct JilogConfig {
     /// `TZ` then the system zone apply (see `jilog_review::zone`).
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Environment-workaround registers (markdown files with a
+    /// `## Standing` table, the format of jibot-code's
+    /// `docs/operations/environment-workarounds.md`). The nightly digest
+    /// lists each row past its Expires date, and each register it cannot
+    /// read or parse, under P0 Alerts (jibot-code#x9k9). `~` is expanded.
+    #[serde(default)]
+    pub workaround_registers: Vec<String>,
 }
 
 /// A configured reader.

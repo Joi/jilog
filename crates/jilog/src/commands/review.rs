@@ -125,6 +125,10 @@ fn run_nightly_at(
         .agentsview_settings()
         .and_then(|s| load_archive_spend(&s, date, zone.name()));
 
+    // Workaround registers: checked against the digest date. A register
+    // that cannot be read is reported in the digest, never fatal.
+    let workaround_check = workaround_check(cfg, date);
+
     let review_args = LibReviewArgs {
         since,
         digest_dir: digest_dir.clone(),
@@ -133,6 +137,7 @@ fn run_nightly_at(
         dry_run: args.dry_run,
         create_issues: args.create_issues,
         archive_spend,
+        workaround_check,
     };
 
     let report = jilog_review::run_review(readers.as_slice(), tracker.as_ref(), &review_args)
@@ -173,6 +178,10 @@ fn run_nightly_at(
             println!("Digest: {}", report.digest_path.display());
         }
 
+        if let Some(w) = &report.workaround_check {
+            println!("{}", workaround_line(w));
+        }
+
         if !report.created_issues.is_empty() {
             println!("Created {} issue(s)", report.created_issues.len());
         }
@@ -186,6 +195,24 @@ fn run_nightly_at(
     }
 
     Ok(())
+}
+
+/// The configured workaround registers checked against `date`, or None
+/// when none is configured (the digest then keeps its earlier shape).
+pub fn workaround_check(
+    cfg: &JilogConfig,
+    date: NaiveDate,
+) -> Option<jilog_review::workaround_register::WorkaroundCheck> {
+    if cfg.workaround_registers.is_empty() {
+        return None;
+    }
+    let paths: Vec<std::path::PathBuf> =
+        cfg.workaround_registers.iter().map(|p| expand_tilde(p)).collect();
+    let check = jilog_review::workaround_register::check_registers(&paths, date);
+    for p in &check.problems {
+        tracing::warn!("workaround register {} not checked: {}", p.register.display(), p.message);
+    }
+    Some(check)
 }
 
 /// The digest's archive Spend block, or None. Advisory by contract: the
@@ -274,13 +301,27 @@ fn summary_line(report: &DigestReport) -> String {
         report.workarounds.len(),
         report.deferrals.len(),
         report.patterns.len(),
-        report.p0_alerts.len(),
+        // The digest's p0_count: tool alerts plus workaround-register lines.
+        report.p0_alerts.len() + report.workaround_check.as_ref().map_or(0, |w| w.alert_count()),
         report.sessions_scanned,
     );
     match (&report.detected, &report.in_window) {
         (Some(d), Some(w)) => line.push_str(&format!(" ({} detected, {} in window)", d.total(), w.total())),
         (Some(d), None) => line.push_str(&format!(" ({} detected)", d.total())),
         _ => {}
+    }
+    line
+}
+
+fn workaround_line(w: &jilog_review::workaround_register::WorkaroundCheck) -> String {
+    let mut line = format!(
+        "Workarounds: {} standing, {} expired across {} register(s)",
+        w.standing,
+        w.expired.len(),
+        w.registers
+    );
+    if !w.problems.is_empty() {
+        line.push_str(&format!(", {} not checked", w.problems.len()));
     }
     line
 }
@@ -406,6 +447,28 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
             "timezone": a.timezone,
         });
     }
+
+    // Workaround registers (jibot-code#x9k9): present only when configured,
+    // for the same reason as archive_spend.
+    if let Some(w) = &report.workaround_check {
+        value["workaround_registers"] = serde_json::json!({
+            "registers": w.registers,
+            "standing": w.standing,
+            "expired": w.expired.iter().map(|e| serde_json::json!({
+                "tracking": e.row.tracking,
+                "workaround": e.row.workaround,
+                "hosts": e.row.hosts,
+                "owner": e.row.owner,
+                "added": e.row.added.to_string(),
+                "expires": e.row.expires.to_string(),
+                "register": e.register.display().to_string(),
+            })).collect::<Vec<_>>(),
+            "problems": w.problems.iter().map(|p| serde_json::json!({
+                "register": p.register.display().to_string(),
+                "message": p.message,
+            })).collect::<Vec<_>>(),
+        });
+    }
     value
 }
 
@@ -459,6 +522,7 @@ mod tests {
             p0_alerts,
             spend: None,
             archive_spend: None,
+            workaround_check: None,
             personas: std::collections::BTreeMap::from([(
                 "jibot@The vibez".to_string(),
                 jilog_review::PersonaCounts {
@@ -730,6 +794,54 @@ mod tests {
         // And the JSON document for a report without the block has no key.
         let value = digest_report_json(&digest_report(), false);
         assert!(value.get("archive_spend").is_none());
+    }
+
+    #[test]
+    fn workaround_registers_reach_the_report_only_when_configured() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let none = JilogConfig::from_toml_str("").unwrap();
+        assert!(workaround_check(&none, date).is_none());
+
+        let dir = std::env::temp_dir().join(format!("jilog-x9k9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = dir.join("register.md");
+        std::fs::write(
+            &reg,
+            "## Standing\n\n| Workaround | Hosts | Tracking | Owner | Added | Expires |\n|---|---|---|---|---|---|\n\
+             | old | h | jibot-code#3x7y | o | 2026-10-01 | 2026-10-31 |\n\
+             | new | h | jibot-code#5db9 | o | 2026-10-27 | 2026-11-26 |\n",
+        )
+        .unwrap();
+        let cfg = JilogConfig::from_toml_str(&format!(
+            "workaround_registers = [{:?}, \"/nonexistent/jilog/x9k9.md\"]\n",
+            reg.display().to_string()
+        ))
+        .unwrap();
+        let check = workaround_check(&cfg, date).expect("configured");
+        assert_eq!((check.registers, check.standing, check.expired.len(), check.problems.len()), (2, 2, 1, 1));
+        let mut with_check = digest_report();
+        let tool_alerts = with_check.p0_alerts.len();
+        with_check.workaround_check = Some(check.clone());
+        assert!(
+            summary_line(&with_check).contains(&format!("{} P0 alert(s)", tool_alerts + 2)),
+            "{}",
+            summary_line(&with_check)
+        );
+        assert_eq!(
+            workaround_line(&check),
+            "Workarounds: 2 standing, 1 expired across 2 register(s), 1 not checked"
+        );
+
+        let mut report = digest_report();
+        assert!(digest_report_json(&report, false).get("workaround_registers").is_none());
+        report.workaround_check = Some(check);
+        let value = digest_report_json(&report, false);
+        let w = &value["workaround_registers"];
+        assert_eq!(w["standing"], 2);
+        assert_eq!(w["expired"][0]["tracking"], "jibot-code#3x7y");
+        assert_eq!(w["expired"][0]["expires"], "2026-10-31");
+        assert_eq!(w["problems"][0]["register"], "/nonexistent/jilog/x9k9.md");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

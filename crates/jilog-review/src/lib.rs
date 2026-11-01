@@ -26,6 +26,7 @@ pub mod signal_ledger;
 pub mod util;
 pub mod readers;
 pub mod trackers;
+pub mod workaround_register;
 pub mod zone;
 
 pub use archive_spend::{ArchiveSpend, DailyUsage, PeriodSpend};

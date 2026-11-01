@@ -343,6 +343,23 @@ With an `agentsview` reader configured, the nightly also runs `agentsview usage 
 
 Costs come from agentsview's own pricing (integer `microdollars`, summed with `rust_decimal`); jilog still keeps no price tables. The daemon is probed first (`GET /api/v1/machines`) because `usage daily` answers from the local archive even when the daemon is down, and the CLI runs under `timeout_secs` in its own process group (a daemon mid-sync blocks the command for minutes; the nightly never waits on it). The block — and the `archive_spend` key in `--json` (`yesterday`, `week`, `week_from`, `week_to`, `timezone`; costs as decimal strings) — is absent when agentsview is not configured, the daemon is unreachable, the binary is missing, the call exceeds the timeout, the output is unparseable, or the window has no rows. None of those fail the run, and for a given digest date a host without agentsview emits exactly the digest and JSON it emitted before (two golden files under `crates/*/tests/golden/` pin the bytes); what the zone changes on such a host is only which calendar day an un-pinned run is dated.
 
+### Expired workarounds (P0 candidates)
+
+An environment workaround in use instead of a fix gets a row in a register: a markdown file whose `## Standing` table has the columns `Workaround | Hosts | Tracking | Owner | Added | Expires`, with `Expires` at most 30 days after `Added` (the format of jibot-code's `docs/operations/environment-workarounds.md`). List the registers in jilog.toml:
+
+```toml
+workaround_registers = ["~/repos/jibot-code/docs/operations/environment-workarounds.md"]
+```
+
+The nightly then reads each register and adds one line to **P0 Alerts** per row whose `Expires` date is before the digest date, and one per register it could not read or parse, so a broken register cannot hide an expiry:
+
+```markdown
+- **P0 CANDIDATE**: workaround `jibot-code#3x7y` expired 2026-11-26 (owner macct host): Codex cannot run shell commands on macct; ...
+- **P0 CANDIDATE**: workaround register `~/repos/jibot-code/docs/operations/environment-workarounds.md` was not checked: cannot read: ...
+```
+
+These lines count in `p0_count`, and the frontmatter gains `workarounds_standing`, `workarounds_expired` and `workaround_register_problems`; `--json` gains a `workaround_registers` object. With no register configured the digest and JSON are unchanged. `jilog config check` reads each register's shape and warns, exit 1, on one it cannot read. The check is offline: it does not ask the tracker whether a tracking issue is still open.
+
 ---
 
 ## Example: a real digest

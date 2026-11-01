@@ -92,6 +92,23 @@ pub fn check_lines(cfg: &JilogConfig) -> (Vec<String>, bool) {
         format!("patterns detector: fed by {}", patterns.join(", "))
     });
 
+    // Workaround registers (jibot-code#x9k9): shape only, as the nightly
+    // reports an unreadable one under P0 Alerts.
+    let mut register_warned = false;
+    if cfg.workaround_registers.is_empty() {
+        lines.push("workaround registers: none configured".to_string());
+    }
+    for raw in &cfg.workaround_registers {
+        let path = jilog_review::util::expand_tilde(raw);
+        match jilog_review::workaround_register::read_register(&path) {
+            Ok(rows) => lines.push(format!("workaround register: {} ({} standing)", raw, rows.len())),
+            Err(e) => {
+                lines.push(format!("warn: workaround register {} is not checked: {}", raw, e));
+                register_warned = true;
+            }
+        }
+    }
+
     let warned = match &cfg.tracker {
         TrackerConfig::Kata { .. } | TrackerConfig::Github { .. } => {
             let kind = if matches!(cfg.tracker, TrackerConfig::Kata { .. }) { "kata" } else { "github" };
@@ -106,7 +123,7 @@ pub fn check_lines(cfg: &JilogConfig) -> (Vec<String>, bool) {
             false
         }
     };
-    (lines, warned)
+    (lines, warned || register_warned)
 }
 
 fn push_unique<'a>(v: &mut Vec<&'a str>, name: &'a str) {
@@ -185,6 +202,35 @@ mod tests {
         assert!(lines[0].starts_with("readers: none configured"), "{lines:?}");
         assert_eq!(lines[1], "errors detector: fed by amplifier");
         assert_eq!(lines[2], "patterns detector: fed by amplifier");
+    }
+
+    #[test]
+    fn workaround_registers_are_checked_for_shape() {
+        let (lines, warned) = check_lines(&cfg("[tracker]\ntype = \"none\"\n"));
+        assert!(!warned);
+        assert!(lines.contains(&"workaround registers: none configured".to_string()), "{lines:?}");
+
+        let dir = std::env::temp_dir().join(format!("jilog-cc-x9k9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.md");
+        std::fs::write(
+            &good,
+            "## Standing\n\n| Workaround | Hosts | Tracking | Owner | Added | Expires |\n|---|---|---|---|---|---|\n| w | h | jibot-code#3x7y | o | 2026-10-01 | 2026-10-31 |\n",
+        )
+        .unwrap();
+        let good = good.display().to_string();
+        let (lines, warned) = check_lines(&cfg(&format!(
+            "workaround_registers = [{good:?}]\n[tracker]\ntype = \"none\"\n"
+        )));
+        assert!(!warned, "{lines:?}");
+        assert!(lines.contains(&format!("workaround register: {good} (1 standing)")), "{lines:?}");
+
+        let (lines, warned) = check_lines(&cfg(
+            "workaround_registers = [\"/nonexistent/x9k9.md\"]\n[tracker]\ntype = \"none\"\n",
+        ));
+        assert!(warned);
+        assert!(lines.iter().any(|l| l.starts_with("warn: workaround register /nonexistent/x9k9.md is not checked")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

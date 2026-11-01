@@ -43,6 +43,11 @@ pub struct ReviewArgs {
     /// (the CLI) before the run; None when agentsview is not configured or
     /// was unavailable. Rendered as the digest's "Archive spend" block.
     pub archive_spend: Option<crate::archive_spend::ArchiveSpend>,
+    /// Expired rows and unreadable registers from the configured
+    /// environment-workaround registers, checked by the caller against
+    /// `date` (jibot-code#x9k9); None when no register is configured.
+    /// Rendered under P0 Alerts and counted in `p0_count`.
+    pub workaround_check: Option<crate::workaround_register::WorkaroundCheck>,
 }
 
 /// Result of a run_review call.
@@ -60,6 +65,9 @@ pub struct DigestReport {
     pub spend: Option<SpendSummary>,
     /// The archive spend block (agentsview), echoed from `ReviewArgs`.
     pub archive_spend: Option<crate::archive_spend::ArchiveSpend>,
+    /// The workaround-register check, echoed from `ReviewArgs` on the same
+    /// terms as `archive_spend`.
+    pub workaround_check: Option<crate::workaround_register::WorkaroundCheck>,
     /// Per-persona/channel rollup for fleet sessions (handles that carried a
     /// persona). Keyed `persona@channel` (or bare persona when the channel is
     /// unknown). Empty when only coding sessions were scanned.
@@ -802,6 +810,7 @@ pub fn run_review(
             &issue_index,
             &personas,
             ledger_counts.as_ref(),
+            args.workaround_check.as_ref(),
         )?;
 
         // Step 4: the digest rendering the new signals is on disk.
@@ -860,6 +869,11 @@ pub fn run_review(
         } else {
             None
         },
+        workaround_check: if should_write || args.dry_run {
+            args.workaround_check.clone()
+        } else {
+            None
+        },
         personas,
         digest_path,
         created_issues,
@@ -901,7 +915,7 @@ pub fn render_digest(
 ) -> String {
     render_digest_full(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts, spend,
-        archive_spend, recurrence_costs, issue_index, personas, None,
+        archive_spend, recurrence_costs, issue_index, personas, None, None,
     )
 }
 
@@ -925,6 +939,7 @@ pub fn render_digest_full(
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
     ledger_counts: Option<&LedgerCounts>,
+    workaround_check: Option<&crate::workaround_register::WorkaroundCheck>,
 ) -> String {
     let detected = ledger_counts.map(|lc| &lc.detected);
     let signals =
@@ -933,7 +948,8 @@ pub fn render_digest_full(
     buf.push_str("---\n");
     buf.push_str(&format!("date: {}\n", date));
     buf.push_str(&format!("signals_captured: {}\n", signals));
-    buf.push_str(&format!("p0_count: {}\n", p0_alerts.len()));
+    let workaround_alerts = workaround_check.map_or(0, |w| w.alert_count());
+    buf.push_str(&format!("p0_count: {}\n", p0_alerts.len() + workaround_alerts));
     buf.push_str(&format!("corrections: {}\n", corrections.len()));
     buf.push_str(&format!("errors: {}\n", errors.len()));
     buf.push_str(&format!("workarounds: {}\n", workarounds.len()));
@@ -955,13 +971,18 @@ pub fn render_digest_full(
         buf.push_str(&format!("deferrals_in_window: {}\n", w.deferrals));
         buf.push_str(&format!("patterns_in_window: {}\n", w.patterns));
     }
+    if let Some(w) = workaround_check {
+        buf.push_str(&format!("workarounds_standing: {}\n", w.standing));
+        buf.push_str(&format!("workarounds_expired: {}\n", w.expired.len()));
+        buf.push_str(&format!("workaround_register_problems: {}\n", w.problems.len()));
+    }
     buf.push_str("---\n\n");
 
     buf.push_str(&format!("# Learning Digest — {}\n\n", date));
 
     // P0 Alerts
     buf.push_str("## P0 Alerts\n\n");
-    if p0_alerts.is_empty() {
+    if p0_alerts.is_empty() && workaround_alerts == 0 {
         buf.push_str("_No P0 alerts._\n\n");
     } else {
         let mut tools: Vec<&String> = p0_alerts.keys().collect();
@@ -975,6 +996,9 @@ pub fn render_digest_full(
                 sessions.len(),
                 session_list.join(", ")
             ));
+        }
+        if let Some(w) = workaround_check {
+            render_workaround_alerts(&mut buf, w);
         }
         buf.push('\n');
     }
@@ -1184,6 +1208,28 @@ pub fn render_digest_full(
 /// models (jilog#heyg). Agents by cost descending; the five most expensive
 /// models. The trailing line names the zone the days are bucketed in
 /// (jilog#0qpq) so a reader can tell it from a report on another clock.
+/// P0 candidate lines for the workaround registers (jibot-code#x9k9): one
+/// per row past expiry, then one per register that could not be read or
+/// parsed. Register text is free-form, so it is made single-line first.
+fn render_workaround_alerts(buf: &mut String, w: &crate::workaround_register::WorkaroundCheck) {
+    for e in &w.expired {
+        buf.push_str(&format!(
+            "- **P0 CANDIDATE**: workaround `{}` expired {} (owner {}): {}\n",
+            sanitize_display(&e.row.tracking),
+            e.row.expires,
+            sanitize_display(&e.row.owner),
+            sanitize_display(&e.row.workaround),
+        ));
+    }
+    for p in &w.problems {
+        buf.push_str(&format!(
+            "- **P0 CANDIDATE**: workaround register `{}` was not checked: {}\n",
+            sanitize_display(&crate::util::contract_tilde(&p.register)),
+            sanitize_display(&p.message),
+        ));
+    }
+}
+
 fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
     /// ` — codex $1.00, claude $2.00`, or nothing when the period has no
     /// per-agent rows.
@@ -1256,12 +1302,14 @@ pub fn write_digest(
     issue_index: &HashMap<String, IssueRef>,
     personas: &BTreeMap<String, PersonaCounts>,
     ledger_counts: Option<&LedgerCounts>,
+    workaround_check: Option<&crate::workaround_register::WorkaroundCheck>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = crate::util::digest_file_path(digest_dir, date);
     let body = render_digest_full(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
         spend, archive_spend, recurrence_costs, issue_index, personas, ledger_counts,
+        workaround_check,
     );
     // Atomic (jilog#1xmf): a failed write must never leave a truncated
     // digest, which a later same-date run would preserve.
@@ -1490,6 +1538,93 @@ mod tests {
         assert!(body.contains("deferrals: 0"));
     }
 
+    fn expired_check() -> crate::workaround_register::WorkaroundCheck {
+        use crate::workaround_register::*;
+        WorkaroundCheck {
+            registers: 2,
+            standing: 3,
+            expired: vec![ExpiredWorkaround {
+                register: PathBuf::from("/r/one.md"),
+                row: StandingRow {
+                    workaround: "Codex `reviews` run\non joimba".into(),
+                    hosts: "macct".into(),
+                    tracking: "jibot-code#3x7y".into(),
+                    owner: "macct host".into(),
+                    added: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                    expires: NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(),
+                },
+            }],
+            problems: vec![RegisterProblem {
+                register: PathBuf::from("/r/two.md"),
+                message: "no '## Standing' section".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn digest_lists_expired_workarounds_as_p0_candidates() {
+        // jibot-code#x9k9: rows past expiry and unreadable registers are
+        // P0 lines and count in p0_count, beside the tool alerts.
+        let mut p0 = HashMap::new();
+        p0.insert("bash".to_string(), BTreeSet::from(["s1".to_string(), "s2".to_string()]));
+        let check = expired_check();
+        let body = render_digest_full(
+            "2026-11-01", &[], &[], &[], &[], &[], &p0, None, None, &HashMap::new(),
+            &no_issues(), &BTreeMap::new(), None, Some(&check),
+        );
+        assert!(body.contains("p0_count: 3\n"), "{body}");
+        assert!(body.contains("workarounds_standing: 3\nworkarounds_expired: 1\nworkaround_register_problems: 1\n---"), "{body}");
+        assert!(body.contains(
+            "- **P0 CANDIDATE**: workaround `jibot-code#3x7y` expired 2026-10-31 (owner macct host): Codex 'reviews' run on joimba\n"
+        ), "{body}");
+        assert!(body.contains(
+            "- **P0 CANDIDATE**: workaround register `/r/two.md` was not checked: no '## Standing' section\n"
+        ), "{body}");
+        let p0_section = body.split("## Corrections").next().unwrap();
+        assert!(p0_section.find("P0 ALERT").unwrap() < p0_section.find("P0 CANDIDATE").unwrap());
+
+        // Only workaround lines: no placeholder.
+        let body = render_digest_full(
+            "2026-11-01", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(),
+            &no_issues(), &BTreeMap::new(), None, Some(&check),
+        );
+        assert!(!body.contains("_No P0 alerts._"));
+
+        // A clean check keeps the placeholder and adds only the counts.
+        let clean = crate::workaround_register::WorkaroundCheck { registers: 1, standing: 2, ..Default::default() };
+        let body = render_digest_full(
+            "2026-11-01", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(),
+            &no_issues(), &BTreeMap::new(), None, Some(&clean),
+        );
+        assert!(body.contains("p0_count: 0\n") && body.contains("_No P0 alerts._"));
+        assert!(body.contains("workarounds_expired: 0\n"));
+
+        // Unconfigured: byte-identical to render_digest.
+        let plain = render_digest("2026-11-01", &[], &[], &[], &[], &[], &p0, None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        assert!(!plain.contains("workarounds_standing"));
+    }
+
+    #[test]
+    fn run_review_renders_and_echoes_the_workaround_check() {
+        let dir = test_dir("workaround-check");
+        let check = expired_check();
+        let args = ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            dry_run: false,
+            create_issues: false,
+            archive_spend: None,
+            workaround_check: Some(check.clone()),
+        };
+        let report = run_review(&[], &crate::trackers::none::NoneTracker, &args).unwrap();
+        assert_eq!(report.workaround_check, Some(check));
+        let body = fs::read_to_string(&report.digest_path).unwrap();
+        assert!(body.contains("P0 CANDIDATE**: workaround `jibot-code#3x7y`"), "{body}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn digest_empty_sections_use_placeholder() {
         let body = render_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
@@ -1592,7 +1727,7 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new(), None).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new(), None, None).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
         let _ = fs::remove_dir_all(&dir);
@@ -1628,6 +1763,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 0);
@@ -1661,6 +1797,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         run_review(&readers, &tracker, &args).unwrap();
 
@@ -1865,6 +2002,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.corrections.len(), 1);
@@ -1930,6 +2068,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
 
@@ -2007,6 +2146,7 @@ mod tests {
             dry_run: true,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         let mut got: Vec<(&str, &str)> = report
@@ -2125,6 +2265,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         let body = fs::read_to_string(&report.digest_path).unwrap();
@@ -2271,6 +2412,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
 
@@ -2362,6 +2504,7 @@ mod tests {
             dry_run: false,
             create_issues: true,
             archive_spend: None,
+            workaround_check: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-aging".into() };
         let r1 = run_review(&readers, &failing, &args).unwrap();
@@ -2465,6 +2608,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "stats-only session must be counted");
@@ -2501,6 +2645,7 @@ mod tests {
             dry_run: false,
             create_issues: true,
             archive_spend: None,
+            workaround_check: None,
         };
         let healthy = FailForSessionTracker { fail_session: "none".into() };
         let report = run_review(&readers, &healthy, &args).unwrap();
@@ -2532,6 +2677,7 @@ mod tests {
                 dry_run: false,
                 create_issues: true,
                 archive_spend: None,
+                workaround_check: None,
             };
             let failing = FailForSessionTracker { fail_session: format!("sess-{}", name) };
             run_review(&readers, &failing, &args).unwrap();
@@ -2568,6 +2714,7 @@ mod tests {
             dry_run: false,
             create_issues: true,
             archive_spend: None,
+            workaround_check: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-pending".into() };
         run_review(&readers, &failing, &args).unwrap();
@@ -2674,6 +2821,7 @@ mod tests {
             dry_run: false,
             create_issues: true,
             archive_spend: None,
+            workaround_check: None,
         };
 
         let report = run_review(&readers, &tracker, &args).unwrap();
@@ -2836,6 +2984,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let first = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(first.sessions_scanned, 1);
@@ -2888,6 +3037,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.corrections[0].agent.as_deref(), Some("claude"));
@@ -2940,6 +3090,7 @@ mod tests {
             dry_run: false,
             create_issues: false,
             archive_spend: None,
+            workaround_check: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "the archive copy is skipped in-run");
@@ -2992,6 +3143,7 @@ mod tests {
             dry_run: false,
             create_issues: true,
             archive_spend: None,
+            workaround_check: None,
         };
         // OpenTitlesTracker refuses every create → tracker failure → session unmarked.
         let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
@@ -3094,6 +3246,7 @@ mod tests {
             dry_run: false,
             create_issues,
             archive_spend: None,
+            workaround_check: None,
         }
     }
 
@@ -3440,7 +3593,7 @@ mod tests {
         )]);
         let with = render_digest_full(
             "2026-10-13", &[], &[], &[], &[], &[], &HashMap::new(), None, None,
-            &HashMap::new(), &no_issues(), &personas, Some(&detected),
+            &HashMap::new(), &no_issues(), &personas, Some(&detected), None,
         );
         for line in [
             "\nsignals_detected: 15\n",

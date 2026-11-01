@@ -52,6 +52,7 @@ fn run_pipeline(reader: Box<dyn Reader>, digest_dir: &Path) -> String {
         dry_run: false,
         create_issues: false,
         archive_spend: None,
+        workaround_check: None,
     };
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
     assert_eq!(
@@ -244,6 +245,7 @@ fn pooled_codex_seat_reaches_signals_through_the_pipeline() {
         dry_run: false,
         create_issues: false,
         archive_spend: None,
+        workaround_check: None,
     };
     let readers: Vec<Box<dyn Reader>> = vec![Box::new(CodexReader::new(sessions))];
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
@@ -319,6 +321,7 @@ esac
         dry_run: false,
         create_issues: false,
         archive_spend: None,
+        workaround_check: None,
     };
     let report = run_review(&readers, &NoneTracker, &args).unwrap();
     assert_eq!(report.errors.len(), 1);
@@ -465,6 +468,7 @@ esac
         dry_run: false,
         create_issues: false,
         archive_spend: None,
+        workaround_check: None,
     };
     let report = run_review(&readers, &NoneTracker, &args("processed-1")).unwrap();
     assert_eq!(report.errors.len(), 1);
