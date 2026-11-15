@@ -308,7 +308,9 @@ pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal>
     // tool_use id → tool name, from assistant blocks; a result follows its call.
     let mut tool_names: HashMap<String, String> = HashMap::new();
     // A Claude Code transcript copies a turn into `api-request-blob` lines as
-    // well as its own line, so one call's result can appear more than once.
+    // well as its own line. The claude-code reader drops those copies
+    // (jibot-code#r1jp); this guard keeps one result per call for any
+    // caller that passes them through.
     let mut seen_results: HashSet<String> = HashSet::new();
     for msg in messages {
         match msg.role.as_deref() {
