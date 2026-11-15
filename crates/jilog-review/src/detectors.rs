@@ -152,6 +152,33 @@ fn is_review_report(text: &str) -> bool {
     text.trim_start().starts_with("## Files Examined") || re.is_match(text)
 }
 
+/// True for an assistant message that is the text of a Claude Code memory
+/// file: a `# Memory Index` file or a memory entry under its YAML
+/// frontmatter (`---`, then `name:` and `description:`). A `claude -p` job
+/// that merges a Syncthing conflict of such a file answers with the merged
+/// file, so a "TODO" or "for now" inside a remembered fact is file content,
+/// not the agent taking a shortcut; those replies were 406 of 407 workaround
+/// signals in 2026-W46 (jibot-code#cny7).
+fn is_memory_file_text(text: &str) -> bool {
+    let text = text.trim_start();
+    if text.starts_with("# Memory Index") {
+        return true;
+    }
+    let mut lines = text.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return false;
+    }
+    let (mut name, mut description) = (false, false);
+    for line in lines {
+        if line.trim_end() == "---" {
+            return name && description;
+        }
+        name |= line.starts_with("name:");
+        description |= line.starts_with("description:");
+    }
+    false
+}
+
 fn is_bare_confirmation(text: &str) -> bool {
     let norm = text.trim().trim_end_matches(['.', '!']).to_lowercase();
     BARE_CONFIRMATIONS.contains(&norm.as_str())
@@ -579,8 +606,9 @@ pub fn detect_workarounds(messages: &[Message], session_id: &str) -> Vec<Workaro
             continue;
         }
         // An assistant turn quoting harness text is echoing it (jilog#1xmf);
-        // a code review reports on another agent's work (jibot-code#prq0).
-        if has_system_marker(&text) || is_review_report(&text) {
+        // a code review reports on another agent's work (jibot-code#prq0);
+        // a memory file's text is remembered facts (jibot-code#cny7).
+        if has_system_marker(&text) || is_review_report(&text) || is_memory_file_text(&text) {
             continue;
         }
         let matches = regex.matches(&text);
@@ -655,8 +683,9 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
             continue;
         }
         // An assistant turn quoting harness text is echoing it (jilog#1xmf);
-        // a code review reports on another agent's work (jibot-code#prq0).
-        if has_system_marker(&text) || is_review_report(&text) {
+        // a code review reports on another agent's work (jibot-code#prq0);
+        // a memory file's text is remembered facts (jibot-code#cny7).
+        if has_system_marker(&text) || is_review_report(&text) || is_memory_file_text(&text) {
             continue;
         }
         let matches = regex.matches(&text);
@@ -1519,6 +1548,40 @@ mod tests {
             let msgs = vec![assistant(&text)];
             assert!(detect_workarounds(&msgs, "s1").is_empty(), "{verdict}");
             assert!(detect_deferrals(&msgs, "s1").is_empty(), "{verdict}");
+        }
+    }
+
+    /// The reply of jibot-code#cny7's evidence session 0ec31d9d: a merged
+    /// MEMORY.md whose entries carry workaround and deferral words.
+    const MEMORY_INDEX_REPLY: &str = "# Memory Index\n- [bounce-fixer disabled by an off-tailnet roster host](bounce-fixer-off-tailnet-roster-host.md) — 11-13: a temporary workaround; for now the roster preflight skips it, defer this to the next fix.\n";
+
+    #[test]
+    fn workarounds_and_deferrals_skip_memory_file_text() {
+        for text in [
+            MEMORY_INDEX_REPLY.to_string(),
+            format!("\n\n{MEMORY_INDEX_REPLY}"),
+            "---\nname: roster-preflight\ndescription: a temporary workaround for now\nmetadata:\n  type: project\n---\n\nThe hack stays for now; defer this to the next fix.\n".to_string(),
+            "---\r\nname: x\r\ndescription: y\r\n---\r\nTODO for now; defer this.\r\n".to_string(),
+        ] {
+            let msgs = vec![assistant(&text)];
+            assert!(detect_workarounds(&msgs, "s1").is_empty(), "{text}");
+            assert!(detect_deferrals(&msgs, "s1").is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn signals_still_fire_beside_memory_lookalikes() {
+        for text in [
+            // The header quoted mid-message is the agent's own prose.
+            "I hardcoded the path for now; the # Memory Index entry says so. Defer this to the next session.",
+            // Frontmatter without both memory keys is not a memory file.
+            "---\ntitle: plan\n---\nI hardcoded the path for now; defer this to the next session.",
+            // An unclosed frontmatter block is not a memory file.
+            "---\nname: x\ndescription: y\nI hardcoded the path for now; defer this to the next session.",
+        ] {
+            let msgs = vec![assistant(text)];
+            assert_eq!(detect_workarounds(&msgs, "s1").len(), 1, "{text}");
+            assert_eq!(detect_deferrals(&msgs, "s1").len(), 1, "{text}");
         }
     }
 
