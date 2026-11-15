@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_job_readers_feed_neither_detector() {
+    fn guarded_job_readers_feed_errors_through_claude_code_only() {
         let (lines, warned) = check_lines(&cfg(
             "[[reader]]\ntype = \"claude-code\"\n[[reader]]\ntype = \"codex\"\n[[reader]]\ntype = \"agentsview\"\n[tracker]\ntype = \"none\"\n",
         ));
