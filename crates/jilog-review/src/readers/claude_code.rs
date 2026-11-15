@@ -262,7 +262,17 @@ impl Reader for ClaudeCodeReader {
 /// so both shapes are accepted. Returns `None` for non-chat lines such as
 /// `type=last-prompt`, `permission-mode`, `attachment`, `ai-title`,
 /// `file-history-snapshot`.
+///
+/// Also `None` for `type=api-request-blob`: Claude Code records each API
+/// request again under that type, repeating the system prompt and every
+/// user and assistant turn already written as `user`/`assistant` lines.
+/// Reading both made every captured signal appear twice in the digest
+/// (jibot-code#r1jp). Text found only in a blob is harness-rendered
+/// (system prompts, reminders, "Tool loaded."), which the detectors skip.
 fn extract_message(value: &serde_json::Value) -> Option<Message> {
+    if value.get("type").and_then(|v| v.as_str()) == Some("api-request-blob") {
+        return None;
+    }
     // Wrapped form: inner `message` object carries role/content.
     if let Some(inner) = value.get("message") {
         if inner.get("role").is_some() {
@@ -339,12 +349,16 @@ mod tests {
         fs::create_dir_all(&proj).unwrap();
 
         // Real-shape Claude Code lines: type+message wrapper, mixed with
-        // session-meta lines that have no role and must be skipped.
+        // session-meta lines that have no role and api-request-blob copies
+        // of the same turns (jibot-code#r1jp), all of which must be skipped.
         let content = r#"{"type":"last-prompt","leafUuid":"abc","sessionId":"x"}
 {"type":"user","uuid":"u1","message":{"role":"user","content":"hello"}}
 {"type":"permission-mode","permissionMode":"acceptEdits","sessionId":"x"}
 {"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
-{"type":"ai-title","title":"t","sessionId":"x"}"#;
+{"type":"ai-title","title":"t","sessionId":"x"}
+{"type":"api-request-blob","hash":"h","sessionId":"x","message":{"role":"system","content":"system prompt"}}
+{"type":"api-request-blob","hash":"h","sessionId":"x","message":{"role":"user","content":"hello"}}
+{"type":"api-request-blob","hash":"h","sessionId":"x","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
         fs::write(proj.join("real-session.jsonl"), content).unwrap();
 
         let reader = ClaudeCodeReader::new(&root);
@@ -353,7 +367,7 @@ mod tests {
         assert_eq!(handles.len(), 1);
 
         let msgs = reader.load(&handles[0]).unwrap();
-        assert_eq!(msgs.len(), 2, "user + assistant only — meta lines skipped");
+        assert_eq!(msgs.len(), 2, "user + assistant only — meta lines and api-request-blob copies skipped");
         assert_eq!(msgs[0].role.as_deref(), Some("user"));
         assert_eq!(msgs[1].role.as_deref(), Some("assistant"));
         let _ = fs::remove_dir_all(&root);
