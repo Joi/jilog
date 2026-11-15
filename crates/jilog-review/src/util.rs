@@ -61,6 +61,26 @@ pub fn digest_file_path(digest_dir: &std::path::Path, date_str: &str) -> PathBuf
     digest_dir.join(format!("learning-digest-{}.md", date_str))
 }
 
+/// Text of a Claude-format tool_result block's `content`, which is either a
+/// string or an array of `{type: "text", text}` blocks.
+pub(crate) fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut parts: Vec<String> = Vec::new();
+            for block in arr {
+                if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // truncate_chars — port from opsctl/src/review_nightly.rs:407-412
 // ---------------------------------------------------------------------------
