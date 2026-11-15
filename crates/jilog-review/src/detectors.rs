@@ -429,14 +429,42 @@ fn claude_tool_failure(tool_name: &str, block: &serde_json::Value) -> Option<Str
 }
 
 /// Claude Code's counterparts of the jilog#42fd noise shapes: a bare
-/// nonzero exit (`Exit code 1` and nothing else) and the user declining a
-/// tool call at the permission prompt. Exact shapes only; any other text
-/// is emitted.
+/// nonzero exit (`Exit code 1` and nothing else), and a denied permission
+/// prompt, whether the user declined or the auto-mode classifier or a
+/// built-in safety check refused. Fixed harness sentences only; any other
+/// text is emitted.
 fn is_expected_claude_noise(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let bare_exit = RE.get_or_init(|| Regex::new(r"^Exit code \d+$").expect("bare exit regex must compile"));
-    let t = text.trim();
-    bare_exit.is_match(t) || t.starts_with("The user doesn't want to proceed with this tool use.")
+    static RE: OnceLock<RegexSet> = OnceLock::new();
+    let set = RE.get_or_init(|| {
+        RegexSet::new([
+            r"^Exit code \d+$",
+            r"^The user doesn't want to (proceed with this tool use|take this action right now)\.",
+            r"^Permission for this (action|command) was denied by ",
+        ])
+        .expect("claude noise patterns must compile")
+    });
+    set.is_match(text.trim())
+}
+
+/// A Claude Code failure caused by the call itself, not by the tool: the
+/// command ran and exited nonzero, the call was invalid or blocked before
+/// it ran, a hook refused it, or the URL answered 4xx. These stay in the
+/// digest's error list but do not count toward a P0 alert, which means a
+/// tool failing across sessions. Without the exclusion `Bash` would alert
+/// on most days (2026-11-16 dry run on macazbd: 471 Bash failures in 3
+/// days, almost all of them `Exit code N` with output).
+fn is_call_level_failure(message: &str) -> bool {
+    static RE: OnceLock<RegexSet> = OnceLock::new();
+    let set = RE.get_or_init(|| {
+        RegexSet::new([
+            r"^Exit code \d+\b",
+            r"^<tool_use_error>",
+            r"^PreToolUse:\S+ hook error",
+            r"^The server returned HTTP 4\d{2}\b",
+        ])
+        .expect("call-level failure patterns must compile")
+    });
+    set.is_match(message.trim_start())
 }
 
 fn webfetch_http_error_regex() -> &'static Regex {
@@ -818,7 +846,8 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 // Heuristic 5: P0 alert detection
 // ---------------------------------------------------------------------------
 
-/// Group errors by tool, count distinct ROOT sessions (skip sub-agents).
+/// Group errors by tool, count distinct ROOT sessions (skip sub-agents and
+/// call-level Claude Code failures, [`is_call_level_failure`]).
 /// Returns entries with >= P0_DISTINCT_SESSION_THRESHOLD distinct sessions.
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -835,6 +864,9 @@ pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<Stri
             continue;
         }
         if crate::reader::is_sub_agent_session(&e.session_id) {
+            continue;
+        }
+        if is_call_level_failure(&e.message) {
             continue;
         }
         by_tool
@@ -1429,6 +1461,14 @@ mod tests {
             ),
             tool_use("t3", "Bash"),
             tool_result("t3", Some(true), json!("Exit code 1\ngrep: x: No such file")),
+            tool_use("t4", "Bash"),
+            tool_result(
+                "t4",
+                Some(true),
+                json!("Permission for this action was denied by the Claude Code auto mode classifier."),
+            ),
+            tool_use("t5", "Bash"),
+            tool_result("t5", Some(true), json!("The user doesn't want to take this action right now. STOP.")),
         ];
         let out = detect_errors(&msgs, "s1");
         assert_eq!(out.len(), 1, "{out:?}");
@@ -1993,6 +2033,33 @@ mod tests {
         let p0 = detect_p0_alerts(&errors);
         assert_eq!(p0.len(), 1);
         assert_eq!(p0["bash"].len(), 3);
+    }
+
+    #[test]
+    fn p0_alerts_skip_call_level_claude_failures() {
+        let err = |s: &str, tool: &str, m: &str| ErrorSignal {
+            session_id: s.into(),
+            tool_name: tool.into(),
+            message: m.into(),
+            ..Default::default()
+        };
+        let errors = vec![
+            err("a", "Bash", "Exit code 1\ngrep: x: No such file"),
+            err("b", "Bash", "<tool_use_error>Blocked: sleep 5 followed by: cat"),
+            err("c", "Bash", "PreToolUse:Bash hook error: pattern kill refused"),
+            err("a", "WebFetch", "The server returned HTTP 404 Not Found."),
+            err("b", "WebFetch", "The server returned HTTP 403 Forbidden."),
+            err("c", "WebFetch", "The server returned HTTP 404 Not Found."),
+        ];
+        assert!(detect_p0_alerts(&errors).is_empty());
+
+        // Transport failures and 5xx are the tool failing: they still alert.
+        let errors = vec![
+            err("a", "WebFetch", "socket hang up"),
+            err("b", "WebFetch", "The server returned HTTP 503 Service Unavailable."),
+            err("c", "WebFetch", "Request was aborted."),
+        ];
+        assert_eq!(detect_p0_alerts(&errors)["WebFetch"].len(), 3);
     }
 
     #[test]
