@@ -224,11 +224,11 @@ The errors detector reads `role: tool` results; the patterns detector reads the 
 | pi, nanoclaw | yes | yes |
 | worker-signals | yes (dispatch diagnostics) | no |
 | generic | only if its files hold tool-role lines | no |
-| claude-code | no — tool results are user-role `tool_result` blocks | no |
+| claude-code | yes — user-role `tool_result` blocks (jibot-code#xbpq) | no |
 | codex | no — tool calls are dropped | no |
 | copilot, agentsview | no | no |
 
-Claude Code marks every non-zero Bash exit `is_error: true`, so counting its `tool_result` errors unfiltered would replace a zero with a flood; that reader stays out of the errors detector until a filtered design exists. `jilog config check` prints which configured readers feed each detector.
+Claude Code marks every non-zero Bash exit `is_error: true`. The errors detector counts a Claude Code result as failed when it carries `is_error: true` or is WebFetch's own `The server returned HTTP 4xx/5xx` sentence, once per `tool_use_id`. A bare `Exit code N` and a denied permission prompt are noise, as in jilog#42fd. Failures the call caused itself (a nonzero exit, an invalid or blocked call, a hook refusal, an HTTP 4xx) are listed under Errors but do not count toward a P0 alert, and neither do subagent transcripts (`agent-<id>`). On macazbd, three days of Claude Code sessions gave 541 errors in 48 sessions, 471 of them Bash. `jilog config check` prints which configured readers feed each detector.
 
 ---
 

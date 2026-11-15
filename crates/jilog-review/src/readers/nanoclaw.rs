@@ -48,7 +48,7 @@ use crate::error::JilogReviewError;
 use crate::reader::{
     Message, Reader, SessionEvent, SessionEventKind, SessionStats, TranscriptHandle,
 };
-use crate::util::parse_iso8601;
+use crate::util::{parse_iso8601, tool_result_text};
 
 /// Reader for NanoClaw cell agent sessions.
 pub struct NanoclawReader {
@@ -322,7 +322,7 @@ impl Reader for NanoclawReader {
                                             .get("is_error")
                                             .and_then(|v| v.as_bool())
                                             .unwrap_or(false);
-                                        let text = block_text(block.get("content"));
+                                        let text = tool_result_text(block.get("content"));
                                         let tool_name = block
                                             .get("tool_use_id")
                                             .and_then(|v| v.as_str())
@@ -613,26 +613,6 @@ fn xml_unescape(s: &str) -> String {
         .replace("&#39;", "'")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
-}
-
-/// Text of a tool_result block's `content`, which is either a string or an
-/// array of `{type: "text", text}` blocks.
-fn block_text(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            let mut parts: Vec<String> = Vec::new();
-            for block in arr {
-                if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        parts.push(t.to_string());
-                    }
-                }
-            }
-            parts.join("\n")
-        }
-        _ => String::new(),
-    }
 }
 
 // ---------------------------------------------------------------------------

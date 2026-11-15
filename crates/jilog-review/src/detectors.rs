@@ -3,7 +3,7 @@
 //! All five detectors are pure functions over `&[Message]`.
 //! Ported verbatim from opsctl/crates/opsctl/src/review_nightly.rs.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::{Regex, RegexSet};
@@ -293,13 +293,35 @@ fn contains_tool_result(content: &Option<serde_json::Value>) -> bool {
 // Heuristic 2: Error signal detection
 // ---------------------------------------------------------------------------
 
-/// Scan for `role: tool` messages whose `content` parses as JSON with
-/// `success: false`. Returns one ErrorSignal per matching message.
+/// Scan for failed tool calls in either transcript shape:
+///
+/// - a `role: tool` message whose `content` parses as JSON with
+///   `success: false` (Amplifier, and the readers that convert to it);
+/// - a Claude-format `tool_result` block on a user-role message, failed per
+///   [`claude_tool_failure`] (the claude-code reader passes these through
+///   unconverted, so until jibot-code#xbpq no Claude Code session ever
+///   produced an error signal).
+///
+/// Returns one ErrorSignal per failed call, in transcript order.
 pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal> {
     let mut out = Vec::new();
+    // tool_use id → tool name, from assistant blocks; a result follows its call.
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    // A Claude Code transcript copies a turn into `api-request-blob` lines as
+    // well as its own line, so one call's result can appear more than once.
+    let mut seen_results: HashSet<String> = HashSet::new();
     for msg in messages {
-        if msg.role.as_deref() != Some("tool") {
-            continue;
+        match msg.role.as_deref() {
+            Some("assistant") => {
+                record_tool_names(&msg.content, &mut tool_names);
+                continue;
+            }
+            Some("user") => {
+                detect_claude_tool_errors(msg, session_id, &tool_names, &mut seen_results, &mut out);
+                continue;
+            }
+            Some("tool") => {}
+            _ => continue,
         }
         let content_str = match &msg.content {
             Some(serde_json::Value::String(s)) => s.clone(),
@@ -335,6 +357,123 @@ pub fn detect_errors(messages: &[Message], session_id: &str) -> Vec<ErrorSignal>
         });
     }
     out
+}
+
+/// Remember the name of every `tool_use` block in an assistant message.
+fn record_tool_names(content: &Option<serde_json::Value>, names: &mut HashMap<String, String>) {
+    let Some(serde_json::Value::Array(blocks)) = content else { return };
+    for block in blocks {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if let (Some(id), Some(name)) = (
+            block.get("id").and_then(|v| v.as_str()),
+            block.get("name").and_then(|v| v.as_str()),
+        ) {
+            names.insert(id.to_string(), name.to_string());
+        }
+    }
+}
+
+/// One ErrorSignal per failed `tool_result` block on a user-role message.
+/// A result whose `tool_use_id` was already seen is a copy and is skipped.
+fn detect_claude_tool_errors(
+    msg: &Message,
+    session_id: &str,
+    tool_names: &HashMap<String, String>,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<ErrorSignal>,
+) {
+    let Some(serde_json::Value::Array(blocks)) = &msg.content else { return };
+    for block in blocks {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+            continue;
+        }
+        let id = block.get("tool_use_id").and_then(|v| v.as_str());
+        if let Some(id) = id {
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+        }
+        let tool_name = id
+            .and_then(|id| tool_names.get(id))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        if let Some(message) = claude_tool_failure(&tool_name, block) {
+            out.push(ErrorSignal {
+                session_id: session_id.to_string(),
+                tool_name,
+                call_level: is_call_level_failure(&message),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+}
+
+/// The error text of a failed Claude-format `tool_result`, or `None` when
+/// the call did not fail. Two shapes fail:
+///
+/// - `is_error: true`, unless the text is one of the ruled-expected noise
+///   shapes in [`is_expected_claude_noise`];
+/// - a `WebFetch` result that is Claude Code's own HTTP-error report
+///   ("The server returned HTTP 403 Forbidden."), which the harness returns
+///   without `is_error`. This is the tool's fixed sentence, not a keyword
+///   search of fetched page text: a page that merely says it is down is a
+///   successful fetch.
+fn claude_tool_failure(tool_name: &str, block: &serde_json::Value) -> Option<String> {
+    let text = crate::util::tool_result_text(block.get("content"));
+    if block.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+        return (!is_expected_claude_noise(&text)).then_some(text);
+    }
+    (tool_name == "WebFetch" && webfetch_http_error_regex().is_match(&text)).then_some(text)
+}
+
+/// Claude Code's counterparts of the jilog#42fd noise shapes: a bare
+/// nonzero exit (`Exit code 1` and nothing else), and a denied permission
+/// prompt, whether the user declined or the auto-mode classifier or a
+/// built-in safety check refused. Fixed harness sentences only; any other
+/// text is emitted.
+fn is_expected_claude_noise(text: &str) -> bool {
+    static RE: OnceLock<RegexSet> = OnceLock::new();
+    let set = RE.get_or_init(|| {
+        RegexSet::new([
+            r"^Exit code \d+$",
+            r"^The user doesn't want to (proceed with this tool use|take this action right now)\.",
+            r"^Permission for this (action|command) was denied by ",
+        ])
+        .expect("claude noise patterns must compile")
+    });
+    set.is_match(text.trim())
+}
+
+/// A Claude Code failure caused by the call itself, not by the tool: the
+/// command ran and exited nonzero, the call was invalid or blocked before
+/// it ran, a hook refused it, or the URL answered 4xx. `detect_errors` sets
+/// [`ErrorSignal::call_level`] from this for Claude-format results only;
+/// such errors stay in the digest's error list but do not count toward a
+/// P0 alert, which means a tool failing across sessions. Without the exclusion `Bash` would alert
+/// on most days (2026-11-16 dry run on macazbd: 471 Bash failures in 3
+/// days, almost all of them `Exit code N` with output).
+fn is_call_level_failure(message: &str) -> bool {
+    static RE: OnceLock<RegexSet> = OnceLock::new();
+    let set = RE.get_or_init(|| {
+        RegexSet::new([
+            r"^Exit code \d+\b",
+            r"^<tool_use_error>",
+            r"^PreToolUse:\S+ hook error",
+            r"^The server returned HTTP 4\d{2}\b",
+        ])
+        .expect("call-level failure patterns must compile")
+    });
+    set.is_match(message.trim_start())
+}
+
+fn webfetch_http_error_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^The server returned HTTP [45]\d{2}\b").expect("http error regex must compile")
+    })
 }
 
 /// Pull the most useful error string out of a tool result `data` blob.
@@ -709,7 +848,9 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 // Heuristic 5: P0 alert detection
 // ---------------------------------------------------------------------------
 
-/// Group errors by tool, count distinct ROOT sessions (skip sub-agents).
+/// Group errors by tool, count distinct ROOT sessions (skip sub-agents of
+/// either harness and call-level Claude Code failures,
+/// [`ErrorSignal::call_level`]).
 /// Returns entries with >= P0_DISTINCT_SESSION_THRESHOLD distinct sessions.
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -726,6 +867,9 @@ pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<Stri
             continue;
         }
         if crate::reader::is_sub_agent_session(&e.session_id) {
+            continue;
+        }
+        if e.call_level || crate::reader::is_claude_sub_agent_session(&e.session_id) {
             continue;
         }
         by_tool
@@ -1221,6 +1365,117 @@ mod tests {
             name: None,
         }];
         assert!(detect_errors(&msgs, "s1").is_empty());
+    }
+
+    // ---------- errors: Claude-format tool_result blocks (jibot-code#xbpq) ----------
+
+    fn tool_use(id: &str, name: &str) -> Message {
+        Message {
+            role: Some("assistant".into()),
+            content: Some(json!([{"type": "tool_use", "id": id, "name": name, "input": {}}])),
+            name: None,
+        }
+    }
+
+    fn tool_result(id: &str, is_error: Option<bool>, content: serde_json::Value) -> Message {
+        let mut block = json!({"type": "tool_result", "tool_use_id": id, "content": content});
+        if let Some(flag) = is_error {
+            block["is_error"] = json!(flag);
+        }
+        Message { role: Some("user".into()), content: Some(json!([block])), name: None }
+    }
+
+    #[test]
+    fn errors_claude_is_error_result_detected_with_tool_name() {
+        let msgs = vec![
+            tool_use("t1", "WebFetch"),
+            tool_result("t1", Some(true), json!("socket hang up")),
+        ];
+        let out = detect_errors(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tool_name, "WebFetch");
+        assert_eq!(out[0].message, "socket hang up");
+    }
+
+    #[test]
+    fn errors_claude_array_content_and_unknown_tool() {
+        let msgs = vec![tool_result(
+            "orphan",
+            Some(true),
+            json!([{"type": "text", "text": "Exit code 2"}, {"type": "text", "text": "ls: nope: No such file"}]),
+        )];
+        let out = detect_errors(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tool_name, "unknown");
+        assert_eq!(out[0].message, "Exit code 2\nls: nope: No such file");
+    }
+
+    #[test]
+    fn errors_claude_successful_results_skipped() {
+        let msgs = vec![
+            tool_use("t1", "Bash"),
+            tool_result("t1", Some(false), json!("error: everything failed")),
+            tool_use("t2", "WebFetch"),
+            // Page text that says the site is down is a successful fetch.
+            tool_result("t2", None, json!("The page reads \"Application Unavailable\".")),
+        ];
+        assert!(detect_errors(&msgs, "s1").is_empty());
+    }
+
+    #[test]
+    fn errors_claude_repeated_result_counts_once() {
+        let msgs = vec![
+            tool_use("t1", "WebFetch"),
+            tool_result("t1", Some(true), json!("socket hang up")),
+            tool_use("t1", "WebFetch"),
+            tool_result("t1", Some(true), json!("socket hang up")),
+            tool_result("t2", Some(true), json!("socket hang up")),
+        ];
+        assert_eq!(detect_errors(&msgs, "s1").len(), 2);
+    }
+
+    #[test]
+    fn errors_claude_webfetch_http_error_detected_without_flag() {
+        let msgs = vec![
+            tool_use("t1", "WebFetch"),
+            tool_result("t1", None, json!("The server returned HTTP 503 Service Unavailable.\n\nThe response body was not retrieved.")),
+            tool_use("t2", "WebFetch"),
+            tool_result("t2", None, json!("The server returned HTTP 301 Moved Permanently.")),
+            // The same sentence from another tool is that tool's output.
+            tool_use("t3", "Read"),
+            tool_result("t3", None, json!("The server returned HTTP 404 Not Found.")),
+        ];
+        let out = detect_errors(&msgs, "s1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tool_name, "WebFetch");
+        assert!(out[0].message.starts_with("The server returned HTTP 503"));
+    }
+
+    #[test]
+    fn errors_claude_noise_shapes_suppressed() {
+        let msgs = vec![
+            tool_use("t1", "Bash"),
+            tool_result("t1", Some(true), json!("Exit code 1")),
+            tool_use("t2", "Edit"),
+            tool_result(
+                "t2",
+                Some(true),
+                json!("The user doesn't want to proceed with this tool use. The tool use was rejected."),
+            ),
+            tool_use("t3", "Bash"),
+            tool_result("t3", Some(true), json!("Exit code 1\ngrep: x: No such file")),
+            tool_use("t4", "Bash"),
+            tool_result(
+                "t4",
+                Some(true),
+                json!("Permission for this action was denied by the Claude Code auto mode classifier."),
+            ),
+            tool_use("t5", "Bash"),
+            tool_result("t5", Some(true), json!("The user doesn't want to take this action right now. STOP.")),
+        ];
+        let out = detect_errors(&msgs, "s1");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].message, "Exit code 1\ngrep: x: No such file");
     }
 
     #[test]
@@ -1781,6 +2036,84 @@ mod tests {
         let p0 = detect_p0_alerts(&errors);
         assert_eq!(p0.len(), 1);
         assert_eq!(p0["bash"].len(), 3);
+    }
+
+    /// Errors as `detect_errors` produces them from one Claude-format
+    /// failed result per session.
+    fn claude_errors(results: &[(&str, &str, &str)], is_error: Option<bool>) -> Vec<ErrorSignal> {
+        results
+            .iter()
+            .flat_map(|(session, tool, text)| {
+                let msgs = vec![tool_use("t1", tool), tool_result("t1", is_error, json!(text))];
+                detect_errors(&msgs, session)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn p0_alerts_skip_call_level_claude_failures() {
+        let mut errors = claude_errors(
+            &[
+                ("a", "Bash", "Exit code 1\ngrep: x: No such file"),
+                ("b", "Bash", "<tool_use_error>Blocked: sleep 5 followed by: cat"),
+                ("c", "Bash", "PreToolUse:Bash hook error: pattern kill refused"),
+            ],
+            Some(true),
+        );
+        errors.extend(claude_errors(
+            &[
+                ("a", "WebFetch", "The server returned HTTP 404 Not Found."),
+                ("b", "WebFetch", "The server returned HTTP 403 Forbidden."),
+                ("c", "WebFetch", "The server returned HTTP 404 Not Found."),
+            ],
+            None,
+        ));
+        assert_eq!(errors.len(), 6, "all six stay in the error list");
+        assert!(detect_p0_alerts(&errors).is_empty());
+
+        // Transport failures and 5xx are the tool failing: they still alert.
+        let mut errors = claude_errors(
+            &[("a", "WebFetch", "socket hang up"), ("c", "WebFetch", "Request was aborted.")],
+            Some(true),
+        );
+        errors.extend(claude_errors(
+            &[("b", "WebFetch", "The server returned HTTP 503 Service Unavailable.")],
+            None,
+        ));
+        assert_eq!(detect_p0_alerts(&errors)["WebFetch"].len(), 3);
+    }
+
+    #[test]
+    fn p0_alerts_keep_native_tool_role_failures_with_claude_like_text() {
+        // Only detect_errors' Claude path classifies; a tool-role failure
+        // reading the same way aggregates as before.
+        let errors: Vec<ErrorSignal> = ["a", "b", "c"]
+            .iter()
+            .flat_map(|s| {
+                let msgs = vec![tool("bash", json!({"success": false, "error": "Exit code 1\nconnection refused"}))];
+                detect_errors(&msgs, s)
+            })
+            .collect();
+        assert!(errors.iter().all(|e| !e.call_level));
+        assert_eq!(detect_p0_alerts(&errors)["bash"].len(), 3);
+    }
+
+    #[test]
+    fn p0_alerts_skip_claude_subagent_transcripts() {
+        let errors = claude_errors(
+            &[
+                ("agent-a1687f84307855078", "WebFetch", "socket hang up"),
+                ("agent-a25265ec1c394bdf6", "WebFetch", "socket hang up"),
+                ("agent-ab4a660dc83a216f3", "WebFetch", "socket hang up"),
+            ],
+            Some(true),
+        );
+        assert_eq!(errors.len(), 3);
+        assert!(detect_p0_alerts(&errors).is_empty());
+        assert!(crate::reader::is_claude_sub_agent_session("agent-ab4a660dc83a216f3"));
+        assert!(!crate::reader::is_claude_sub_agent_session("agent-"));
+        assert!(!crate::reader::is_claude_sub_agent_session("agent-browser"));
+        assert!(!crate::reader::is_claude_sub_agent_session("7649ad4b-efda-4d25-ac75-9861384685c7"));
     }
 
     #[test]

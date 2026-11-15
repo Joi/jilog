@@ -18,8 +18,9 @@ pub enum ConfigCmd {
 
 /// What a reader can give the detectors beyond user/assistant messages.
 struct Feeds {
-    /// `role: "tool"` results — the input of `detect_errors`. `Some(true)`
-    /// always, `Some(false)` never, `None` only if its files hold them.
+    /// Tool results `detect_errors` reads (`role: "tool"` lines or
+    /// Claude-format `tool_result` blocks). `Some(true)` always,
+    /// `Some(false)` never, `None` only if its files hold them.
     errors: Option<bool>,
     /// An event stream from `load_events` — the input of
     /// `detect_health_patterns`.
@@ -38,10 +39,9 @@ fn feeds(reader: &ReaderConfig) -> (&'static str, Feeds) {
         ReaderConfig::Nanoclaw { .. } => ("nanoclaw", Feeds { errors: Some(true), patterns: true }),
         ReaderConfig::WorkerSignals => ("worker-signals", Feeds { errors: Some(true), patterns: false }),
         ReaderConfig::Generic { .. } => ("generic", Feeds { errors: None, patterns: false }),
-        // Claude Code tool results are user-role tool_result blocks. (Its
-        // legacy flat form would pass a synthetic `role: "tool"` line
-        // through, but real Claude Code transcripts hold none.)
-        ReaderConfig::ClaudeCode { .. } => ("claude-code", Feeds { errors: Some(false), patterns: false }),
+        // Claude Code tool results are user-role tool_result blocks, which
+        // detect_errors reads since jibot-code#xbpq.
+        ReaderConfig::ClaudeCode { .. } => ("claude-code", Feeds { errors: Some(true), patterns: false }),
         // The codex reader drops tool calls.
         ReaderConfig::Codex { .. } => ("codex", Feeds { errors: Some(false), patterns: false }),
         ReaderConfig::Copilot { .. } => ("copilot", Feeds { errors: Some(false), patterns: false }),
@@ -81,7 +81,7 @@ pub fn check_lines(cfg: &JilogConfig) -> (Vec<String>, bool) {
         errors_maybe.join(", ")
     );
     lines.push(match (errors_always.is_empty(), errors_maybe.is_empty()) {
-        (true, true) => "errors detector: no configured reader feeds it (claude-code, codex, copilot and agentsview carry no tool-role results)".to_string(),
+        (true, true) => "errors detector: no configured reader feeds it (codex, copilot and agentsview carry no tool results)".to_string(),
         (true, false) => format!("errors detector: {}", maybe),
         (false, true) => format!("errors detector: fed by {}", errors_always.join(", ")),
         (false, false) => format!("errors detector: fed by {}; {}", errors_always.join(", "), maybe),
@@ -164,7 +164,7 @@ mod tests {
             ("pi", "fed by pi", "fed by pi"),
             ("nanoclaw", "fed by nanoclaw", "fed by nanoclaw"),
             ("worker-signals", "fed by worker-signals", "no configured reader"),
-            ("claude-code", "no configured reader", "no configured reader"),
+            ("claude-code", "fed by claude-code", "no configured reader"),
             ("codex", "no configured reader", "no configured reader"),
             ("copilot", "no configured reader", "no configured reader"),
             ("agentsview", "no configured reader", "no configured reader"),
@@ -179,11 +179,11 @@ mod tests {
     }
 
     #[test]
-    fn guarded_job_readers_feed_neither_detector() {
+    fn guarded_job_readers_feed_errors_through_claude_code_only() {
         let (lines, warned) = check_lines(&cfg(
             "[[reader]]\ntype = \"claude-code\"\n[[reader]]\ntype = \"codex\"\n[[reader]]\ntype = \"agentsview\"\n[tracker]\ntype = \"none\"\n",
         ));
-        assert!(lines[0].contains("no configured reader feeds it"), "{lines:?}");
+        assert_eq!(lines[0], "errors detector: fed by claude-code");
         assert!(lines[1].contains("no configured reader feeds it"), "{lines:?}");
         assert!(!warned);
         assert!(lines.iter().any(|l| l.starts_with("tracker: none")));
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn mixed_readers_list_the_feeders() {
         let (lines, _) = check_lines(&cfg("[[reader]]\ntype = \"claude-code\"\n[[reader]]\ntype = \"pi\"\n"));
-        assert_eq!(lines[0], "errors detector: fed by pi");
+        assert_eq!(lines[0], "errors detector: fed by claude-code, pi");
         assert_eq!(lines[1], "patterns detector: fed by pi");
     }
 
