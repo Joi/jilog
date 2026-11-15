@@ -104,6 +104,16 @@ pub fn is_sub_agent_session(session_id: &str) -> bool {
     session_id.starts_with(SUB_AGENT_PREFIX)
 }
 
+/// True for a Claude Code subagent transcript, which the claude-code reader
+/// finds at `<session>/subagents/agent-<hex id>.jsonl` and names by its
+/// stem. Used only by the P0 alert, so the health detectors' autonomy rule
+/// (jilog#42fd) is unchanged.
+pub fn is_claude_sub_agent_session(session_id: &str) -> bool {
+    session_id
+        .strip_prefix("agent-")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The `8-4-4-4-12` hex uuid `s` ends with, if it ends with one. Used to
 /// recognise one Codex session through two readers: the raw rollout stem
 /// `rollout-<ts>-<uuid>` and the agentsview archive id `codex:<uuid>`

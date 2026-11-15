@@ -19,7 +19,7 @@ fn kata_tracker_warns_and_exits_1() {
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("warn: tracker kata files every raw signal"), "{stdout}");
-    assert!(stdout.contains("errors detector: no configured reader feeds it"), "{stdout}");
+    assert!(stdout.contains("errors detector: fed by claude-code"), "{stdout}");
 }
 
 #[test]

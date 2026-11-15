@@ -117,6 +117,12 @@ pub struct ErrorSignal {
     pub machine: Option<String>,
     pub tool_name: String,
     pub message: String,
+    /// A Claude Code failure caused by the call itself (a nonzero exit, an
+    /// invalid or refused call, an HTTP 4xx), set by `detect_errors`. Such
+    /// an error stays in the digest but does not count toward a P0 alert.
+    /// Never serialized, so the JSON and the signal ledger are unchanged.
+    #[serde(skip)]
+    pub call_level: bool,
     /// Which bot ran the session (fleet sessions only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,

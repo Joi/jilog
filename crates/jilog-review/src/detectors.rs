@@ -403,6 +403,7 @@ fn detect_claude_tool_errors(
             out.push(ErrorSignal {
                 session_id: session_id.to_string(),
                 tool_name,
+                call_level: is_call_level_failure(&message),
                 message,
                 ..Default::default()
             });
@@ -448,9 +449,10 @@ fn is_expected_claude_noise(text: &str) -> bool {
 
 /// A Claude Code failure caused by the call itself, not by the tool: the
 /// command ran and exited nonzero, the call was invalid or blocked before
-/// it ran, a hook refused it, or the URL answered 4xx. These stay in the
-/// digest's error list but do not count toward a P0 alert, which means a
-/// tool failing across sessions. Without the exclusion `Bash` would alert
+/// it ran, a hook refused it, or the URL answered 4xx. `detect_errors` sets
+/// [`ErrorSignal::call_level`] from this for Claude-format results only;
+/// such errors stay in the digest's error list but do not count toward a
+/// P0 alert, which means a tool failing across sessions. Without the exclusion `Bash` would alert
 /// on most days (2026-11-16 dry run on macazbd: 471 Bash failures in 3
 /// days, almost all of them `Exit code N` with output).
 fn is_call_level_failure(message: &str) -> bool {
@@ -846,8 +848,9 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
 // Heuristic 5: P0 alert detection
 // ---------------------------------------------------------------------------
 
-/// Group errors by tool, count distinct ROOT sessions (skip sub-agents and
-/// call-level Claude Code failures, [`is_call_level_failure`]).
+/// Group errors by tool, count distinct ROOT sessions (skip sub-agents of
+/// either harness and call-level Claude Code failures,
+/// [`ErrorSignal::call_level`]).
 /// Returns entries with >= P0_DISTINCT_SESSION_THRESHOLD distinct sessions.
 pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<String>> {
     let mut by_tool: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -866,7 +869,7 @@ pub fn detect_p0_alerts(errors: &[ErrorSignal]) -> HashMap<String, BTreeSet<Stri
         if crate::reader::is_sub_agent_session(&e.session_id) {
             continue;
         }
-        if is_call_level_failure(&e.message) {
+        if e.call_level || crate::reader::is_claude_sub_agent_session(&e.session_id) {
             continue;
         }
         by_tool
@@ -2035,31 +2038,82 @@ mod tests {
         assert_eq!(p0["bash"].len(), 3);
     }
 
+    /// Errors as `detect_errors` produces them from one Claude-format
+    /// failed result per session.
+    fn claude_errors(results: &[(&str, &str, &str)], is_error: Option<bool>) -> Vec<ErrorSignal> {
+        results
+            .iter()
+            .flat_map(|(session, tool, text)| {
+                let msgs = vec![tool_use("t1", tool), tool_result("t1", is_error, json!(text))];
+                detect_errors(&msgs, session)
+            })
+            .collect()
+    }
+
     #[test]
     fn p0_alerts_skip_call_level_claude_failures() {
-        let err = |s: &str, tool: &str, m: &str| ErrorSignal {
-            session_id: s.into(),
-            tool_name: tool.into(),
-            message: m.into(),
-            ..Default::default()
-        };
-        let errors = vec![
-            err("a", "Bash", "Exit code 1\ngrep: x: No such file"),
-            err("b", "Bash", "<tool_use_error>Blocked: sleep 5 followed by: cat"),
-            err("c", "Bash", "PreToolUse:Bash hook error: pattern kill refused"),
-            err("a", "WebFetch", "The server returned HTTP 404 Not Found."),
-            err("b", "WebFetch", "The server returned HTTP 403 Forbidden."),
-            err("c", "WebFetch", "The server returned HTTP 404 Not Found."),
-        ];
+        let mut errors = claude_errors(
+            &[
+                ("a", "Bash", "Exit code 1\ngrep: x: No such file"),
+                ("b", "Bash", "<tool_use_error>Blocked: sleep 5 followed by: cat"),
+                ("c", "Bash", "PreToolUse:Bash hook error: pattern kill refused"),
+            ],
+            Some(true),
+        );
+        errors.extend(claude_errors(
+            &[
+                ("a", "WebFetch", "The server returned HTTP 404 Not Found."),
+                ("b", "WebFetch", "The server returned HTTP 403 Forbidden."),
+                ("c", "WebFetch", "The server returned HTTP 404 Not Found."),
+            ],
+            None,
+        ));
+        assert_eq!(errors.len(), 6, "all six stay in the error list");
         assert!(detect_p0_alerts(&errors).is_empty());
 
         // Transport failures and 5xx are the tool failing: they still alert.
-        let errors = vec![
-            err("a", "WebFetch", "socket hang up"),
-            err("b", "WebFetch", "The server returned HTTP 503 Service Unavailable."),
-            err("c", "WebFetch", "Request was aborted."),
-        ];
+        let mut errors = claude_errors(
+            &[("a", "WebFetch", "socket hang up"), ("c", "WebFetch", "Request was aborted.")],
+            Some(true),
+        );
+        errors.extend(claude_errors(
+            &[("b", "WebFetch", "The server returned HTTP 503 Service Unavailable.")],
+            None,
+        ));
         assert_eq!(detect_p0_alerts(&errors)["WebFetch"].len(), 3);
+    }
+
+    #[test]
+    fn p0_alerts_keep_native_tool_role_failures_with_claude_like_text() {
+        // Only detect_errors' Claude path classifies; a tool-role failure
+        // reading the same way aggregates as before.
+        let errors: Vec<ErrorSignal> = ["a", "b", "c"]
+            .iter()
+            .flat_map(|s| {
+                let msgs = vec![tool("bash", json!({"success": false, "error": "Exit code 1\nconnection refused"}))];
+                detect_errors(&msgs, s)
+            })
+            .collect();
+        assert!(errors.iter().all(|e| !e.call_level));
+        assert_eq!(detect_p0_alerts(&errors)["bash"].len(), 3);
+    }
+
+    #[test]
+    fn p0_alerts_skip_claude_subagent_transcripts() {
+        let errors = claude_errors(
+            &[
+                ("agent-a1687f84307855078", "WebFetch", "socket hang up"),
+                ("agent-a25265ec1c394bdf6", "WebFetch", "socket hang up"),
+                ("agent-ab4a660dc83a216f3", "WebFetch", "socket hang up"),
+            ],
+            Some(true),
+        );
+        assert_eq!(errors.len(), 3);
+        assert!(detect_p0_alerts(&errors).is_empty());
+        assert!(crate::reader::is_claude_sub_agent_session("agent-ab4a660dc83a216f3"));
+        assert!(!crate::reader::is_claude_sub_agent_session("agent-"));
+        assert!(!crate::reader::is_claude_sub_agent_session("agent-browser"));
+        assert!(!crate::reader::is_claude_sub_agent_session("7649ad4b-efda-4d25-ac75-9861384685c7"));
     }
 
     #[test]
