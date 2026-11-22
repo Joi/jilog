@@ -72,7 +72,9 @@ impl Fixture {
 
     /// A `cargo` stub on PATH that logs its arguments and "installs" a jilog
     /// under the --root it was given, naming the checkout's HEAD. Without
-    /// --root it installs nothing, so the script's own check fails.
+    /// --root it installs nothing, so the script's own check fails. Like real
+    /// cargo, it refuses to replace a bin/jilog it has no record of
+    /// ($root/.crates.toml) unless given --force (jibot-code#q8kf).
     fn stub_cargo(&self) -> (PathBuf, PathBuf) {
         let dir = self._tmp.path().join("stubbin");
         std::fs::create_dir_all(&dir).unwrap();
@@ -81,10 +83,12 @@ impl Fixture {
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/bash\necho \"$*\" > '{log}'\nroot=\"\"; path=\"\"\n\
-                 while [ $# -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift;; --path) path=\"$2\"; shift;; esac; shift; done\n\
-                 [ -n \"$root\" ] || exit 0\nsha=$(git -C \"${{path%/crates/jilog}}\" rev-parse HEAD)\nmkdir -p \"$root/bin\"\n\
-                 printf '#!/bin/sh\\necho \"jilog 0.9.0 (commit %s)\"\\n' \"$sha\" > \"$root/bin/jilog\"\nchmod +x \"$root/bin/jilog\"\n",
+                "#!/bin/bash\necho \"$*\" > '{log}'\nroot=\"\"; path=\"\"; force=0\n\
+                 while [ $# -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift;; --path) path=\"$2\"; shift;; --force) force=1;; esac; shift; done\n\
+                 [ -n \"$root\" ] || exit 0\n\
+                 if [ -e \"$root/bin/jilog\" ] && [ ! -e \"$root/.crates.toml\" ] && [ $force = 0 ]; then\n\
+                 echo 'error: binary `jilog` already exists in destination' >&2; exit 101; fi\nsha=$(git -C \"${{path%/crates/jilog}}\" rev-parse HEAD)\nmkdir -p \"$root/bin\"\n\
+                 printf '#!/bin/sh\\necho \"jilog 0.9.0 (commit %s)\"\\n' \"$sha\" > \"$root/bin/jilog\"\nchmod +x \"$root/bin/jilog\"\ntouch \"$root/.crates.toml\"\n",
                 log = log.display()
             ),
         )
@@ -199,4 +203,26 @@ fn install_passes_its_root_to_cargo_and_verifies_the_result() {
     let args = std::fs::read_to_string(&log).unwrap();
     assert!(args.contains(&format!("--root {}", home.display())), "{args}");
     assert!(home.join("bin/jilog").exists());
+}
+
+#[test]
+fn install_replaces_a_jilog_that_cargo_did_not_install() {
+    // azbdmini's jilog was copied in by hand, with no .crates.toml entry, and
+    // cargo refused to overwrite it until the script passed --force
+    // (jibot-code#q8kf).
+    let f = fixture();
+    f.fake_jilog("jilog 0.9.0");
+    assert!(!f.root.join(".crates.toml").exists());
+    let (stubbin, log) = f.stub_cargo();
+    let o = Command::new("bash")
+        .arg(f.checkout.join("scripts/install"))
+        .env("CARGO_INSTALL_ROOT", &f.root)
+        .env("CARGO_HOME", f.root.join("unused-cargo-home"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stubbin.display()))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains(&format!("jilog: installed {}", f.main)), "{}", stdout(&o));
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(args.contains("--force"), "{args}");
 }
