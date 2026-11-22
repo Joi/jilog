@@ -160,7 +160,11 @@ fn is_review_report(text: &str) -> bool {
 /// not the agent taking a shortcut; those replies were 406 of 407 workaround
 /// signals in 2026-W46 (jibot-code#cny7).
 fn is_memory_file_text(text: &str) -> bool {
-    let text = text.trim_start();
+    let mut text = text.trim_start();
+    // The same file wrapped in a code fence (jibot-code#chk5).
+    if let Some(rest) = text.strip_prefix("```") {
+        text = rest.split_once('\n').map_or("", |(_, body)| body).trim_start();
+    }
     if text.starts_with("# Memory Index") {
         return true;
     }
@@ -177,6 +181,35 @@ fn is_memory_file_text(text: &str) -> bool {
         description |= line.starts_with("description:");
     }
     false
+}
+
+/// First lines of the reports scheduled jobs answer with: a CVE triage
+/// verdict ("Verdict: HIGH" then "Why:"), a watch brief ("# News watch —
+/// 2026-11-21", "**News watch · November 20**") and meeting notes
+/// ("### Topics").
+const GENERATED_REPORT_PATTERNS: [&str; 3] = [
+    r"\AVerdict:[ \t]*(?:NONE|LOW|MEDIUM|HIGH|CRITICAL)\b[^\n]*\r?\n[ \t]*Why:",
+    r"\A(?:#{1,6}[ \t]+|\*\*)[^\n]{0,40}?\bwatch[ \t]*(?:—|–|-|·|:)",
+    r"\A#{1,6}[ \t]+Topics[ \t]*\r?$",
+];
+
+/// True for an assistant message that is a report a scheduled job asked
+/// for, not the agent describing its own work: a CVE triage verdict, a
+/// watch brief, meeting notes, or a JSON object (a structured-output
+/// reply). The keyword in such a report belongs to the advisory, the news
+/// or the meeting; under the current detectors these were 38 of 101
+/// workaround signals in 2026-W47 (jibot-code#chk5).
+fn is_generated_report(text: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(&format!("(?im){}", GENERATED_REPORT_PATTERNS.join("|")))
+            .expect("generated-report patterns must compile")
+    });
+    let text = text.trim_start();
+    if text.starts_with('{') && serde_json::from_str::<serde_json::Value>(text.trim_end()).is_ok() {
+        return true;
+    }
+    re.is_match(text)
 }
 
 fn is_bare_confirmation(text: &str) -> bool {
@@ -748,8 +781,13 @@ pub fn detect_workarounds(messages: &[Message], session_id: &str) -> Vec<Workaro
         }
         // An assistant turn quoting harness text is echoing it (jilog#1xmf);
         // a code review reports on another agent's work (jibot-code#prq0);
-        // a memory file's text is remembered facts (jibot-code#cny7).
-        if has_system_marker(&text) || is_review_report(&text) || is_memory_file_text(&text) {
+        // a memory file's text is remembered facts (jibot-code#cny7); a
+        // scheduled job's report describes the world (jibot-code#chk5).
+        if has_system_marker(&text)
+            || is_review_report(&text)
+            || is_memory_file_text(&text)
+            || is_generated_report(&text)
+        {
             continue;
         }
         let matches = regex.matches(&text);
@@ -825,8 +863,13 @@ pub fn detect_deferrals(messages: &[Message], session_id: &str) -> Vec<DeferralS
         }
         // An assistant turn quoting harness text is echoing it (jilog#1xmf);
         // a code review reports on another agent's work (jibot-code#prq0);
-        // a memory file's text is remembered facts (jibot-code#cny7).
-        if has_system_marker(&text) || is_review_report(&text) || is_memory_file_text(&text) {
+        // a memory file's text is remembered facts (jibot-code#cny7); a
+        // scheduled job's report describes the world (jibot-code#chk5).
+        if has_system_marker(&text)
+            || is_review_report(&text)
+            || is_memory_file_text(&text)
+            || is_generated_report(&text)
+        {
             continue;
         }
         let matches = regex.matches(&text);
@@ -1823,6 +1866,61 @@ mod tests {
             let msgs = vec![assistant(&text)];
             assert!(detect_workarounds(&msgs, "s1").is_empty(), "{text}");
             assert!(detect_deferrals(&msgs, "s1").is_empty(), "{text}");
+        }
+    }
+
+    /// Openings of 2026-W47 workaround signals that were reports, copied
+    /// from the digests (jibot-code#chk5); each gets a trailing sentence
+    /// carrying workaround and deferral words.
+    const W47_REPORTS: &[&str] = &[
+        "Verdict: HIGH\nWhy: CVE-2026-123158 (\"sshole\") is a pre-auth password-authentication bypass.",
+        "Verdict: LOW\nWhy: The affected package is kanishka-linux reminiscence 0.3, not Chrome.",
+        "Verdict: MEDIUM\r\nWhy: CVE-2026-99731 is a lost-wakeup race in the Linux kernel's mm/filemap code.",
+        "# News watch — 2026-11-21\n\n## Oura IPO\n- Nothing new.",
+        "# Routing watch — 2026-11-17\n\n## Headlines\n\n- Terminal-Bench 4.1 opened.",
+        "# RSI watch — 2026-11-20\n\n- One paper.",
+        "**News watch · November 20**\n\nTwo items.",
+        "### Topics\n- Tateki Matsuda asked how the previous day's treatment felt.",
+        "{\"schema_version\":3,\"summary\":\"This is the regenerated decision-docket\",\"items\":[]}",
+        "```\n# Memory Index\n- [joimbp repair handover 2026-11-16](joimbp-repair.md) — 11-16: notes\n```",
+    ];
+
+    #[test]
+    fn workarounds_and_deferrals_skip_generated_reports() {
+        for opening in W47_REPORTS {
+            let text = if opening.starts_with('{') || opening.starts_with("```") {
+                // A JSON reply carries its words inside the object; a fenced
+                // file ends at its fence.
+                opening.replace("notes", "a temporary hack for now; defer this to the next session")
+                    .replace("decision-docket", "decision-docket, a temporary hack for now; defer this to the next session")
+            } else {
+                format!("{opening}\n\nA temporary workaround is in place for now; defer this to the next session.\n")
+            };
+            let msgs = vec![assistant(&text)];
+            assert!(detect_workarounds(&msgs, "s1").is_empty(), "{text}");
+            assert!(detect_deferrals(&msgs, "s1").is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn signals_still_fire_beside_report_lookalikes() {
+        for text in [
+            // A verdict quoted mid-message, or without its Why: line.
+            "The triage said Verdict: HIGH.\nWhy: unclear. I hardcoded the path for now; defer this to the next session.",
+            "Verdict: HIGH\n\nI hardcoded the path for now; defer this to the next session.",
+            // "watch" as a word in the agent's own heading, not a brief's title.
+            "# Stopwatch fix\n\nI hardcoded the path for now; defer this to the next session.",
+            "I will watch the job: I hardcoded the path for now; defer this to the next session.",
+            // A topics heading that is not the first line.
+            "Summary.\n### Topics\nI hardcoded the path for now; defer this to the next session.",
+            // Prose that opens with a brace but is not JSON.
+            "{draft} I hardcoded the path for now; defer this to the next session.",
+            // A code fence around something other than a memory file.
+            "```\nfn main() {}\n```\nI hardcoded the path for now; defer this to the next session.",
+        ] {
+            let msgs = vec![assistant(text)];
+            assert_eq!(detect_workarounds(&msgs, "s1").len(), 1, "{text}");
+            assert_eq!(detect_deferrals(&msgs, "s1").len(), 1, "{text}");
         }
     }
 
