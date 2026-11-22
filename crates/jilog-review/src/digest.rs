@@ -88,6 +88,10 @@ pub struct DigestReport {
     /// the window start, plus this run's new ones (jilog#1xmf). `None`
     /// without a ledger.
     pub in_window: Option<KindCounts>,
+    /// The "classifier degenerate" alarm for this run's detected signals
+    /// ([`degenerate_classifier_alert`], jibot-code#chk5), or None. The
+    /// digest lists it under P0 Alerts and counts it in `p0_count`.
+    pub classifier_degenerate: Option<String>,
 }
 
 /// Sessions and signal counts for one persona@channel key.
@@ -865,6 +869,16 @@ pub fn run_review(
         }
     }
 
+    let classifier_degenerate = degenerate_classifier_alert(
+        ledger_counts.as_ref().map(|lc| &lc.detected).unwrap_or(&KindCounts {
+            corrections: all_corrections.len(),
+            errors: all_errors.len(),
+            workarounds: all_workarounds.len(),
+            deferrals: all_deferrals.len(),
+            patterns: all_patterns.len(),
+        }),
+    );
+
     Ok(DigestReport {
         date: args.date,
         corrections: all_corrections,
@@ -893,6 +907,7 @@ pub fn run_review(
         tracker_failures,
         detected: ledger_counts.as_ref().map(|lc| lc.detected.clone()),
         in_window: ledger_counts.map(|lc| lc.in_window),
+        classifier_degenerate,
     })
 }
 
@@ -961,7 +976,15 @@ pub fn render_digest_full(
     buf.push_str(&format!("date: {}\n", date));
     buf.push_str(&format!("signals_captured: {}\n", signals));
     let workaround_alerts = workaround_check.map_or(0, |w| w.alert_count());
-    buf.push_str(&format!("p0_count: {}\n", p0_alerts.len() + workaround_alerts));
+    let degenerate = degenerate_classifier_alert(detected.unwrap_or(&KindCounts {
+        corrections: corrections.len(),
+        errors: errors.len(),
+        workarounds: workarounds.len(),
+        deferrals: deferrals.len(),
+        patterns: patterns.len(),
+    }));
+    let extra_alerts = workaround_alerts + usize::from(degenerate.is_some());
+    buf.push_str(&format!("p0_count: {}\n", p0_alerts.len() + extra_alerts));
     buf.push_str(&format!("corrections: {}\n", corrections.len()));
     buf.push_str(&format!("errors: {}\n", errors.len()));
     buf.push_str(&format!("workarounds: {}\n", workarounds.len()));
@@ -994,7 +1017,7 @@ pub fn render_digest_full(
 
     // P0 Alerts
     buf.push_str("## P0 Alerts\n\n");
-    if p0_alerts.is_empty() && workaround_alerts == 0 {
+    if p0_alerts.is_empty() && extra_alerts == 0 {
         buf.push_str("_No P0 alerts._\n\n");
     } else {
         let mut tools: Vec<&String> = p0_alerts.keys().collect();
@@ -1008,6 +1031,9 @@ pub fn render_digest_full(
                 sessions.len(),
                 session_list.join(", ")
             ));
+        }
+        if let Some(message) = &degenerate {
+            buf.push_str(&format!("- **P0 ALERT**: {message}\n"));
         }
         if let Some(w) = workaround_check {
             render_workaround_alerts(&mut buf, w);
@@ -1216,10 +1242,31 @@ pub fn render_digest_full(
     buf
 }
 
-/// The "Archive spend (agentsview)" block: yesterday, trailing 7d, top
-/// models (jilog#heyg). Agents by cost descending; the five most expensive
-/// models. The trailing line names the zone the days are bucketed in
-/// (jilog#0qpq) so a reader can tell it from a report on another clock.
+/// Fewest signals a run must detect before [`degenerate_classifier_alert`]
+/// reads its share of workarounds: a quiet day with three signals, all
+/// workarounds, says nothing about the detectors.
+const DEGENERATE_MIN_SIGNALS: usize = 20;
+
+/// The P0 alert message for a run whose detectors put more than nine in
+/// ten signals in the workaround bucket, or None. Six digests of 2026-W47 read
+/// 88/88, 78/78, 255/258 and so on: a host running a jilog build from
+/// before the code-review and memory-file skips, which also counted no
+/// errors (jibot-code#chk5). Real work does not produce that mix, so the
+/// message says to check the build before reading the signals. The digest
+/// line begins with "- **P0 ALERT**", so a refreshed digest keeps it as a
+/// tool line.
+pub fn degenerate_classifier_alert(counts: &KindCounts) -> Option<String> {
+    let total = counts.total();
+    if total < DEGENERATE_MIN_SIGNALS || counts.workarounds * 10 <= total * 9 {
+        return None;
+    }
+    Some(format!(
+        "classifier degenerate: {} of {} signals are workarounds; \
+         check that this host's jilog build is current before reading them",
+        counts.workarounds, total
+    ))
+}
+
 /// P0 candidate lines for the workaround registers (jibot-code#x9k9): one
 /// per row past expiry, then one per register that could not be read or
 /// parsed. Register text is free-form, so it is made single-line first.
@@ -1315,6 +1362,10 @@ fn refresh_workaround_block(existing: &str, w: &crate::workaround_register::Work
     )
 }
 
+/// The "Archive spend (agentsview)" block: yesterday, trailing 7d, top
+/// models (jilog#heyg). Agents by cost descending; the five most expensive
+/// models. The trailing line names the zone the days are bucketed in
+/// (jilog#0qpq) so a reader can tell it from a report on another clock.
 fn render_archive_spend(buf: &mut String, a: &crate::archive_spend::ArchiveSpend) {
     /// ` — codex $1.00, claude $2.00`, or nothing when the period has no
     /// per-agent rows.
@@ -1644,6 +1695,59 @@ mod tests {
                 message: "no '## Standing' section".into(),
             }],
         }
+    }
+
+    #[test]
+    fn degenerate_classifier_alert_reads_the_workaround_share() {
+        // jibot-code#chk5: more than nine in ten signals, at least 20 of them.
+        let counts = |workarounds, errors| KindCounts { workarounds, errors, ..Default::default() };
+        for (w, e, fires) in [
+            (88, 0, true),
+            (255, 3, true),
+            (19, 1, true),
+            (18, 2, false), // exactly nine in ten
+            (19, 0, false), // too few signals
+            (101, 596, false),
+            (0, 0, false),
+        ] {
+            assert_eq!(degenerate_classifier_alert(&counts(w, e)).is_some(), fires, "{w}/{e}");
+        }
+        assert_eq!(
+            degenerate_classifier_alert(&counts(255, 3)).unwrap(),
+            "classifier degenerate: 255 of 258 signals are workarounds; \
+             check that this host's jilog build is current before reading them"
+        );
+    }
+
+    #[test]
+    fn digest_raises_and_keeps_the_degenerate_classifier_alert() {
+        let workarounds: Vec<Workaround> = (0..20)
+            .map(|i| Workaround {
+                session_id: format!("s{i}"),
+                pattern: "TODO".into(),
+                context: "I'll fetch the Mastodon status".into(),
+                ..Default::default()
+            })
+            .collect();
+        let body = render_digest_full(
+            "2026-11-20", &[], &[], &workarounds, &[], &[], &HashMap::new(), None, None,
+            &HashMap::new(), &no_issues(), &BTreeMap::new(), None, None,
+        );
+        assert!(body.contains("p0_count: 1\n"), "{body}");
+        assert!(!body.contains("_No P0 alerts._"), "{body}");
+        assert!(body.contains("**P0 ALERT**: classifier degenerate: 20 of 20 signals"), "{body}");
+
+        // A register refresh keeps the line and counts it.
+        let refreshed = refresh_workaround_block(&body, &expired_check());
+        assert!(refreshed.contains("p0_count: 3\n"), "{refreshed}");
+        assert!(refreshed.contains("**P0 ALERT**: classifier degenerate"), "{refreshed}");
+
+        // Nineteen workarounds: no alert.
+        let body = render_digest_full(
+            "2026-11-20", &[], &[], &workarounds[..19], &[], &[], &HashMap::new(), None, None,
+            &HashMap::new(), &no_issues(), &BTreeMap::new(), None, None,
+        );
+        assert!(body.contains("p0_count: 0\n") && body.contains("_No P0 alerts._"), "{body}");
     }
 
     #[test]
@@ -3725,6 +3829,44 @@ mod tests {
         let r2 = run_review(&readers2, &tracker, &ledger_args(&dir, "2026-10-13", false)).unwrap();
         assert_eq!(r2.errors.len(), 1, "only s3's error is new");
         assert!(r2.p0_alerts.contains_key("web_fetch"), "P0 counts seen errors");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_reports_the_classifier_alarm_in_every_mode() {
+        // jibot-code#chk5: the alarm is on the report, dry run included,
+        // and in the written digest's p0_count.
+        let dir = test_dir("classifier-alarm");
+        let readers: Vec<Box<dyn Reader>> = (0..20)
+            .map(|i| -> Box<dyn Reader> {
+                Box::new(FixtureReader {
+                    agent: None,
+                    machine: None,
+                    dedupe_key: None,
+                    session_id: format!("s{i}"),
+                    messages: vec![Message {
+                        role: Some("assistant".into()),
+                        content: Some(serde_json::Value::String(
+                            "I hardcoded the path for now.".into(),
+                        )),
+                        name: None,
+                    }],
+                    stats: None,
+                    persona: None,
+                    channel: None,
+                })
+            })
+            .collect();
+        let tracker = CountingTracker::new(&[]);
+        let mut args = ledger_args(&dir, "2026-11-20", false);
+        args.dry_run = true;
+        let dry = run_review(&readers, &tracker, &args).unwrap();
+        assert!(dry.classifier_degenerate.as_deref().is_some_and(|m| m.contains("20 of 20")));
+        args.dry_run = false;
+        let wet = run_review(&readers, &tracker, &args).unwrap();
+        assert!(wet.classifier_degenerate.is_some());
+        let body = digest_for(&dir, "2026-11-20");
+        assert!(body.contains("p0_count: 1\n"), "{body}");
         let _ = fs::remove_dir_all(&dir);
     }
 
