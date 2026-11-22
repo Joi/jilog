@@ -53,6 +53,15 @@ cargo install --git https://github.com/Joi/jilog --tag v0.5.0 jilog   # pinned
 cargo install --git https://github.com/Joi/jilog jilog                # moving main
 ```
 
+From a checkout, `scripts/install` fast-forwards `main` to `origin/main`,
+runs `cargo install --locked --path crates/jilog`, and checks that the
+installed binary names that commit; `scripts/install --check` installs
+nothing and reports `CURRENT`, `STALE` or `ABSENT` against `origin/main`
+(exit 0, 1, 2). `jilog --version` prints the build's commit:
+`jilog 0.9.0 (commit <40-hex>)`, with `-dirty` for a build from modified
+files and `unknown` outside a git checkout. A merge to `main` installs
+nothing on its own; run `scripts/install` on every Mac that runs jilog.
+
 Fleet replication (`jilog spool`, below) ships in v0.5.0 — it requires
 v0.5.0 or later; earlier tags (v0.2.0–v0.4.0) do not have the `spool`
 command. (The v0.5.0 tag is created with the release this section ships
