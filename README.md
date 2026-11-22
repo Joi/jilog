@@ -61,6 +61,9 @@ nothing and reports `CURRENT`, `STALE` or `ABSENT` against `origin/main`
 `jilog 0.9.0 (commit <40-hex>)`, with `-dirty` for a build from modified
 files and `unknown` outside a git checkout. A merge to `main` installs
 nothing on its own; run `scripts/install` on every Mac that runs jilog.
+Each digest `jilog review nightly` writes names the same commit as its
+second frontmatter line, `jilog_commit: <40-hex>`, so a digest written by
+a stale build says so.
 
 Fleet replication (`jilog spool`, below) ships in v0.5.0 — it requires
 v0.5.0 or later; earlier tags (v0.2.0–v0.4.0) do not have the `spool`

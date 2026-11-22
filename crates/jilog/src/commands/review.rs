@@ -138,6 +138,7 @@ fn run_nightly_at(
         create_issues: args.create_issues,
         archive_spend,
         workaround_check,
+        build_commit: Some(env!("JILOG_GIT_COMMIT").to_string()),
     };
 
     let report = jilog_review::run_review(readers.as_slice(), tracker.as_ref(), &review_args)
@@ -726,6 +727,9 @@ mod tests {
         let digest = std::fs::read_to_string(dir.path().join("digests/learning-digest-2026-09-16.md")).unwrap();
         assert!(!digest.contains("Archive spend"), "{digest}");
         assert!(!digest.contains("## Spend"), "{digest}");
+        // The digest names the build that wrote it (jibot-code#gtqd).
+        let stamp = format!("---\ndate: 2026-09-16\njilog_commit: {}\n", env!("JILOG_GIT_COMMIT"));
+        assert!(digest.starts_with(&stamp), "{digest}");
     }
 
     #[test]

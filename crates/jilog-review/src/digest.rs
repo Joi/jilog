@@ -48,6 +48,10 @@ pub struct ReviewArgs {
     /// `date` (jibot-code#x9k9); None when no register is configured.
     /// Rendered under P0 Alerts and counted in `p0_count`.
     pub workaround_check: Option<crate::workaround_register::WorkaroundCheck>,
+    /// The commit of the jilog build running this review, written to the
+    /// digest frontmatter as `jilog_commit:` so a reader of the digest can
+    /// tell a stale binary (jibot-code#gtqd); None writes no line.
+    pub build_commit: Option<String>,
 }
 
 /// Result of a run_review call.
@@ -815,6 +819,7 @@ pub fn run_review(
             &personas,
             ledger_counts.as_ref(),
             args.workaround_check.as_ref(),
+            args.build_commit.as_deref(),
         )?;
 
         // Step 4: the digest rendering the new signals is on disk.
@@ -1439,18 +1444,44 @@ pub fn write_digest(
     personas: &BTreeMap<String, PersonaCounts>,
     ledger_counts: Option<&LedgerCounts>,
     workaround_check: Option<&crate::workaround_register::WorkaroundCheck>,
+    build_commit: Option<&str>,
 ) -> Result<PathBuf, JilogReviewError> {
     std::fs::create_dir_all(digest_dir)?;
     let path = crate::util::digest_file_path(digest_dir, date);
-    let body = render_digest_full(
+    let mut body = render_digest_full(
         date, corrections, errors, workarounds, deferrals, patterns, p0_alerts,
         spend, archive_spend, recurrence_costs, issue_index, personas, ledger_counts,
         workaround_check,
     );
+    if let Some(commit) = build_commit {
+        body = stamp_build_commit(&body, commit);
+    }
     // Atomic (jilog#1xmf): a failed write must never leave a truncated
     // digest, which a later same-date run would preserve.
     crate::reader::write_atomic(&path, &body)?;
     Ok(path)
+}
+
+/// Insert `jilog_commit: <commit>` after the frontmatter's `date:` line
+/// (jibot-code#gtqd). macazbd wrote a week of digests with a build that
+/// predated a merged fix, and the weekly synthesis filed the fixed defect
+/// again; with the commit second in the frontmatter, a stale build shows in
+/// every digest the synthesis reads, ahead of any truncation. A body whose
+/// frontmatter does not open with a `date:` line is returned unchanged. A
+/// preserved same-date digest keeps the commit of the run that wrote it.
+pub fn stamp_build_commit(body: &str, commit: &str) -> String {
+    let commit: String = commit.chars().filter(|c| !c.is_control()).collect();
+    let Some(rest) = body.strip_prefix("---\n") else {
+        return body.to_string();
+    };
+    if !rest.starts_with("date: ") || !rest.contains("\n---\n") {
+        return body.to_string();
+    }
+    let Some(line_end) = rest.find('\n') else {
+        return body.to_string();
+    };
+    let at = "---\n".len() + line_end + 1;
+    format!("{}jilog_commit: {}\n{}", &body[..at], commit, &body[at..])
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,6 +1837,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: Some(check.clone()),
+            build_commit: None,
         };
         let report = run_review(&[], &crate::trackers::none::NoneTracker, &args).unwrap();
         assert_eq!(report.workaround_check, Some(check));
@@ -1865,6 +1897,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: Some(check.clone()),
+            build_commit: None,
         };
         let report = run_review(&[], &crate::trackers::none::NoneTracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 0);
@@ -1978,9 +2011,66 @@ mod tests {
     #[test]
     fn write_digest_creates_file() {
         let dir = test_dir("digest-write");
-        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new(), None, None).unwrap();
+        let path = write_digest("2026-04-30", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &dir, &no_issues(), &BTreeMap::new(), None, None, None).unwrap();
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "learning-digest-2026-04-30.md");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("jilog_commit:"), "no commit given, no line:\n{body}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // jibot-code#gtqd: the digest names the jilog build that wrote it.
+    #[test]
+    fn stamp_build_commit_goes_second_in_the_frontmatter() {
+        let body = render_digest("2026-11-22", &[], &[], &[], &[], &[], &HashMap::new(), None, None, &HashMap::new(), &no_issues(), &BTreeMap::new());
+        let sha = "de612ec188630ab353497e9a66dd0217742503d1";
+        let stamped = stamp_build_commit(&body, sha);
+        assert!(
+            stamped.starts_with(&format!("---\ndate: 2026-11-22\njilog_commit: {sha}\nsignals_captured: 0\n")),
+            "{stamped}"
+        );
+        // Only the one line is added.
+        assert_eq!(stamped.replace(&format!("jilog_commit: {sha}\n"), ""), body);
+        // Control characters cannot break the frontmatter.
+        assert!(stamp_build_commit(&body, "abc\n---\nx").contains("jilog_commit: abc---x\n"));
+        // No frontmatter, or one not opening with date: unchanged.
+        assert_eq!(stamp_build_commit("no frontmatter", sha), "no frontmatter");
+        let odd = "---\nsignals_captured: 1\n---\n";
+        assert_eq!(stamp_build_commit(odd, sha), odd);
+        assert_eq!(stamp_build_commit("---\ndate: x\n", sha), "---\ndate: x\n");
+    }
+
+    #[test]
+    fn run_review_writes_the_build_commit_and_a_preserved_digest_keeps_its_own() {
+        use crate::trackers::NoneTracker;
+        use chrono::{NaiveDate, Utc};
+
+        let dir = test_dir("build-commit");
+        let date = NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        let digest_path = dir.join("learning-digest-2026-11-22.md");
+        let readers: Vec<Box<dyn Reader>> = Vec::new();
+        let args = |commit: &str| ReviewArgs {
+            since: Utc::now() - chrono::Duration::days(1),
+            digest_dir: dir.clone(),
+            processed_file: None,
+            date,
+            dry_run: false,
+            create_issues: false,
+            archive_spend: None,
+            workaround_check: Some(crate::workaround_register::WorkaroundCheck::default()),
+            build_commit: Some(commit.to_string()),
+        };
+        run_review(&readers, &NoneTracker, &args("aaaa")).unwrap();
+        let first = fs::read_to_string(&digest_path).unwrap();
+        assert!(first.starts_with("---\ndate: 2026-11-22\njilog_commit: aaaa\n"), "{first}");
+
+        // A same-date rerun that scans nothing preserves the digest (and
+        // refreshes its register lines); the findings, and the commit that
+        // wrote them, stay.
+        run_review(&readers, &NoneTracker, &args("bbbb")).unwrap();
+        let second = fs::read_to_string(&digest_path).unwrap();
+        assert!(second.contains("jilog_commit: aaaa\n"), "{second}");
+        assert!(!second.contains("bbbb"), "{second}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2015,6 +2105,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 0);
@@ -2049,6 +2140,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         run_review(&readers, &tracker, &args).unwrap();
 
@@ -2254,6 +2346,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.corrections.len(), 1);
@@ -2320,6 +2413,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
 
@@ -2398,6 +2492,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         let mut got: Vec<(&str, &str)> = report
@@ -2517,6 +2612,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         let body = fs::read_to_string(&report.digest_path).unwrap();
@@ -2664,6 +2760,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
 
@@ -2756,6 +2853,7 @@ mod tests {
             create_issues: true,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-aging".into() };
         let r1 = run_review(&readers, &failing, &args).unwrap();
@@ -2860,6 +2958,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &tracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "stats-only session must be counted");
@@ -2897,6 +2996,7 @@ mod tests {
             create_issues: true,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let healthy = FailForSessionTracker { fail_session: "none".into() };
         let report = run_review(&readers, &healthy, &args).unwrap();
@@ -2929,6 +3029,7 @@ mod tests {
                 create_issues: true,
                 archive_spend: None,
                 workaround_check: None,
+                build_commit: None,
             };
             let failing = FailForSessionTracker { fail_session: format!("sess-{}", name) };
             run_review(&readers, &failing, &args).unwrap();
@@ -2966,6 +3067,7 @@ mod tests {
             create_issues: true,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let failing = FailForSessionTracker { fail_session: "sess-pending".into() };
         run_review(&readers, &failing, &args).unwrap();
@@ -3073,6 +3175,7 @@ mod tests {
             create_issues: true,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
 
         let report = run_review(&readers, &tracker, &args).unwrap();
@@ -3236,6 +3339,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let first = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(first.sessions_scanned, 1);
@@ -3289,6 +3393,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.corrections[0].agent.as_deref(), Some("claude"));
@@ -3342,6 +3447,7 @@ mod tests {
             create_issues: false,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         let report = run_review(&readers, &crate::trackers::NoneTracker, &args).unwrap();
         assert_eq!(report.sessions_scanned, 1, "the archive copy is skipped in-run");
@@ -3395,6 +3501,7 @@ mod tests {
             create_issues: true,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         };
         // OpenTitlesTracker refuses every create → tracker failure → session unmarked.
         let report = run_review(&readers, &OpenTitlesTracker { titles: vec![] }, &args).unwrap();
@@ -3498,6 +3605,7 @@ mod tests {
             create_issues,
             archive_spend: None,
             workaround_check: None,
+            build_commit: None,
         }
     }
 
