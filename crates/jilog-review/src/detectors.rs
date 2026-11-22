@@ -195,10 +195,12 @@ const GENERATED_REPORT_PATTERNS: [&str; 3] = [
 
 /// True for an assistant message that is a report a scheduled job asked
 /// for, not the agent describing its own work: a CVE triage verdict, a
-/// watch brief, meeting notes, or a JSON object (a structured-output
-/// reply). The keyword in such a report belongs to the advisory, the news
-/// or the meeting; under the current detectors these were 38 of 101
-/// workaround signals in 2026-W47 (jibot-code#chk5).
+/// watch brief, meeting notes, or a versioned JSON report (an object with
+/// a top-level `schema_version`, such as the decision docket). The keyword
+/// in such a report belongs to the advisory, the news or the meeting;
+/// under the current detectors these were 38 of 101 workaround signals in
+/// 2026-W47 (jibot-code#chk5). Other JSON replies, such as an agent's
+/// structured status, are still read.
 fn is_generated_report(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -206,8 +208,12 @@ fn is_generated_report(text: &str) -> bool {
             .expect("generated-report patterns must compile")
     });
     let text = text.trim_start();
-    if text.starts_with('{') && serde_json::from_str::<serde_json::Value>(text.trim_end()).is_ok() {
-        return true;
+    if text.starts_with('{') {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text.trim_end()) {
+            if map.contains_key("schema_version") {
+                return true;
+            }
+        }
     }
     re.is_match(text)
 }
@@ -1915,6 +1921,8 @@ mod tests {
             "Summary.\n### Topics\nI hardcoded the path for now; defer this to the next session.",
             // Prose that opens with a brace but is not JSON.
             "{draft} I hardcoded the path for now; defer this to the next session.",
+            // A structured status reply without a report schema.
+            "{\"summary\":\"I hardcoded the path for now; defer this to the next session.\"}",
             // A code fence around something other than a memory file.
             "```\nfn main() {}\n```\nI hardcoded the path for now; defer this to the next session.",
         ] {

@@ -301,8 +301,11 @@ fn summary_line(report: &DigestReport) -> String {
         report.workarounds.len(),
         report.deferrals.len(),
         report.patterns.len(),
-        // The digest's p0_count: tool alerts plus workaround-register lines.
-        report.p0_alerts.len() + report.workaround_check.as_ref().map_or(0, |w| w.alert_count()),
+        // The digest's p0_count: tool alerts, the classifier alarm and
+        // workaround-register lines.
+        report.p0_alerts.len()
+            + usize::from(report.classifier_degenerate.is_some())
+            + report.workaround_check.as_ref().map_or(0, |w| w.alert_count()),
         report.sessions_scanned,
     );
     match (&report.detected, &report.in_window) {
@@ -422,6 +425,12 @@ fn digest_report_json(report: &DigestReport, dry_run: bool) -> serde_json::Value
             .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
             .unwrap_or(serde_json::Value::Null),
     });
+
+    // The "classifier degenerate" alarm (jibot-code#chk5): present only
+    // when it fires, so a healthy run keeps today's exact key set.
+    if let Some(message) = &report.classifier_degenerate {
+        value["classifier_degenerate"] = serde_json::Value::String(message.clone());
+    }
 
     // Archive spend (agentsview): present only when the block rendered, so
     // an unconfigured host's document keeps today's exact key set (the
@@ -550,6 +559,7 @@ mod tests {
             tracker_failures: 0,
             detected: None,
             in_window: None,
+            classifier_degenerate: None,
         }
     }
 
@@ -578,6 +588,23 @@ mod tests {
             digest_report_json(&report, false)["in_window"],
             serde_json::json!({"corrections": 9, "errors": 1, "workarounds": 0, "deferrals": 0, "patterns": 0})
         );
+    }
+
+    #[test]
+    fn classifier_alarm_reaches_summary_and_json() {
+        // jibot-code#chk5: the digest counts the alarm in p0_count, so the
+        // human summary and --json (dry run included) carry it too.
+        let mut report = digest_report();
+        assert!(summary_line(&report).contains("1 P0 alert(s)"), "{}", summary_line(&report));
+        assert!(digest_report_json(&report, true).get("classifier_degenerate").is_none());
+        report.classifier_degenerate = Some("classifier degenerate: 20 of 20 signals are workarounds".into());
+        assert!(summary_line(&report).contains("2 P0 alert(s)"), "{}", summary_line(&report));
+        for dry_run in [false, true] {
+            assert_eq!(
+                digest_report_json(&report, dry_run)["classifier_degenerate"],
+                "classifier degenerate: 20 of 20 signals are workarounds"
+            );
+        }
     }
 
     #[test]
