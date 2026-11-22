@@ -86,7 +86,11 @@ head="$(g rev-parse HEAD)"
 
 cargo="$(command -v cargo || echo "${CARGO_HOME:-$HOME/.cargo}/bin/cargo")"
 [ -x "$cargo" ] || { echo "install: no cargo on this Mac" >&2; exit 2; }
-"$cargo" install --locked --root "$root" --path "$repo/crates/jilog"
+# --force: a jilog that cargo did not install (copied in by hand, as on
+# azbdmini, jibot-code#q8kf) has no entry in $root/.crates.toml, and without
+# --force cargo refuses to replace it ("binary `jilog` already exists").
+# A --path install rebuilds either way, so --force costs nothing else.
+"$cargo" install --force --locked --root "$root" --path "$repo/crates/jilog"
 
 have="$(installed_commit)"
 if [ "$have" = "$head" ]; then
