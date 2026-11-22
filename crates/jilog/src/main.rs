@@ -13,11 +13,16 @@ use clap::{Parser, Subcommand};
 use commands::review::ReviewArgs;
 use commands::query::QueryArgs;
 
+/// `jilog 0.9.0 (commit <40-hex>[-dirty])`, or `(commit unknown)` outside a
+/// git checkout. The fleet-tools drift watch compares the commit with
+/// origin/main (jibot-code#hw8a); keep the `(commit ` shape stable.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (commit ", env!("JILOG_GIT_COMMIT"), ")");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "jilog",
     about = "Pluggable session-log review and append-only event ledger",
-    version
+    version = VERSION
 )]
 struct Cli {
     /// Path to jilog.toml (default: $JILOG_CONFIG, ~/.jilog.toml, ./jilog.toml).

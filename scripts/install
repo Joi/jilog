@@ -1,0 +1,86 @@
+#!/bin/bash
+# scripts/install — install jilog from this checkout's origin/main and prove it
+# (jibot-code#hw8a).
+#
+# A landing is not an install. Fleet Macs build jilog with
+# `cargo install --path`, and nothing re-ran that after a merge: macazbd wrote
+# the nightly digests for three weeks with a 2026-11-02 build (856 workarounds
+# and 0 errors where main gives 101 and 589).
+#
+#   scripts/install            fast-forward main to origin/main, cargo install,
+#                              then check that ~/.cargo/bin/jilog names HEAD
+#   scripts/install --check    install nothing; compare the installed commit
+#                              with origin/main
+#   --no-fetch                 use the last-fetched origin/main (offline)
+#
+# Exit status: 0 installed / current, 1 stale or the install failed,
+# 2 could not tell (no jilog, a build without a commit, git failure).
+#
+# The installed commit comes from `jilog --version`, which reads
+# `jilog X.Y.Z (commit <40-hex>[-dirty])` since this change; an older build
+# prints no commit and reads as unknown, which --check reports as stale.
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bin="${CARGO_HOME:-$HOME/.cargo}/bin/jilog"
+mode=install
+fetch=1
+for a in "$@"; do
+  case "$a" in
+    --check) mode=check ;;
+    --no-fetch) fetch=0 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "install: unknown argument $a" >&2; exit 2 ;;
+  esac
+done
+
+g() { git -C "$repo" "$@"; }
+
+installed_commit() {
+  # Prints the commit, `unknown` for a build without one, `absent` with no binary.
+  [ -x "$bin" ] || { echo absent; return; }
+  local v
+  v="$("$bin" --version 2>/dev/null || true)"
+  if [[ "$v" =~ \(commit\ ([0-9a-f]{40}(-dirty)?)\) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo unknown
+  fi
+}
+
+if [ "$fetch" = 1 ]; then
+  g fetch -q origin main || { echo "jilog: UNKNOWN git fetch failed in $repo" >&2; exit 2; }
+fi
+main="$(g rev-parse --verify -q origin/main)" || { echo "jilog: UNKNOWN no origin/main in $repo" >&2; exit 2; }
+
+if [ "$mode" = check ]; then
+  have="$(installed_commit)"
+  case "$have" in
+    absent) echo "jilog: ABSENT no $bin"; exit 2 ;;
+    "$main") echo "jilog: CURRENT $main"; exit 0 ;;
+    unknown) echo "jilog: STALE installed build names no commit (built before jibot-code#hw8a); origin/main $main"; exit 1 ;;
+    *)
+      behind="$(g rev-list --count "${have%-dirty}..$main" 2>/dev/null || echo '?')"
+      echo "jilog: STALE installed $have, origin/main $main ($behind behind)"
+      exit 1 ;;
+  esac
+fi
+
+branch="$(g symbolic-ref -q --short HEAD || true)"
+[ "$branch" = main ] || { echo "install: $repo is on '${branch:-detached HEAD}', not main; install from the primary checkout" >&2; exit 1; }
+g diff-index --quiet HEAD -- || { echo "install: $repo has uncommitted changes to tracked files; refusing" >&2; exit 1; }
+g merge -q --ff-only origin/main || { echo "install: main cannot fast-forward to origin/main (local commits?); refusing" >&2; exit 1; }
+head="$(g rev-parse HEAD)"
+
+cargo="$(command -v cargo || echo "${CARGO_HOME:-$HOME/.cargo}/bin/cargo")"
+[ -x "$cargo" ] || { echo "install: no cargo on this Mac" >&2; exit 2; }
+"$cargo" install --locked --path "$repo/crates/jilog"
+
+have="$(installed_commit)"
+if [ "$have" = "$head" ]; then
+  echo "jilog: installed $head"
+else
+  echo "install: $bin reports '$have', expected $head" >&2
+  exit 1
+fi
