@@ -26,6 +26,7 @@ fn main() {
     if let Ok(v) = std::env::var("JILOG_GIT_COMMIT") {
         if !v.is_empty() {
             println!("cargo:rustc-env=JILOG_GIT_COMMIT={v}");
+            println!("cargo:rustc-env=JILOG_GIT_COMMIT_OVERRIDDEN=1");
             return;
         }
     }
@@ -50,9 +51,23 @@ fn main() {
     // Rebuild when HEAD moves or the index changes. Paths come from git so a
     // linked worktree (where .git is a file) resolves correctly.
     // A path that does not exist would make cargo rerun on every build, so
-    // only existing ones are watched. The dirty flag is exact for a fresh
-    // build (`cargo install` always is one); an incremental dev build sees
-    // an unstaged edit only once the index changes.
+    // only existing ones are watched.
+    //
+    // Git metadata alone misses an unstaged edit: the index does not change,
+    // so a reused target dir (cargo install --path keeps the workspace's)
+    // would stamp a modified build with the clean SHA. Watching the
+    // workspace sources reruns this script, and so recomputes the dirty
+    // flag, whenever a tracked source file changes. Cargo scans a watched
+    // directory recursively by mtime.
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    if let Some(ws) = manifest.parent().and_then(|p| p.parent()) {
+        for rel in ["crates", "Cargo.toml", "Cargo.lock"] {
+            let path = ws.join(rel);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
     let mut watch: Vec<String> = vec!["HEAD".into(), "index".into(), "packed-refs".into()];
     if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
         watch.push(r);

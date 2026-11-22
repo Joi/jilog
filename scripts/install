@@ -13,6 +13,9 @@
 #                              with origin/main
 #   --no-fetch                 use the last-fetched origin/main (offline)
 #
+# The binary checked and installed is $CARGO_INSTALL_ROOT/bin/jilog, else
+# $CARGO_HOME/bin/jilog, else ~/.cargo/bin/jilog.
+#
 # Exit status: 0 installed / current, 1 stale or the install failed,
 # 2 could not tell (no jilog, a build without a commit, git failure).
 #
@@ -23,7 +26,12 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="${CARGO_HOME:-$HOME/.cargo}/bin/jilog"
+# One install root for both the install and the check. cargo's own order is
+# --root, CARGO_INSTALL_ROOT, install.root in config, CARGO_HOME; passing
+# --root below pins it, so a config install.root cannot send the binary
+# somewhere this script does not look.
+root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+bin="$root/bin/jilog"
 mode=install
 fetch=1
 for a in "$@"; do
@@ -72,10 +80,13 @@ branch="$(g symbolic-ref -q --short HEAD || true)"
 g diff-index --quiet HEAD -- || { echo "install: $repo has uncommitted changes to tracked files; refusing" >&2; exit 1; }
 g merge -q --ff-only origin/main || { echo "install: main cannot fast-forward to origin/main (local commits?); refusing" >&2; exit 1; }
 head="$(g rev-parse HEAD)"
+# A main AHEAD of origin/main fast-forwards as a no-op; installing it would
+# install commits that never landed.
+[ "$head" = "$main" ] || { echo "install: main is ahead of origin/main ($(g rev-list --count "$main..HEAD") local commit(s)); push or drop them; refusing" >&2; exit 1; }
 
 cargo="$(command -v cargo || echo "${CARGO_HOME:-$HOME/.cargo}/bin/cargo")"
 [ -x "$cargo" ] || { echo "install: no cargo on this Mac" >&2; exit 2; }
-"$cargo" install --locked --path "$repo/crates/jilog"
+"$cargo" install --locked --root "$root" --path "$repo/crates/jilog"
 
 have="$(installed_commit)"
 if [ "$have" = "$head" ]; then
