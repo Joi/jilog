@@ -69,6 +69,30 @@ impl Fixture {
             .output()
             .unwrap()
     }
+
+    /// A `cargo` stub on PATH that logs its arguments and "installs" a jilog
+    /// under the --root it was given, naming the checkout's HEAD. Without
+    /// --root it installs nothing, so the script's own check fails.
+    fn stub_cargo(&self) -> (PathBuf, PathBuf) {
+        let dir = self._tmp.path().join("stubbin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = self._tmp.path().join("cargo-args");
+        let stub = dir.join("cargo");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/bash\necho \"$*\" > '{log}'\nroot=\"\"; path=\"\"\n\
+                 while [ $# -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift;; --path) path=\"$2\"; shift;; esac; shift; done\n\
+                 [ -n \"$root\" ] || exit 0\nsha=$(git -C \"${{path%/crates/jilog}}\" rev-parse HEAD)\nmkdir -p \"$root/bin\"\n\
+                 printf '#!/bin/sh\\necho \"jilog 0.9.0 (commit %s)\"\\n' \"$sha\" > \"$root/bin/jilog\"\nchmod +x \"$root/bin/jilog\"\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, log)
+    }
 }
 
 fn stdout(o: &Output) -> String {
@@ -140,4 +164,39 @@ fn install_refuses_a_branch_other_than_main_and_a_dirty_tree() {
     let o = f.run(&[]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("uncommitted changes"), "{}", stderr(&o));
+}
+
+#[test]
+fn install_passes_its_root_to_cargo_and_verifies_the_result() {
+    let f = fixture();
+    let (stubbin, log) = f.stub_cargo();
+    let path = format!("{}:/usr/bin:/bin", stubbin.display());
+
+    // CARGO_INSTALL_ROOT set: that is the root.
+    let o = Command::new("bash")
+        .arg(f.checkout.join("scripts/install"))
+        .env("CARGO_INSTALL_ROOT", &f.root)
+        .env("CARGO_HOME", f.root.join("unused-cargo-home"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains(&format!("jilog: installed {}", f.main)), "{}", stdout(&o));
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(args.contains(&format!("--root {}", f.root.display())), "{args}");
+    assert!(args.contains("--locked"), "{args}");
+
+    // Only CARGO_HOME set: the root falls back to it, for install and check.
+    let home = f.root.join("cargo-home");
+    let o = Command::new("bash")
+        .arg(f.checkout.join("scripts/install"))
+        .env_remove("CARGO_INSTALL_ROOT")
+        .env("CARGO_HOME", &home)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(args.contains(&format!("--root {}", home.display())), "{args}");
+    assert!(home.join("bin/jilog").exists());
 }
